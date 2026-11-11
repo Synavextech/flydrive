@@ -17,7 +17,9 @@ import {
   X,
   CheckCircle2,
   MessageSquare,
-  ZoomIn
+  ZoomIn,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react'
 import { Product } from '../types'
 import { useProducts } from '../contexts/ProductContext'
@@ -70,6 +72,14 @@ export const HomePage: React.FC = () => {
   const [isSubmittingReview, setIsSubmittingReview] = useState(false)
   const [reviewFeedback, setReviewFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [zoomedReviewImage, setZoomedReviewImage] = useState<string | null>(null)
+  const [expandedReviewProductIds, setExpandedReviewProductIds] = useState<Record<string, boolean>>({})
+
+  const toggleProductReviews = (productId: string) => {
+    setExpandedReviewProductIds((prev) => ({
+      ...prev,
+      [productId]: !prev[productId],
+    }))
+  }
 
   const openReviewModal = (product: Product) => {
     const fullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ').trim()
@@ -684,9 +694,10 @@ export const HomePage: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Constantly Visible 5 Customer Reviews Below Every Item Listing */}
+                    {/* Collapsible Customer Reviews Below Every Item Listing (Manual Toggle Only) */}
                     {(() => {
                       const visibleReviews = getReviewsForProduct(product).slice(0, 5)
+                      const isReviewsExpanded = Boolean(expandedReviewProductIds[product.id])
                       const avgRating =
                         visibleReviews.length > 0
                           ? (
@@ -698,19 +709,33 @@ export const HomePage: React.FC = () => {
                       return (
                         <div className="border-t border-gray-200 dark:border-white/10 bg-gray-50/90 dark:bg-[#121216] p-2.5 sm:p-3 space-y-2 text-[10px]">
                           <div className="flex items-center justify-between gap-1.5">
-                            <div className="flex items-center gap-1 min-w-0">
-                              <div className="flex items-center gap-0.5 text-[#58b970]">
+                            <button
+                              type="button"
+                              onClick={() => toggleProductReviews(product.id)}
+                              aria-expanded={isReviewsExpanded}
+                              aria-controls={`card-reviews-${product.id}`}
+                              className="flex items-center gap-1.5 min-w-0 text-left group/rev cursor-pointer"
+                            >
+                              <div className="flex items-center gap-0.5 text-[#58b970] flex-shrink-0">
                                 {[1, 2, 3, 4, 5].map((starIdx) => (
                                   <Star key={starIdx} className="w-2.5 h-2.5 fill-[#58b970] text-[#58b970]" />
                                 ))}
                               </div>
-                              <span className="font-extrabold text-gray-900 dark:text-white truncate">
+                              <span className="font-extrabold text-gray-900 dark:text-white flex-shrink-0">
                                 {avgRating}
                               </span>
-                              <span className="text-gray-500 dark:text-gray-400 font-semibold truncate">
-                                • 5 Reviews
+                              <span className="text-gray-500 dark:text-gray-400 font-semibold group-hover/rev:text-creamy-600 dark:group-hover/rev:text-creamy-400 truncate transition-colors">
+                                • {visibleReviews.length} Reviews
                               </span>
-                            </div>
+                              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-gray-200/80 dark:bg-white/10 text-gray-700 dark:text-gray-200 group-hover/rev:bg-creamy-500 group-hover/rev:text-black font-bold text-[9px] uppercase tracking-wider transition-colors flex-shrink-0">
+                                <span>{isReviewsExpanded ? 'Hide' : 'View'}</span>
+                                {isReviewsExpanded ? (
+                                  <ChevronUp className="w-2.5 h-2.5" />
+                                ) : (
+                                  <ChevronDown className="w-2.5 h-2.5" />
+                                )}
+                              </span>
+                            </button>
 
                             <button
                               type="button"
@@ -722,82 +747,90 @@ export const HomePage: React.FC = () => {
                             </button>
                           </div>
 
-                          <div className="space-y-1.5">
-                            {visibleReviews.map((review) => (
-                              <div
-                                key={review.id}
-                                className="rounded-md bg-white dark:bg-[#191920] border border-gray-200/80 dark:border-white/5 px-2 py-1.5 space-y-1"
-                              >
-                                <div className="flex items-center justify-between gap-1">
-                                  <div className="flex items-center gap-1 min-w-0">
-                                    <span className="font-bold text-gray-900 dark:text-white truncate">
-                                      {review.reviewerName}
-                                    </span>
-                                    {review.verifiedPurchase && (
-                                      <CheckCircle2 className="w-2.5 h-2.5 text-[#58b970] flex-shrink-0" />
+                          {isReviewsExpanded && (
+                            <div
+                              id={`card-reviews-${product.id}`}
+                              aria-hidden={!isReviewsExpanded}
+                              className="space-y-2 pt-1 border-t border-gray-200/70 dark:border-white/5"
+                            >
+                              <div className="space-y-1.5">
+                                {visibleReviews.map((review) => (
+                                  <div
+                                    key={review.id}
+                                    className="rounded-md bg-white dark:bg-[#191920] border border-gray-200/80 dark:border-white/5 px-2 py-1.5 space-y-1"
+                                  >
+                                    <div className="flex items-center justify-between gap-1">
+                                      <div className="flex items-center gap-1 min-w-0">
+                                        <span className="font-bold text-gray-900 dark:text-white truncate">
+                                          {review.reviewerName}
+                                        </span>
+                                        {review.verifiedPurchase && (
+                                          <CheckCircle2 className="w-2.5 h-2.5 text-[#58b970] flex-shrink-0" />
+                                        )}
+                                      </div>
+                                      <div className="flex items-center gap-0.5 flex-shrink-0">
+                                        {[1, 2, 3, 4, 5].map((starVal) => (
+                                          <Star
+                                            key={starVal}
+                                            className={`w-2 h-2 ${
+                                              starVal <= (review.rating || 5)
+                                                ? 'fill-[#58b970] text-[#58b970]'
+                                                : 'text-gray-300 dark:text-gray-700'
+                                            }`}
+                                          />
+                                        ))}
+                                      </div>
+                                    </div>
+
+                                    <p className="text-[10px] leading-snug text-gray-600 dark:text-gray-300 line-clamp-2">
+                                      {review.comment}
+                                    </p>
+
+                                    {review.images && review.images.length > 0 && (
+                                      <div className="flex items-center gap-1 pt-0.5">
+                                        {review.images.slice(0, 3).map((imgUrl, imgIdx) => (
+                                          <button
+                                            key={imgIdx}
+                                            type="button"
+                                            onClick={() => setZoomedReviewImage(getSafeMediaUrl(imgUrl))}
+                                            className="relative group/img w-8 h-8 rounded overflow-hidden border border-gray-200 dark:border-white/10 hover:border-[#58b970] transition-colors flex-shrink-0"
+                                            title="Click to inspect customer photo"
+                                          >
+                                            <img
+                                              src={getSafeMediaUrl(imgUrl)}
+                                              alt={`Review photo by ${review.reviewerName}`}
+                                              className="w-full h-full object-cover"
+                                            />
+                                            <span className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 flex items-center justify-center transition-opacity">
+                                              <ZoomIn className="w-3 h-3 text-white" />
+                                            </span>
+                                          </button>
+                                        ))}
+                                      </div>
                                     )}
                                   </div>
-                                  <div className="flex items-center gap-0.5 flex-shrink-0">
-                                    {[1, 2, 3, 4, 5].map((starVal) => (
-                                      <Star
-                                        key={starVal}
-                                        className={`w-2 h-2 ${
-                                          starVal <= (review.rating || 5)
-                                            ? 'fill-[#58b970] text-[#58b970]'
-                                            : 'text-gray-300 dark:text-gray-700'
-                                        }`}
-                                      />
-                                    ))}
-                                  </div>
-                                </div>
-
-                                <p className="text-[10px] leading-snug text-gray-600 dark:text-gray-300 line-clamp-2">
-                                  {review.comment}
-                                </p>
-
-                                {review.images && review.images.length > 0 && (
-                                  <div className="flex items-center gap-1 pt-0.5">
-                                    {review.images.slice(0, 3).map((imgUrl, imgIdx) => (
-                                      <button
-                                        key={imgIdx}
-                                        type="button"
-                                        onClick={() => setZoomedReviewImage(getSafeMediaUrl(imgUrl))}
-                                        className="relative group/img w-8 h-8 rounded overflow-hidden border border-gray-200 dark:border-white/10 hover:border-[#58b970] transition-colors flex-shrink-0"
-                                        title="Click to inspect customer photo"
-                                      >
-                                        <img
-                                          src={getSafeMediaUrl(imgUrl)}
-                                          alt={`Review photo by ${review.reviewerName}`}
-                                          className="w-full h-full object-cover"
-                                        />
-                                        <span className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 flex items-center justify-center transition-opacity">
-                                          <ZoomIn className="w-3 h-3 text-white" />
-                                        </span>
-                                      </button>
-                                    ))}
-                                  </div>
-                                )}
+                                ))}
                               </div>
-                            ))}
-                          </div>
 
-                          <div className="flex items-center justify-between pt-0.5 text-[9px] font-bold uppercase tracking-wider">
-                            <button
-                              type="button"
-                              onClick={() => openReviewModal(product)}
-                              className="text-[#357c47] dark:text-[#76cf89] hover:underline flex items-center gap-1"
-                            >
-                              <MessageSquare className="w-2.5 h-2.5" />
-                              <span>Write Review</span>
-                            </button>
-                            <Link
-                              to={`/product/${product.id}#reviews`}
-                              className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center gap-0.5"
-                            >
-                              <span>Full Gallery</span>
-                              <ArrowRight className="w-2.5 h-2.5" />
-                            </Link>
-                          </div>
+                              <div className="flex items-center justify-between pt-0.5 text-[9px] font-bold uppercase tracking-wider">
+                                <button
+                                  type="button"
+                                  onClick={() => openReviewModal(product)}
+                                  className="text-[#357c47] dark:text-[#76cf89] hover:underline flex items-center gap-1"
+                                >
+                                  <MessageSquare className="w-2.5 h-2.5" />
+                                  <span>Write Review</span>
+                                </button>
+                                <Link
+                                  to={`/product/${product.id}#reviews`}
+                                  className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center gap-0.5"
+                                >
+                                  <span>Full Gallery</span>
+                                  <ArrowRight className="w-2.5 h-2.5" />
+                                </Link>
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )
                     })()}
