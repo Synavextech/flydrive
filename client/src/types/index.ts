@@ -117,10 +117,26 @@ export interface Address {
   isDefault: boolean
 }
 
+export interface ProductReview {
+  id: string
+  productId: string
+  userId?: string | null
+  reviewerName: string
+  reviewerEmail?: string | null
+  rating: number
+  title?: string | null
+  comment: string
+  images: string[]
+  verifiedPurchase: boolean
+  createdAt: string
+  updatedAt?: string
+}
+
 export interface Order {
   id: string
   userId: string
   orderNumber: string
+  trackingNumber?: string
   status: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
   total: number
   subtotal: number
@@ -138,6 +154,47 @@ export interface Order {
   billingAddress?: Address
   createdAt: string
   updatedAt: string
+}
+
+export interface OrderTrackingTimelineStep {
+  step: number
+  key: string
+  title: string
+  location: string
+  description: string
+  completed: boolean
+  active: boolean
+  timestamp: string | null
+}
+
+export interface TrackedOrderDetails {
+  id: string
+  orderNumber: string
+  trackingNumber: string
+  status: Order['status']
+  paymentStatus: Order['paymentStatus']
+  paymentMethod: Order['paymentMethod']
+  total: number
+  subtotal?: number
+  tax?: number
+  shipping?: number
+  carrier: string
+  dispatchWarehouse: string
+  destination: string
+  estimatedDelivery: string
+  createdAt: string
+  updatedAt: string
+  items: Array<{
+    id?: string
+    productId?: string
+    name: string
+    image?: string
+    category?: string
+    quantity: number
+    price: number
+    total: number
+  }>
+  timeline: OrderTrackingTimelineStep[]
 }
 
 // API Response types
@@ -159,4 +216,46 @@ export interface PaymentIntent {
   client_secret: string
   amount: number
   currency: string
+}
+
+// LiveChat & Support types
+export type SupportTopic = 'Payment Issue' | 'Item Purchase' | 'General Inquiry' | 'Shipping Issue'
+
+export interface SupportSelectedProduct {
+  id: string
+  name: string
+  sku: string
+  price: number
+  category: string
+  image?: string
+}
+
+export interface SupportMessage {
+  id: string
+  sessionId: string
+  senderRole: 'CLIENT' | 'ADMIN' | 'AI_ASSISTANT'
+  senderName: string
+  content: string
+  metadata?: Record<string, any>
+  createdAt: string
+}
+
+export interface SupportSession {
+  id: string
+  visitorId: string
+  userId?: string
+  visitorName: string
+  visitorEmail?: string
+  visitorPhone?: string
+  topic: SupportTopic | string
+  selectedProducts: SupportSelectedProduct[]
+  status: 'OPEN' | 'RESOLVED'
+  isOnline: boolean
+  lastSeenAt: string
+  lastSeenText?: string
+  unreadAdminCount: number
+  unreadClientCount: number
+  createdAt: string
+  updatedAt: string
+  messages: SupportMessage[]
 }

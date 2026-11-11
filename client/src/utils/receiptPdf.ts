@@ -2,6 +2,7 @@ export interface OrderReceiptData {
   date: string
   orderDate: string
   orderNumber: string
+  trackingNumber?: string
   transactionId: string
   userName: string
   address: string
@@ -25,6 +26,7 @@ export interface OrderReceiptData {
  * Generates the standardized receipt text block for an order.
  */
 export const generateReceiptText = (r: OrderReceiptData): string => {
+  const trackingNum = r.trackingNumber || `TRK-${r.orderNumber}`
   const lines = [
     `Receipt `,
     ` Order Summary `,
@@ -36,6 +38,7 @@ export const generateReceiptText = (r: OrderReceiptData): string => {
     `********************************************************************************  `,
     `Order Date     : ${r.orderDate}`,
     `Order Number   : ${r.orderNumber}`,
+    `Tracking Number: ${trackingNum}`,
     `Transaction ID : ${r.transactionId}`,
     `User Name      : ${r.userName}`,
     `Address        : ${r.address}`,
@@ -133,6 +136,7 @@ export const generateReceiptPdfBytes = (r: OrderReceiptData): Uint8Array => {
       trimmed === 'Purchased Units:' ||
       trimmed === 'Additional Transaction Details:' ||
       trimmed.startsWith('Order Number') ||
+      trimmed.startsWith('Tracking Number') ||
       trimmed.startsWith('Final Cost')
 
     const segments = wrapLine(rawLine, 80)
@@ -142,10 +146,11 @@ export const generateReceiptPdfBytes = (r: OrderReceiptData): Uint8Array => {
   }
 
   // Build PDF content stream commands
+  const trackingNum = r.trackingNumber || `TRK-${r.orderNumber}`
   const commands: string[] = []
 
-  // Outer card border & top header bar
-  commands.push('0.96 0.62 0.04 RG') // Amber accent stroke
+  // Outer card border & top header bar (Creamy Green accent stroke)
+  commands.push('0.35 0.73 0.44 RG')
   commands.push('1.5 w')
   commands.push('36 36 540 720 re S')
 
@@ -156,10 +161,10 @@ export const generateReceiptPdfBytes = (r: OrderReceiptData): Uint8Array => {
   // Header title text (White)
   commands.push('1 1 1 rg')
   commands.push('BT /F2 13 Tf 50 731 Td (DRIVEFLYELECTRIC - OFFICIAL PURCHASE RECEIPT) Tj ET')
-  commands.push('0.96 0.62 0.04 rg')
+  commands.push('0.46 0.81 0.54 rg')
   commands.push(
-    `BT /F2 8.5 Tf 50 713 Td (${escapePdfText(
-      `ORDER #${r.orderNumber}  |  STATUS: SETTLED IN FULL  |  DATE: ${r.date}`
+    `BT /F2 8.2 Tf 50 713 Td (${escapePdfText(
+      `ORDER #${r.orderNumber}  |  TRACKING: ${trackingNum}  |  DATE: ${r.date}`
     )}) Tj ET`
   )
 

@@ -14,11 +14,15 @@ export interface SystemActivityEvent {
   id: string
   type:
     | 'ORDER_PURCHASED'
+    | 'PAYMENT_AUTHORIZED'
+    | 'PAYMENT_CAPTURED'
     | 'USER_REGISTERED'
     | 'USER_LOGIN'
     | 'ORDER_STATUS_UPDATED'
     | 'ORDER_CANCELLED'
     | 'PRODUCT_UPDATED'
+    | 'SUPPORT_INQUIRY'
+    | 'SUPPORT_REPLY'
   title: string
   message: string
   userEmail?: string
@@ -203,17 +207,25 @@ class EmailService {
 
     // 1. Send Purchase Confirmation + PDF Receipt to User Email
     let userEmailSent = false
+    const trackingNumber = receiptData.trackingNumber || `TRK-${receiptData.orderNumber}`
     if (userRecipients.length > 0) {
       const userHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; color: #111827; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
           <div style="background-color: #111318; color: #ffffff; padding: 24px;">
-            <span style="background-color: #f59e0b; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Payment Verified & Settled</span>
+            <span style="background-color: #58b970; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Payment Verified & Settled</span>
             <h1 style="margin: 12px 0 4px; font-size: 22px; color: #ffffff;">Order Confirmed • #${receiptData.orderNumber}</h1>
-            <p style="margin: 0; font-size: 13px; color: #9ca3af;">DriveFlyElectric • Official Purchase Receipt (PDF Attached)</p>
+            <p style="margin: 0; font-size: 13px; color: #9de0ab; font-weight: bold;">Shipment Tracking Number: ${trackingNumber}</p>
+            <p style="margin: 4px 0 0; font-size: 12px; color: #9ca3af;">DriveFlyElectric • Official Purchase Receipt (PDF Attached)</p>
           </div>
           <div style="padding: 24px;">
             <p style="font-size: 14px; line-height: 1.6;">Hello <strong>${receiptData.userName}</strong>,</p>
             <p style="font-size: 14px; line-height: 1.6;">Thank you for shopping with <strong>DriveFlyElectric</strong>. Your payment has been verified and your order is registered for express dispatch from our Nanshan, Shenzhen, Guangdong Province, China Warehouse. Your official generated <strong>PDF Receipt (Receipt-${receiptData.orderNumber}.pdf)</strong> is attached to this email.</p>
+
+            <div style="margin: 16px 0; padding: 14px 16px; background-color: #f2fbf4; border: 1px solid #9de0ab; border-radius: 10px;">
+              <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #357c47; font-weight: 800;">Official Shipment Tracking Number</div>
+              <div style="font-size: 18px; font-family: monospace; font-weight: 900; color: #111827; margin-top: 4px;">${trackingNumber}</div>
+              <div style="font-size: 12px; color: #4b5563; margin-top: 4px;">Use the <strong>Track Order</strong> button on the top navigation bar at <a href="https://driveflyelectric.shop" style="color: #429b58; font-weight: bold;">driveflyelectric.shop</a> to monitor live transit updates.</div>
+            </div>
 
             ${
               itemsHtml
@@ -236,14 +248,14 @@ class EmailService {
             <h3 style="font-size: 14px; text-transform: uppercase; color: #374151; margin-top: 20px;">Official Receipt Summary</h3>
             <pre style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; font-family: 'Courier New', Courier, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-x: auto;">${receiptText}</pre>
 
-            <p style="font-size: 12px; color: #6b7280; margin-top: 20px;">Need assistance? Contact our 24/7 Customer Support team at <a href="mailto:info-eurotopmobility@driveflyelectric.shop" style="color: #d97706;">info-eurotopmobility@driveflyelectric.shop</a>.</p>
+            <p style="font-size: 12px; color: #6b7280; margin-top: 20px;">Need assistance? Contact our 24/7 Customer Support team at <a href="mailto:info-eurotopmobility@driveflyelectric.shop" style="color: #429b58;">info-eurotopmobility@driveflyelectric.shop</a>.</p>
           </div>
         </div>
       `
 
       const userMailRes = await this.dispatchMail({
         to: userRecipients.join(', '),
-        subject: `Official Purchase Receipt & Order Confirmation - #${receiptData.orderNumber}`,
+        subject: `Official Purchase Receipt & Tracking #${trackingNumber} - Order #${receiptData.orderNumber}`,
         text: receiptText,
         html: userHtml,
         attachments: [pdfAttachment]
@@ -256,19 +268,20 @@ class EmailService {
     let systemEmailSent = false
     if (systemEmails.length > 0) {
       const adminHtml = `
-        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; color: #111827; border: 1px solid #f59e0b; border-radius: 12px; overflow: hidden;">
+        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; color: #111827; border: 1px solid #58b970; border-radius: 12px; overflow: hidden;">
           <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
-            <span style="background-color: #10b981; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Real-Time System Alert • Settled Purchase</span>
-            <h2 style="margin: 10px 0 2px; font-size: 20px; color: #f59e0b;">New Purchase Order #${receiptData.orderNumber} (${receiptData.finalCost})</h2>
-            <p style="margin: 0; font-size: 12px; color: #9ca3af;">Timestamp: ${new Date().toUTCString()}</p>
+            <span style="background-color: #58b970; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Real-Time System Alert • Settled Purchase</span>
+            <h2 style="margin: 10px 0 2px; font-size: 20px; color: #76cf89;">New Purchase Order #${receiptData.orderNumber} (${receiptData.finalCost})</h2>
+            <p style="margin: 0; font-size: 12px; color: #9ca3af;">Tracking #: ${trackingNumber} • Timestamp: ${new Date().toUTCString()}</p>
           </div>
           <div style="padding: 24px;">
             <table style="width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 13px;">
               <tr><td style="padding: 6px 0; color: #6b7280; width: 160px;">Customer Name:</td><td style="padding: 6px 0; font-weight: bold;">${receiptData.userName}</td></tr>
               <tr><td style="padding: 6px 0; color: #6b7280;">Account / User Email:</td><td style="padding: 6px 0; font-weight: bold;">${userRecipients.join(', ') || 'Guest Checkout'}</td></tr>
+              <tr><td style="padding: 6px 0; color: #6b7280;">Tracking Number:</td><td style="padding: 6px 0; font-family: monospace; font-weight: bold; color: #357c47;">${trackingNumber}</td></tr>
               <tr><td style="padding: 6px 0; color: #6b7280;">Payment Source:</td><td style="padding: 6px 0; font-weight: bold;">${receiptData.paymentSource}</td></tr>
               <tr><td style="padding: 6px 0; color: #6b7280;">Transaction ID:</td><td style="padding: 6px 0; font-family: monospace;">${receiptData.transactionId}</td></tr>
-              <tr><td style="padding: 6px 0; color: #6b7280;">Settled Total (USD):</td><td style="padding: 6px 0; font-weight: bold; color: #059669;">${receiptData.finalCost}</td></tr>
+              <tr><td style="padding: 6px 0; color: #6b7280;">Settled Total (USD):</td><td style="padding: 6px 0; font-weight: bold; color: #429b58;">${receiptData.finalCost}</td></tr>
               <tr><td style="padding: 6px 0; color: #6b7280;">Shipping Address:</td><td style="padding: 6px 0;">${receiptData.address}</td></tr>
             </table>
 
@@ -321,17 +334,17 @@ class EmailService {
     const userHtml = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #111827; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
         <div style="background-color: #111318; color: #ffffff; padding: 24px;">
-          <span style="background-color: #f59e0b; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Account Active</span>
+          <span style="background-color: #58b970; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Account Active</span>
           <h1 style="margin: 12px 0 4px; font-size: 22px; color: #ffffff;">Welcome to DriveFlyElectric!</h1>
         </div>
         <div style="padding: 24px; font-size: 14px; line-height: 1.6;">
           <p>Hello <strong>${fullName}</strong>,</p>
-          <p>Your account (<strong style="color: #d97706;">${user.email}</strong>) has been successfully created on <strong>DriveFlyElectric</strong>.</p>
+          <p>Your account (<strong style="color: #429b58;">${user.email}</strong>) has been successfully created on <strong>DriveFlyElectric</strong>.</p>
           <p>All future purchase confirmations, official PDF receipts, and real-time order dispatch updates will be sent directly to this email address.</p>
           <div style="margin: 24px 0;">
-            <a href="${storeUrl}" style="background-color: #f59e0b; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">Explore Fleet Catalog</a>
+            <a href="${storeUrl}" style="background-color: #58b970; color: #000000; font-weight: bold; text-decoration: none; padding: 12px 24px; border-radius: 8px; display: inline-block;">Explore Fleet Catalog</a>
           </div>
-          <p style="font-size: 12px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 16px;">Questions? Reach our 24/7 support desk at <a href="mailto:info-eurotopmobility@driveflyelectric.shop" style="color: #d97706;">info-eurotopmobility@driveflyelectric.shop</a>.</p>
+          <p style="font-size: 12px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 16px;">Questions? Reach our 24/7 support desk at <a href="mailto:info-eurotopmobility@driveflyelectric.shop" style="color: #429b58;">info-eurotopmobility@driveflyelectric.shop</a>.</p>
         </div>
       </div>
     `
@@ -350,7 +363,7 @@ class EmailService {
       const sysHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
           <div style="background-color: #111318; color: #ffffff; padding: 18px 24px;">
-            <h2 style="margin: 0; font-size: 18px; color: #f59e0b;">[System Activity] New User Account Registered</h2>
+            <h2 style="margin: 0; font-size: 18px; color: #76cf89;">[System Activity] New User Account Registered</h2>
           </div>
           <div style="padding: 20px 24px; font-size: 13px; line-height: 1.6;">
             <p><strong>Name:</strong> ${fullName}</p>
@@ -394,6 +407,7 @@ class EmailService {
   async sendOrderStatusUpdate(order: any, userEmail?: string) {
     const targetEmail = userEmail || order.user?.email
     const receiptData = buildReceiptDataFromOrder(order, { email: targetEmail })
+    const trackingNumber = receiptData.trackingNumber || `TRK-${receiptData.orderNumber}`
     const pdfBuffer = generateReceiptPdfBuffer(receiptData)
 
     const statusMessages: { [key: string]: string } = {
@@ -409,11 +423,12 @@ class EmailService {
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
           <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
-            <h2 style="margin: 0; font-size: 20px; color: #f59e0b;">Order Status Update • #${receiptData.orderNumber}</h2>
+            <h2 style="margin: 0; font-size: 20px; color: #76cf89;">Order Status Update • #${receiptData.orderNumber}</h2>
+            <p style="margin: 4px 0 0; font-size: 12px; color: #9de0ab;">Tracking Number: <strong>${trackingNumber}</strong></p>
           </div>
           <div style="padding: 24px; font-size: 14px; line-height: 1.6;">
             <p>Hello <strong>${receiptData.userName}</strong>,</p>
-            <p>The status of your order <strong>#${receiptData.orderNumber}</strong> has been updated to: <strong style="color: #d97706;">${order.status}</strong>.</p>
+            <p>The status of your order <strong>#${receiptData.orderNumber}</strong> (Tracking: <strong>${trackingNumber}</strong>) has been updated to: <strong style="color: #429b58;">${order.status}</strong>.</p>
             <p>${statusMessages[order.status] || 'Your order status has been updated.'}</p>
             <p style="font-size: 12px; color: #6b7280; margin-top: 20px;">Your updated PDF purchase receipt is attached for your records.</p>
           </div>
@@ -421,8 +436,8 @@ class EmailService {
       `
       const res = await this.dispatchMail({
         to: targetEmail,
-        subject: `Order #${receiptData.orderNumber} Status Update: ${order.status}`,
-        text: `Hello ${receiptData.userName},\n\nYour order #${receiptData.orderNumber} status has been updated to ${order.status}.\n${statusMessages[order.status] || ''}`,
+        subject: `Order #${receiptData.orderNumber} (${trackingNumber}) Status Update: ${order.status}`,
+        text: `Hello ${receiptData.userName},\n\nYour order #${receiptData.orderNumber} (Tracking: ${trackingNumber}) status has been updated to ${order.status}.\n${statusMessages[order.status] || ''}`,
         html,
         attachments: [
           {
@@ -440,8 +455,8 @@ class EmailService {
     if (systemEmails.length > 0) {
       const sysRes = await this.dispatchMail({
         to: systemEmails.join(', '),
-        subject: `[SYSTEM NOTIFICATION] Order #${receiptData.orderNumber} Status -> ${order.status}`,
-        text: `Order #${receiptData.orderNumber} for ${receiptData.userName} (${targetEmail || 'Guest'}) was updated to status: ${order.status}.`
+        subject: `[SYSTEM NOTIFICATION] Order #${receiptData.orderNumber} (${trackingNumber}) Status -> ${order.status}`,
+        text: `Order #${receiptData.orderNumber} (Tracking: ${trackingNumber}) for ${receiptData.userName} (${targetEmail || 'Guest'}) was updated to status: ${order.status}.`
       })
       sysSent = sysRes.success
     }
@@ -458,6 +473,107 @@ class EmailService {
     })
 
     return { success: userSent || sysSent }
+  }
+
+  /**
+   * Records a client LiveChat support inquiry in the Real-Time System Activity feed
+   * and dispatches an SMTP notification to the system support email.
+   */
+  async sendSupportInquiryAlert(session: any, clientMessage: string): Promise<void> {
+    const visitorLabel = session.visitorName || 'Store Visitor'
+    const contactInfo = session.visitorEmail || session.visitorPhone || 'Anonymous Visitor'
+    const topic = session.topic || 'General Inquiry'
+    const selectedList = Array.isArray(session.selectedProducts) && session.selectedProducts.length > 0
+      ? session.selectedProducts.map((p: any) => `${p.name} ($${Number(p.price || 0).toLocaleString()})`).join(', ')
+      : 'None selected'
+
+    const { systemEmails } = this.getTransporter()
+    let sysSent = false
+
+    // Dispatch SMTP alert on first client message or when visitor provides email
+    const clientMsgCount = (session.messages || []).filter((m: any) => m.senderRole === 'CLIENT').length
+    if (systemEmails.length > 0 && (clientMsgCount <= 2 || session.visitorEmail)) {
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #58b970; border-radius: 12px; overflow: hidden;">
+          <div style="background-color: #111318; color: #ffffff; padding: 18px 24px;">
+            <span style="background-color: #58b970; color: #000000; font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 9999px; text-transform: uppercase;">LiveChat Support Inquiry</span>
+            <h2 style="margin: 8px 0 0; font-size: 18px; color: #ffffff;">${visitorLabel} • ${topic}</h2>
+          </div>
+          <div style="padding: 20px 24px; font-size: 13px; line-height: 1.6; color: #111827;">
+            <p><strong>Visitor Name:</strong> ${visitorLabel}</p>
+            <p><strong>Visitor Contact:</strong> ${contactInfo}</p>
+            <p><strong>Selected Topic:</strong> ${topic}</p>
+            <p><strong>Selected Catalogue Rigs:</strong> ${selectedList}</p>
+            <div style="margin-top: 14px; padding: 12px 16px; background-color: #f9fafb; border-left: 4px solid #58b970; border-radius: 6px;">
+              <strong>Client Message:</strong><br/>${clientMessage}
+            </div>
+            <p style="font-size: 12px; color: #6b7280; margin-top: 16px;">Open the <strong>Admin Dashboard &rarr; Support Tab</strong> on DriveFlyElectric to reply live.</p>
+          </div>
+        </div>
+      `
+      const sysRes = await this.dispatchMail({
+        to: systemEmails.join(', '),
+        subject: `[LIVECHAT INQUIRY] ${topic} from ${visitorLabel} (${contactInfo})`,
+        text: `LiveChat Inquiry (${topic})\nVisitor: ${visitorLabel} (${contactInfo})\nSelected Rigs: ${selectedList}\nMessage: ${clientMessage}`,
+        html
+      })
+      sysSent = sysRes.success
+    }
+
+    this.recordActivity({
+      type: 'SUPPORT_INQUIRY',
+      title: `LiveChat Inquiry (${topic}) • ${visitorLabel}`,
+      message: `"${clientMessage.slice(0, 120)}" ${selectedList !== 'None selected' ? `[Rigs: ${selectedList}]` : ''}`,
+      userEmail: session.visitorEmail || undefined,
+      emailDispatched: false,
+      systemMailDispatched: sysSent
+    })
+  }
+
+  /**
+   * Dispatches an email copy of an Admin's LiveChat reply to the client (if visitorEmail is known)
+   * and logs the reply to the Real-Time System Activity stream.
+   */
+  async sendSupportReplyNotification(session: any, replyContent: string, adminName: string): Promise<void> {
+    const visitorLabel = session.visitorName || 'Valued Customer'
+    const targetEmail = (session.visitorEmail || '').trim()
+    let userSent = false
+
+    if (targetEmail && targetEmail.includes('@')) {
+      const storeUrl = process.env.PRODUCTION_url || 'https://driveflyelectric.shop'
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+          <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
+            <span style="background-color: #58b970; color: #000000; font-size: 10px; font-weight: 800; padding: 3px 8px; border-radius: 9999px; text-transform: uppercase;">Live Support Reply</span>
+            <h2 style="margin: 8px 0 0; font-size: 19px; color: #76cf89;">DriveFlyElectric Support Specialist Replied</h2>
+          </div>
+          <div style="padding: 24px; font-size: 14px; line-height: 1.6; color: #111827;">
+            <p>Hello <strong>${visitorLabel}</strong>,</p>
+            <p>Our support specialist (<strong>${adminName}</strong>) has replied to your <strong>${session.topic || 'General Inquiry'}</strong> on <strong>DriveFlyElectric</strong>:</p>
+            <div style="margin: 16px 0; padding: 16px; background-color: #f9fafb; border-left: 4px solid #58b970; border-radius: 8px; font-size: 14px;">
+              ${replyContent}
+            </div>
+            <p>You can continue chatting in real time using the LiveChat button at the bottom-right of <a href="${storeUrl}" style="color: #429b58; font-weight: bold;">${storeUrl}</a> or reply directly to this email.</p>
+          </div>
+        </div>
+      `
+      const mailRes = await this.dispatchMail({
+        to: targetEmail,
+        subject: `DriveFlyElectric Support Reply - ${session.topic || 'Your Inquiry'}`,
+        text: `Hello ${visitorLabel},\n\n${adminName} replied to your inquiry on DriveFlyElectric:\n\n"${replyContent}"\n\nContinue chatting at: ${storeUrl}`,
+        html
+      })
+      userSent = mailRes.success
+    }
+
+    this.recordActivity({
+      type: 'SUPPORT_REPLY',
+      title: `Support Reply Sent • To ${visitorLabel}`,
+      message: `${adminName}: "${replyContent.slice(0, 120)}"`,
+      userEmail: targetEmail || undefined,
+      emailDispatched: userSent,
+      systemMailDispatched: true
+    })
   }
 }
 

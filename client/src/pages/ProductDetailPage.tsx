@@ -13,10 +13,16 @@ import {
   X,
   Play,
   Download,
-  Check
+  Check,
+  Camera,
+  Upload,
+  CheckCircle2,
+  MessageSquare,
+  ZoomIn
 } from 'lucide-react'
 import { useProducts } from '../contexts/ProductContext'
 import { useCart } from '../contexts/CartContext'
+import { useAuth } from '../contexts/AuthContext'
 
 // Safe URL encoder for filenames with spaces or special characters
 const getSafeMediaUrl = (url?: string) => {
@@ -35,8 +41,19 @@ const isVideoMedia = (url?: string) => {
 export const ProductDetailPage = () => {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
-  const { currentProduct: rawProduct, fetchProductById, fetchProduct, products, isLoading, error } = useProducts()
+  const {
+    currentProduct: rawProduct,
+    fetchProductById,
+    fetchProduct,
+    products,
+    isLoading,
+    error,
+    getReviewsForProduct,
+    fetchProductReviews,
+    submitProductReview
+  } = useProducts()
   const { addToCart } = useCart()
+  const { user } = useAuth()
 
   // Use matching product from memory immediately if available, preventing dark blank screen
   const currentProduct = rawProduct?.id === id ? rawProduct : (products?.find(p => p.id === id) || rawProduct)
@@ -51,6 +68,27 @@ export const ProductDetailPage = () => {
   const [isLightboxOpen, setIsLightboxOpen] = useState(false)
   const [lightboxIndex, setLightboxIndex] = useState(0)
 
+  // Customer Reviews & Multi-Image Upload state
+  const [reviewName, setReviewName] = useState('')
+  const [reviewEmail, setReviewEmail] = useState('')
+  const [reviewRating, setReviewRating] = useState(5)
+  const [reviewTitle, setReviewTitle] = useState('')
+  const [reviewComment, setReviewComment] = useState('')
+  const [reviewFiles, setReviewFiles] = useState<File[]>([])
+  const [reviewPreviews, setReviewPreviews] = useState<string[]>([])
+  const [isSubmittingReview, setIsSubmittingReview] = useState(false)
+  const [reviewFeedback, setReviewFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [showAllReviews, setShowAllReviews] = useState(false)
+  const [zoomedReviewImage, setZoomedReviewImage] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (user) {
+      const fullName = [user.firstName, user.lastName].filter(Boolean).join(' ').trim()
+      if (fullName && !reviewName) setReviewName(fullName)
+      if (user.email && !reviewEmail) setReviewEmail(user.email)
+    }
+  }, [user])
+
   useEffect(() => {
     if (id) {
       if (typeof fetchProductById === 'function') {
@@ -58,10 +96,23 @@ export const ProductDetailPage = () => {
       } else if (typeof fetchProduct === 'function') {
         fetchProduct(id)
       }
+      if (typeof fetchProductReviews === 'function') {
+        fetchProductReviews(id)
+      }
     }
     // Reset selected image when navigating to new product
     setSelectedImageIndex(0)
-  }, [id, fetchProductById, fetchProduct])
+    setShowAllReviews(false)
+  }, [id, fetchProductById, fetchProduct, fetchProductReviews])
+
+  useEffect(() => {
+    if (currentProduct && typeof window !== 'undefined' && window.location.hash === '#reviews') {
+      setTimeout(() => {
+        const el = document.getElementById('reviews')
+        if (el) el.scrollIntoView({ behavior: 'smooth' })
+      }, 150)
+    }
+  }, [currentProduct?.id])
 
   // Dynamic Product SEO Meta Tags & JSON-LD Product Structured Data
   useEffect(() => {
@@ -122,7 +173,7 @@ export const ProductDetailPage = () => {
       aggregateRating: {
         '@type': 'AggregateRating',
         ratingValue: String(currentProduct.rating || 4.9),
-        reviewCount: String(currentProduct.reviewCount || 18)
+        reviewCount: String(Math.max(currentProduct.reviews || 0, 5))
       },
       offers: {
         '@type': 'Offer',
@@ -244,13 +295,13 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
 
     for (let i = 0; i < fullStars; i++) {
       stars.push(
-        <Star key={i} className="w-4 h-4 fill-amber-400 text-amber-400" />
+        <Star key={i} className="w-4 h-4 fill-creamy-400 text-creamy-400" />
       )
     }
 
     if (hasHalfStar) {
       stars.push(
-        <Star key="half" className="w-4 h-4 fill-amber-400/50 text-amber-400" />
+        <Star key="half" className="w-4 h-4 fill-creamy-400/50 text-creamy-400" />
       )
     }
 
@@ -288,7 +339,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
       return (
         <div className="pt-24 min-h-screen flex items-center justify-center bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white transition-colors duration-200">
           <div className="text-center">
-            <div className="w-12 h-12 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+            <div className="w-12 h-12 border-4 border-creamy-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
             <p className="mt-4 text-gray-600 dark:text-gray-400 font-bold text-sm">Loading product details...</p>
           </div>
         </div>
@@ -301,7 +352,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
           <p className="text-red-500 font-bold mb-4">{error || 'Product not found'}</p>
           <button
             onClick={() => navigate('/#store-catalog')}
-            className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider px-5 py-2.5 rounded-xl text-xs transition-transform active:scale-95"
+            className="inline-flex items-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider px-5 py-2.5 rounded-xl text-xs transition-transform active:scale-95"
           >
             <ArrowLeft className="w-4 h-4" />
             Back to Products
@@ -322,9 +373,9 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
         <div className="flex items-center justify-between mb-6">
           <button
             onClick={() => navigate('/#store-catalog')}
-            className="inline-flex items-center gap-2 text-xs sm:text-sm font-extrabold uppercase tracking-wider text-gray-600 dark:text-gray-300 hover:text-amber-500 dark:hover:text-amber-400 transition-colors"
+            className="inline-flex items-center gap-2 text-xs sm:text-sm font-extrabold uppercase tracking-wider text-gray-600 dark:text-gray-300 hover:text-creamy-500 dark:hover:text-creamy-400 transition-colors"
           >
-            <ArrowLeft className="w-4 h-4 text-amber-500" />
+            <ArrowLeft className="w-4 h-4 text-creamy-500" />
             <span>Back to Product Listing</span>
           </button>
 
@@ -377,7 +428,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
               </div>
 
               {/* Enlarge Hint overlay */}
-              <div className="absolute top-3 right-3 bg-black/60 hover:bg-amber-500 hover:text-black text-white backdrop-blur-md p-2 rounded-xl transition-all shadow-md">
+              <div className="absolute top-3 right-3 bg-black/60 hover:bg-creamy-500 hover:text-black text-white backdrop-blur-md p-2 rounded-xl transition-all shadow-md">
                 <Maximize2 className="w-4 h-4" />
               </div>
             </div>
@@ -390,13 +441,13 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                     key={index}
                     onClick={() => setSelectedImageIndex(index)}
                     className={`relative aspect-square bg-white dark:bg-[#15171d] rounded-lg border-2 overflow-hidden transition-all ${selectedImageIndex === index
-                      ? 'border-lime-500 dark:border-lime-400 ring-2 ring-lime-500/20 shadow-md scale-[1.02]'
+                      ? 'border-creamy-500 dark:border-creamy-400 ring-2 ring-creamy-500/20 shadow-md scale-[1.02]'
                       : 'border-gray-200 dark:border-white/10 hover:border-gray-400 dark:hover:border-white/30 opacity-75 hover:opacity-100'
                       }`}
                   >
                     {isVideoMedia(media) ? (
-                      <div className="w-full h-full flex items-center justify-center bg-neutral-900 text-amber-500">
-                        <Play className="w-5 h-5 fill-amber-500" />
+                      <div className="w-full h-full flex items-center justify-center bg-neutral-900 text-creamy-500">
+                        <Play className="w-5 h-5 fill-creamy-500" />
                       </div>
                     ) : (
                       <img
@@ -422,7 +473,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
 
             {/* Tagline with vertical accent bar */}
             <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold text-gray-700 dark:text-gray-300">
-              <span className="w-1 h-5 bg-lime-500 dark:bg-lime-400 rounded-full inline-block flex-shrink-0"></span>
+              <span className="w-1 h-5 bg-creamy-500 dark:bg-creamy-400 rounded-full inline-block flex-shrink-0"></span>
               <span className="font-semibold">{getProductTagline()}</span>
             </div>
 
@@ -437,20 +488,36 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             </div>
 
             {/* Rating Stars */}
-            {currentProduct.rating && (
-              <div className="flex items-center gap-2.5">
-                <div className="flex items-center gap-0.5">
-                  {renderStars(currentProduct.rating)}
-                </div>
-                <span className="text-xs font-bold text-gray-600 dark:text-gray-400">
-                  {currentProduct.rating.toFixed(1)} ({currentProduct.reviews || 28} verified reviews)
-                </span>
-              </div>
-            )}
+            {(() => {
+              const allReviews = getReviewsForProduct(currentProduct)
+              const avgRating =
+                allReviews.length > 0
+                  ? allReviews.reduce((sum, r) => sum + (Number(r.rating) || 5), 0) / allReviews.length
+                  : currentProduct.rating || 4.9
+              const reviewCount = Math.max(currentProduct.reviews || 0, allReviews.length)
+
+              return (
+                <a
+                  href="#reviews"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    document.getElementById('reviews')?.scrollIntoView({ behavior: 'smooth' })
+                  }}
+                  className="inline-flex items-center gap-2.5 group"
+                >
+                  <div className="flex items-center gap-0.5">
+                    {renderStars(avgRating)}
+                  </div>
+                  <span className="text-xs font-bold text-gray-600 dark:text-gray-400 group-hover:text-creamy-500 transition-colors">
+                    {avgRating.toFixed(1)} ({reviewCount} verified reviews)
+                  </span>
+                </a>
+              )
+            })()}
 
             {/* Huge Price Display matching screenshot */}
             <div className="flex items-baseline gap-4 pt-1">
-              <div className="text-4xl sm:text-5xl font-black text-lime-500 dark:text-lime-400 font-anton tracking-tight">
+              <div className="text-4xl sm:text-5xl font-black text-creamy-500 dark:text-creamy-400 font-anton tracking-tight">
                 {formatPrice(currentProduct.price)}
               </div>
               {currentProduct.originalPrice && currentProduct.originalPrice > currentProduct.price && (
@@ -465,7 +532,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
               <div className="font-bold flex items-center gap-2 text-gray-800 dark:text-gray-200">
                 <span className="uppercase text-gray-500 dark:text-gray-400 font-extrabold tracking-wider">SHIPPING:</span>
                 <span className="line-through text-gray-400">$220</span>
-                <span className="text-lime-500 dark:text-lime-400 font-black uppercase">FREE</span>
+                <span className="text-creamy-500 dark:text-creamy-400 font-black uppercase">FREE</span>
                 <span>• delivery in {currentProduct.averageDeliveryTime || '12–20 days'}</span>
               </div>
               <p className="text-[11px] text-gray-500 dark:text-gray-400 font-medium">
@@ -485,7 +552,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                     key={col}
                     onClick={() => setSelectedVariant(col)}
                     className={`px-4 py-2 rounded-lg text-xs font-extrabold uppercase tracking-wider border-2 transition-all ${selectedVariant.toLowerCase() === col.toLowerCase()
-                      ? 'bg-neutral-900 text-white border-lime-500 dark:border-lime-400 shadow-md ring-1 ring-lime-400/30'
+                      ? 'bg-neutral-900 text-white border-creamy-500 dark:border-creamy-400 shadow-md ring-1 ring-creamy-400/30'
                       : 'bg-white dark:bg-[#1a1d24] text-gray-700 dark:text-gray-300 border-gray-200 dark:border-white/10 hover:border-gray-400 dark:hover:border-white/30'
                       }`}
                   >
@@ -521,11 +588,11 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
 
             {/* Action Buttons Row matching reference screenshot: BUY NOW, ADD TO CART, SAVE */}
             <div className="flex flex-col sm:flex-row items-stretch gap-3 pt-2">
-              {/* BUY NOW (Lime green/Amber filled) */}
+              {/* BUY NOW (Creamy green filled) */}
               <button
                 onClick={handleBuyNow}
                 disabled={currentProduct.stock <= 0}
-                className="flex-1 bg-lime-500 hover:bg-lime-400 text-black font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-lg shadow-lime-500/20 disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
+                className="flex-1 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
               >
                 <span>Buy Now</span>
               </button>
@@ -536,7 +603,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                 disabled={currentProduct.stock <= 0}
                 className="flex-1 bg-white hover:bg-gray-100 dark:bg-[#16181e] dark:hover:bg-[#1f222a] border border-gray-300 dark:border-white/20 text-gray-900 dark:text-white font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-md disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
               >
-                <ShoppingCart className="w-4 h-4 text-amber-500" />
+                <ShoppingCart className="w-4 h-4 text-creamy-500" />
                 <span>Add to Cart</span>
               </button>
 
@@ -557,13 +624,13 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             {/* Download Product Information Card matching reference screenshot */}
             <div
               onClick={handleDownloadSpecs}
-              className="group cursor-pointer bg-white dark:bg-[#16181e] border border-gray-200 dark:border-white/10 hover:border-lime-500/50 dark:hover:border-lime-400/50 rounded-xl p-4 flex items-center gap-3.5 transition-all shadow-sm hover:shadow-md"
+              className="group cursor-pointer bg-white dark:bg-[#16181e] border border-gray-200 dark:border-white/10 hover:border-creamy-500/50 dark:hover:border-creamy-400/50 rounded-xl p-4 flex items-center gap-3.5 transition-all shadow-sm hover:shadow-md"
             >
-              <div className="w-10 h-10 rounded-lg bg-lime-500/10 border border-lime-500/20 flex items-center justify-center text-lime-600 dark:text-lime-400 flex-shrink-0 group-hover:scale-110 transition-transform">
+              <div className="w-10 h-10 rounded-lg bg-creamy-500/10 border border-creamy-500/20 flex items-center justify-center text-creamy-600 dark:text-creamy-400 flex-shrink-0 group-hover:scale-110 transition-transform">
                 <Download className="w-5 h-5" />
               </div>
               <div className="flex-1">
-                <h4 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white group-hover:text-lime-500 dark:group-hover:text-lime-400 transition-colors">
+                <h4 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white group-hover:text-creamy-500 dark:group-hover:text-creamy-400 transition-colors">
                   Download Product Information
                 </h4>
                 <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
@@ -633,14 +700,417 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                 <span>100% Factory Verified & Tested</span>
               </div>
               <div className="flex items-center gap-2">
-                <Truck className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                <Truck className="w-4 h-4 text-creamy-500 flex-shrink-0" />
                 <span>Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Dispatch</span>
               </div>
             </div>
 
           </div>
         </div>
+
+        {/* CUSTOMER REVIEWS & MULTI-IMAGE UPLOAD SECTION (CONSTANTLY VISIBLE 5+ REVIEWS BELOW ITEM LISTING) */}
+        {(() => {
+          const allReviews = getReviewsForProduct(currentProduct)
+          const visibleReviews = showAllReviews ? allReviews : allReviews.slice(0, 5)
+          const totalReviewCount = Math.max(currentProduct.reviews || 0, allReviews.length)
+          const avgRating =
+            allReviews.length > 0
+              ? (
+                  allReviews.reduce((acc, item) => acc + (Number(item.rating) || 5), 0) /
+                  allReviews.length
+                ).toFixed(1)
+              : '4.9'
+
+          const handlePhotoSelection = (e: React.ChangeEvent<HTMLInputElement>) => {
+            const picked = Array.from(e.target.files || [])
+            if (picked.length === 0) return
+            const nextFiles = [...reviewFiles, ...picked].slice(0, 4)
+            reviewPreviews.forEach((url) => URL.revokeObjectURL(url))
+            setReviewFiles(nextFiles)
+            setReviewPreviews(nextFiles.map((file) => URL.createObjectURL(file)))
+            e.target.value = ''
+          }
+
+          const removePickedPhoto = (idx: number) => {
+            const nextFiles = reviewFiles.filter((_, index) => index !== idx)
+            reviewPreviews.forEach((url) => URL.revokeObjectURL(url))
+            setReviewFiles(nextFiles)
+            setReviewPreviews(nextFiles.map((file) => URL.createObjectURL(file)))
+          }
+
+          const handleDetailReviewSubmit = async (e: React.FormEvent) => {
+            e.preventDefault()
+            if (!reviewName.trim() || !reviewComment.trim()) {
+              setReviewFeedback({ type: 'error', text: 'Please enter your name and review feedback.' })
+              return
+            }
+
+            try {
+              setIsSubmittingReview(true)
+              setReviewFeedback(null)
+              await submitProductReview(
+                currentProduct.id,
+                {
+                  reviewerName: reviewName.trim(),
+                  reviewerEmail: reviewEmail.trim() || undefined,
+                  rating: reviewRating,
+                  title: reviewTitle.trim() || undefined,
+                  comment: reviewComment.trim(),
+                },
+                reviewFiles
+              )
+              setReviewTitle('')
+              setReviewComment('')
+              reviewPreviews.forEach((url) => URL.revokeObjectURL(url))
+              setReviewFiles([])
+              setReviewPreviews([])
+              setReviewRating(5)
+              setReviewFeedback({
+                type: 'success',
+                text: 'Your verified customer review and photos have been published below.',
+              })
+            } catch (err: any) {
+              setReviewFeedback({
+                type: 'error',
+                text: err?.message || 'Unable to submit review right now. Please try again.',
+              })
+            } finally {
+              setIsSubmittingReview(false)
+            }
+          }
+
+          return (
+            <section
+              id="reviews"
+              className="mt-12 pt-10 border-t border-gray-200 dark:border-white/10 space-y-8"
+            >
+              {/* Reviews Header Banner */}
+              <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+                <div>
+                  <span className="text-[11px] font-black uppercase tracking-widest text-[#357c47] dark:text-[#76cf89]">
+                    Verified Owner Feedback
+                  </span>
+                  <h2 className="text-2xl sm:text-3xl font-anton uppercase tracking-tight text-gray-900 dark:text-white mt-1">
+                    Customer Reviews &amp; Delivery Photos
+                  </h2>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    Showing {Math.min(5, visibleReviews.length)} constantly visible verified reviews below{' '}
+                    {currentProduct.name}. Upload your own delivery or action photos below.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-4 bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-xl px-4 py-3 shadow-sm">
+                  <div className="text-center pr-4 border-r border-gray-200 dark:border-white/10">
+                    <p className="font-anton text-3xl text-[#357c47] dark:text-[#76cf89] leading-none">
+                      {avgRating}
+                    </p>
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400 mt-1">
+                      Out of 5.0
+                    </p>
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-0.5 text-[#58b970]">
+                      {[1, 2, 3, 4, 5].map((starIdx) => (
+                        <Star key={starIdx} className="w-4 h-4 fill-[#58b970] text-[#58b970]" />
+                      ))}
+                    </div>
+                    <p className="text-xs font-bold text-gray-700 dark:text-gray-300 mt-1">
+                      {totalReviewCount} Verified Owner Reviews
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                {/* Left Column: Interactive Review & Multi-Image Upload Form */}
+                <div className="lg:col-span-5 bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl p-5 sm:p-6 shadow-sm">
+                  <div className="flex items-center gap-2 pb-3 mb-4 border-b border-gray-200 dark:border-white/10">
+                    <Camera className="w-4 h-4 text-[#58b970]" />
+                    <h3 className="font-anton text-lg uppercase tracking-wide text-gray-900 dark:text-white">
+                      Write a Review With Photos
+                    </h3>
+                  </div>
+
+                  <form onSubmit={handleDetailReviewSubmit} className="space-y-4">
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1.5">
+                        Rating *
+                      </label>
+                      <div className="flex items-center gap-1.5">
+                        {[1, 2, 3, 4, 5].map((starValue) => (
+                          <button
+                            key={starValue}
+                            type="button"
+                            onClick={() => setReviewRating(starValue)}
+                            className="p-1 rounded hover:scale-110 transition-transform"
+                            aria-label={`Rate ${starValue} out of 5 stars`}
+                          >
+                            <Star
+                              className={`w-6 h-6 ${
+                                starValue <= reviewRating
+                                  ? 'fill-[#58b970] text-[#58b970]'
+                                  : 'text-gray-300 dark:text-gray-600'
+                              }`}
+                            />
+                          </button>
+                        ))}
+                        <span className="ml-2 text-xs font-bold text-gray-600 dark:text-gray-300">
+                          {reviewRating} / 5 Stars
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                          Your Name *
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={reviewName}
+                          onChange={(e) => setReviewName(e.target.value)}
+                          placeholder="Full Name"
+                          className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                          Email (Optional)
+                        </label>
+                        <input
+                          type="email"
+                          value={reviewEmail}
+                          onChange={(e) => setReviewEmail(e.target.value)}
+                          placeholder="you@example.com"
+                          className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                        Review Headline
+                      </label>
+                      <input
+                        type="text"
+                        value={reviewTitle}
+                        onChange={(e) => setReviewTitle(e.target.value)}
+                        placeholder="Summarize your build quality or ride experience"
+                        className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                        Review Details *
+                      </label>
+                      <textarea
+                        required
+                        rows={4}
+                        value={reviewComment}
+                        onChange={(e) => setReviewComment(e.target.value)}
+                        placeholder="Tell other buyers about crating quality, assembly, performance, and range..."
+                        className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1.5">
+                        Attach Photos (Up to 4 Images)
+                      </label>
+                      <label className="flex flex-col items-center justify-center gap-1.5 p-4 rounded-xl border-2 border-dashed border-gray-300 dark:border-white/15 hover:border-[#58b970] bg-gray-50 dark:bg-[#111115] cursor-pointer transition-colors">
+                        <Upload className="w-5 h-5 text-[#58b970]" />
+                        <span className="text-xs font-bold text-gray-700 dark:text-gray-200">
+                          Click to upload unboxing or riding photos
+                        </span>
+                        <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                          JPG, PNG, WEBP, GIF ({reviewFiles.length}/4 uploaded)
+                        </span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          onChange={handlePhotoSelection}
+                          className="hidden"
+                        />
+                      </label>
+
+                      {reviewPreviews.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-3">
+                          {reviewPreviews.map((url, idx) => (
+                            <div
+                              key={url}
+                              className="relative w-16 h-16 rounded-lg overflow-hidden border border-gray-200 dark:border-white/10"
+                            >
+                              <img src={url} alt={`Selected upload ${idx + 1}`} className="w-full h-full object-cover" />
+                              <button
+                                type="button"
+                                onClick={() => removePickedPhoto(idx)}
+                                className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/75 text-white hover:bg-red-600"
+                                aria-label="Remove selected photo"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {reviewFeedback && (
+                      <div
+                        className={`p-3 rounded-lg text-xs font-bold ${
+                          reviewFeedback.type === 'success'
+                            ? 'bg-[#e1f6e5] text-[#255131] border border-[#76cf89]'
+                            : 'bg-red-500/10 text-red-500 border border-red-500/30'
+                        }`}
+                      >
+                        {reviewFeedback.text}
+                      </div>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={isSubmittingReview}
+                      className="w-full py-3 rounded-xl bg-[#58b970] hover:bg-[#76cf89] text-black font-black uppercase tracking-widest text-xs transition-colors disabled:opacity-50"
+                    >
+                      {isSubmittingReview ? 'Uploading Photos & Publishing...' : 'Submit Verified Review'}
+                    </button>
+                  </form>
+                </div>
+
+                {/* Right Column: Constantly Visible 5+ Customer Reviews */}
+                <div className="lg:col-span-7 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-anton text-lg uppercase tracking-wide text-gray-900 dark:text-white flex items-center gap-2">
+                      <MessageSquare className="w-4 h-4 text-[#58b970]" />
+                      <span>Recent Customer Reviews ({visibleReviews.length})</span>
+                    </h3>
+                    {allReviews.length > 5 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllReviews((prev) => !prev)}
+                        className="text-xs font-bold text-[#357c47] dark:text-[#76cf89] hover:underline"
+                      >
+                        {showAllReviews ? 'Show Top 5 Reviews' : `Show All ${allReviews.length} Reviews`}
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-3.5">
+                    {visibleReviews.map((review) => (
+                      <article
+                        key={review.id}
+                        className="bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl p-4 sm:p-5 shadow-sm space-y-2.5"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 rounded-full bg-[#e1f6e5] dark:bg-[#255131]/70 text-[#255131] dark:text-[#9de0ab] font-black text-xs flex items-center justify-center uppercase">
+                              {(review.reviewerName || 'U').slice(0, 2)}
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-extrabold text-gray-900 dark:text-white">
+                                  {review.reviewerName}
+                                </span>
+                                {review.verifiedPurchase && (
+                                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-[#e1f6e5] dark:bg-[#255131]/60 text-[#2c623a] dark:text-[#9de0ab] text-[9px] font-bold uppercase tracking-wider">
+                                    <CheckCircle2 className="w-2.5 h-2.5" />
+                                    Verified Buyer
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[10px] text-gray-500 dark:text-gray-400">
+                                {review.createdAt
+                                  ? new Date(review.createdAt).toLocaleDateString('en-US', {
+                                      year: 'numeric',
+                                      month: 'short',
+                                      day: 'numeric',
+                                    })
+                                  : 'Verified Delivery'}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-0.5">
+                            {[1, 2, 3, 4, 5].map((starVal) => (
+                              <Star
+                                key={starVal}
+                                className={`w-3.5 h-3.5 ${
+                                  starVal <= (review.rating || 5)
+                                    ? 'fill-[#58b970] text-[#58b970]'
+                                    : 'text-gray-300 dark:text-gray-700'
+                                }`}
+                              />
+                            ))}
+                          </div>
+                        </div>
+
+                        {review.title && (
+                          <h4 className="text-xs sm:text-sm font-extrabold text-gray-900 dark:text-white">
+                            {review.title}
+                          </h4>
+                        )}
+
+                        <p className="text-xs leading-relaxed text-gray-600 dark:text-gray-300">
+                          {review.comment}
+                        </p>
+
+                        {review.images && review.images.length > 0 && (
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            {review.images.map((imgUrl, idx) => (
+                              <button
+                                key={idx}
+                                type="button"
+                                onClick={() => setZoomedReviewImage(getSafeMediaUrl(imgUrl))}
+                                className="relative group w-20 h-20 rounded-xl overflow-hidden border border-gray-200 dark:border-white/10 hover:border-[#58b970] transition-colors"
+                                title="Click to enlarge customer photo"
+                              >
+                                <img
+                                  src={getSafeMediaUrl(imgUrl)}
+                                  alt={`Customer upload by ${review.reviewerName}`}
+                                  className="w-full h-full object-cover"
+                                />
+                                <span className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity">
+                                  <ZoomIn className="w-4 h-4 text-white" />
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+          )
+        })()}
       </div>
+
+      {/* FULLSCREEN REVIEW PHOTO LIGHTBOX MODAL */}
+      {zoomedReviewImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setZoomedReviewImage(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setZoomedReviewImage(null)}
+            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-[#58b970] hover:text-black text-white transition-colors"
+            aria-label="Close review image preview"
+          >
+            <X className="w-6 h-6" />
+          </button>
+          <img
+            src={zoomedReviewImage}
+            alt="Enlarged customer review photo"
+            className="max-h-[85vh] max-w-[92vw] rounded-2xl object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      )}
 
       {/* FULL-SCREEN MEDIA LIGHTBOX / VIEWER MODAL */}
       {isLightboxOpen && (
@@ -648,7 +1118,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
           {/* Header */}
           <div className="flex items-center justify-between text-white max-w-6xl w-full mx-auto pb-3 border-b border-white/10">
             <div>
-              <h3 className="font-anton text-lg sm:text-xl uppercase tracking-wider text-lime-400">
+              <h3 className="font-anton text-lg sm:text-xl uppercase tracking-wider text-creamy-400">
                 {currentProduct.name}
               </h3>
               <p className="text-xs text-gray-400">
@@ -657,7 +1127,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             </div>
             <button
               onClick={() => setIsLightboxOpen(false)}
-              className="p-2 rounded-full bg-white/10 hover:bg-lime-500 hover:text-black transition-colors"
+              className="p-2 rounded-full bg-white/10 hover:bg-creamy-500 hover:text-black transition-colors"
               title="Close (Esc)"
             >
               <X className="w-6 h-6" />
@@ -670,7 +1140,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             {mediaList.length > 1 && (
               <button
                 onClick={() => setLightboxIndex((prev) => (prev - 1 + mediaList.length) % mediaList.length)}
-                className="absolute left-2 sm:left-4 z-10 p-3 rounded-full bg-black/60 hover:bg-lime-500 hover:text-black text-white transition-all backdrop-blur-sm"
+                className="absolute left-2 sm:left-4 z-10 p-3 rounded-full bg-black/60 hover:bg-creamy-500 hover:text-black text-white transition-all backdrop-blur-sm"
                 title="Previous (Left Arrow)"
               >
                 <ChevronLeft className="w-6 h-6 sm:w-8 sm:h-8" />
@@ -705,7 +1175,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             {mediaList.length > 1 && (
               <button
                 onClick={() => setLightboxIndex((prev) => (prev + 1) % mediaList.length)}
-                className="absolute right-2 sm:right-4 z-10 p-3 rounded-full bg-black/60 hover:bg-lime-500 hover:text-black text-white transition-all backdrop-blur-sm"
+                className="absolute right-2 sm:right-4 z-10 p-3 rounded-full bg-black/60 hover:bg-creamy-500 hover:text-black text-white transition-all backdrop-blur-sm"
                 title="Next (Right Arrow)"
               >
                 <ChevronRight className="w-6 h-6 sm:w-8 sm:h-8" />
@@ -722,13 +1192,13 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                     key={idx}
                     onClick={() => setLightboxIndex(idx)}
                     className={`relative flex-shrink-0 w-16 h-16 sm:w-20 sm:h-20 rounded-xl overflow-hidden border-2 transition-all ${lightboxIndex === idx
-                      ? 'border-lime-500 ring-2 ring-lime-500 scale-105'
-                      : 'border-white/20 opacity-60 hover:opacity-100 hover:border-lime-500/50'
+                      ? 'border-creamy-500 ring-2 ring-creamy-500 scale-105'
+                      : 'border-white/20 opacity-60 hover:opacity-100 hover:border-creamy-500/50'
                       }`}
                   >
                     {isVideoMedia(thumb) ? (
-                      <div className="w-full h-full flex items-center justify-center bg-neutral-900 text-amber-500">
-                        <Play className="w-5 h-5 fill-amber-500" />
+                      <div className="w-full h-full flex items-center justify-center bg-neutral-900 text-creamy-500">
+                        <Play className="w-5 h-5 fill-creamy-500" />
                       </div>
                     ) : (
                       <img

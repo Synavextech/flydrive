@@ -11,7 +11,10 @@ export const getEvents = async (req: Request, res: Response) => {
     const query = req.query as EventsQuery
     const { view, category, limit = 10, offset = 0 } = query
 
-    let queryBuilder = supabase.from('events').select('*', { count: 'exact' })
+    let queryBuilder = supabase
+      .from('events')
+      .select('*', { count: 'exact' })
+      .neq('category', 'LIVECHAT_SESSION')
 
     if (category) {
       queryBuilder = queryBuilder.ilike('category', category)

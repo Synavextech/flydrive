@@ -6,11 +6,15 @@ import {
   updateOrderStatus,
   cancelOrder,
   getOrderStats,
-  downloadOrderReceiptPdf
+  downloadOrderReceiptPdf,
+  trackOrder
 } from '../controllers/orderController.js'
 import { protect, authorize, optionalAuth } from '../middleware/auth.js'
 
 const router = express.Router()
+
+// Public order tracking lookup by Tracking Number or Order Number
+router.get('/track/:identifier', optionalAuth, trackOrder)
 
 // Customer order placement allows guest checkout with optional authentication
 router.post('/', optionalAuth, createOrder)

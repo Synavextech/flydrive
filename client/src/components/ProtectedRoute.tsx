@@ -26,7 +26,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
     return (
       <div className="pt-24 min-h-screen flex items-center justify-center bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white transition-colors duration-200">
         <div className="text-center p-8 bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl">
-          <div className="w-10 h-10 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+          <div className="w-10 h-10 border-4 border-creamy-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
           <p className="text-xs font-bold text-gray-600 dark:text-gray-300 uppercase tracking-wider">Verifying permissions...</p>
         </div>
       </div>
@@ -49,11 +49,11 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
           <h2 className="text-xl font-black uppercase text-gray-900 dark:text-white mb-2">Access Restricted</h2>
           <p className="text-xs text-gray-600 dark:text-gray-400 mb-6 font-medium leading-relaxed">
             Administrative permissions required. Your current account role is{' '}
-            <span className="font-bold text-amber-500 uppercase">{user?.role}</span>.
+            <span className="font-bold text-creamy-500 uppercase">{user?.role}</span>.
           </p>
           <Link
             to="/"
-            className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider py-2.5 px-6 rounded-xl transition-all text-xs"
+            className="inline-flex items-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-2.5 px-6 rounded-xl transition-all text-xs"
           >
             <ArrowLeft className="w-4 h-4" />
             Return to Store

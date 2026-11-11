@@ -4,6 +4,7 @@ import pg from 'pg'
 import type {
   User,
   Product,
+  ProductReview,
   Cart,
   CartItem,
   Order,
@@ -17,6 +18,7 @@ const { Pool } = pg
 export class DatabaseService {
   public supabase: SupabaseClient
   public pool: pg.Pool | null = null
+  private reviewsMemoryCache: Map<string, ProductReview[]> = new Map()
 
   constructor(client: SupabaseClient = supabase) {
     this.supabase = client
@@ -25,6 +27,74 @@ export class DatabaseService {
         connectionString: process.env.DATABASE_URL,
         ssl: { rejectUnauthorized: false }
       })
+      this.ensureSecondaryFeaturesSchema().catch(err => {
+        console.warn('Database auto-migration notice:', err?.message || err)
+      })
+    }
+  }
+
+  public async ensureSecondaryFeaturesSchema(): Promise<void> {
+    if (!this.pool) return
+    await this.pool.query(`
+      ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
+      CREATE INDEX IF NOT EXISTS idx_orders_tracking_number ON public.orders(tracking_number);
+      UPDATE public.orders SET tracking_number = 'TRK-' || order_number WHERE tracking_number IS NULL AND order_number IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS public.product_reviews (
+        id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+        product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE NOT NULL,
+        user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
+        reviewer_name TEXT NOT NULL,
+        reviewer_email TEXT,
+        rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL DEFAULT 5,
+        title TEXT,
+        comment TEXT NOT NULL,
+        images TEXT[] DEFAULT '{}',
+        verified_purchase BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_product_reviews_product_id ON public.product_reviews(product_id);
+      CREATE INDEX IF NOT EXISTS idx_product_reviews_created_at ON public.product_reviews(created_at DESC);
+      ALTER TABLE public.product_reviews ENABLE ROW LEVEL SECURITY;
+      DROP POLICY IF EXISTS "Public can view product reviews" ON public.product_reviews;
+      CREATE POLICY "Public can view product reviews" ON public.product_reviews FOR SELECT USING (true);
+      DROP POLICY IF EXISTS "Anyone can submit product reviews" ON public.product_reviews;
+      CREATE POLICY "Anyone can submit product reviews" ON public.product_reviews FOR INSERT WITH CHECK (true);
+      DROP POLICY IF EXISTS "Admins can manage product reviews" ON public.product_reviews;
+      CREATE POLICY "Admins can manage product reviews" ON public.product_reviews FOR ALL USING (true) WITH CHECK (true);
+      NOTIFY pgrst, 'reload schema';
+    `)
+  }
+
+  public generateTrackingNumber(orderNumber?: string): string {
+    const suffix = crypto.randomBytes(2).toString('hex').toUpperCase()
+    const cleanNum = (orderNumber || `DFE-${Date.now()}`).replace(/^DFE-?/i, '')
+    return `TRK-DFE-${cleanNum.slice(-6)}-${suffix}`
+  }
+
+  public extractTrackingFromNotes(notes?: string | null, fallbackOrderNumber?: string): string {
+    if (notes) {
+      const match = notes.match(/\[TRACKING:([A-Z0-9-]+)\]/i)
+      if (match && match[1]) return match[1].toUpperCase()
+    }
+    return `TRK-${fallbackOrderNumber || 'DFE'}`
+  }
+
+  public mapProductReview(raw: any): ProductReview {
+    return {
+      id: raw.id,
+      productId: raw.product_id || raw.productId,
+      userId: raw.user_id || raw.userId || null,
+      reviewerName: raw.reviewer_name || raw.reviewerName || 'Verified Buyer',
+      reviewerEmail: raw.reviewer_email || raw.reviewerEmail || null,
+      rating: Math.min(5, Math.max(1, Number(raw.rating || 5))),
+      title: raw.title || null,
+      comment: raw.comment || '',
+      images: Array.isArray(raw.images) ? raw.images : [],
+      verifiedPurchase: raw.verified_purchase ?? raw.verifiedPurchase ?? true,
+      createdAt: raw.created_at ? new Date(raw.created_at) : raw.createdAt ? new Date(raw.createdAt) : new Date(),
+      updatedAt: raw.updated_at ? new Date(raw.updated_at) : raw.updatedAt ? new Date(raw.updatedAt) : new Date()
     }
   }
 
@@ -91,10 +161,19 @@ export class DatabaseService {
   }
 
   public mapOrder(raw: any): Order {
+    const trackingNumber =
+      raw.tracking_number ||
+      raw.trackingNumber ||
+      this.extractTrackingFromNotes(raw.notes, raw.order_number)
+    const cleanedNotes = raw.notes
+      ? String(raw.notes).replace(/\s*\[TRACKING:[A-Z0-9-]+\]/gi, '').trim() || null
+      : null
+
     return {
       id: raw.id,
       userId: raw.user_id,
       orderNumber: raw.order_number,
+      trackingNumber,
       status: raw.status,
       total: Number(raw.total),
       subtotal: Number(raw.subtotal),
@@ -106,7 +185,7 @@ export class DatabaseService {
       paymentId: raw.payment_id || null,
       shippingAddressId: raw.shipping_address_id || null,
       billingAddressId: raw.billing_address_id || null,
-      notes: raw.notes || null,
+      notes: cleanedNotes,
       createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
       updatedAt: raw.updated_at ? new Date(raw.updated_at) : new Date(),
       items: Array.isArray(raw.order_items) ? raw.order_items.map((oi: any) => ({
@@ -587,28 +666,59 @@ export class DatabaseService {
   }): Promise<Order> {
     const orderId = crypto.randomUUID()
     const orderNumber = `DFE-${Date.now()}`
+    const trackingNumber = this.generateTrackingNumber(orderNumber)
+    const notesWithTracking = orderData.notes
+      ? `${orderData.notes} [TRACKING:${trackingNumber}]`
+      : `[TRACKING:${trackingNumber}]`
 
-    const { data: order, error: orderError } = await this.supabase
+    const baseInsertPayload: Record<string, any> = {
+      id: orderId,
+      user_id: orderData.userId,
+      order_number: orderNumber,
+      total: orderData.total,
+      subtotal: orderData.subtotal,
+      tax: orderData.tax || 0,
+      shipping: orderData.shipping || 0,
+      discount: orderData.discount || 0,
+      payment_method: orderData.paymentMethod,
+      payment_id: orderData.paymentId || null,
+      payment_status: orderData.paymentStatus || 'PENDING',
+      status: orderData.status || (orderData.paymentStatus === 'COMPLETED' ? 'PROCESSING' : 'PENDING'),
+      shipping_address_id: orderData.shippingAddressId,
+      billing_address_id: orderData.billingAddressId,
+      notes: notesWithTracking
+    }
+
+    let order: any = null
+    let orderError: any = null
+
+    const firstAttempt = await this.supabase
       .from('orders')
       .insert({
-        id: orderId,
-        user_id: orderData.userId,
-        order_number: orderNumber,
-        total: orderData.total,
-        subtotal: orderData.subtotal,
-        tax: orderData.tax || 0,
-        shipping: orderData.shipping || 0,
-        discount: orderData.discount || 0,
-        payment_method: orderData.paymentMethod,
-        payment_id: orderData.paymentId || null,
-        payment_status: orderData.paymentStatus || 'PENDING',
-        status: orderData.status || (orderData.paymentStatus === 'COMPLETED' ? 'PROCESSING' : 'PENDING'),
-        shipping_address_id: orderData.shippingAddressId,
-        billing_address_id: orderData.billingAddressId,
-        notes: orderData.notes
+        ...baseInsertPayload,
+        tracking_number: trackingNumber
       })
       .select()
       .single()
+
+    if (firstAttempt.error) {
+      // Fallback if PostgREST schema cache hasn't refreshed tracking_number yet
+      const secondAttempt = await this.supabase
+        .from('orders')
+        .insert(baseInsertPayload)
+        .select()
+        .single()
+      order = secondAttempt.data
+      orderError = secondAttempt.error
+
+      if (order && this.pool) {
+        await this.pool
+          .query('UPDATE public.orders SET tracking_number = $1 WHERE id = $2', [trackingNumber, orderId])
+          .catch(() => {})
+      }
+    } else {
+      order = firstAttempt.data
+    }
 
     if (orderError || !order) throw orderError || new Error('Failed to create order')
 
@@ -674,6 +784,273 @@ export class DatabaseService {
 
     if (error) throw error
     return data ? this.mapOrder(data) : null
+  }
+
+  async findOrderByTrackingOrNumber(identifier: string): Promise<Order | null> {
+    const cleaned = (identifier || '').trim().replace(/^#/, '').toUpperCase()
+    if (!cleaned) return null
+
+    // 1. Check recent orders via Supabase with full relational join
+    try {
+      const { data: rows, error } = await this.supabase
+        .from('orders')
+        .select('*, order_items(*, products(*)), users(*), shipping_address:addresses!orders_shipping_address_id_fkey(*)')
+        .order('created_at', { ascending: false })
+        .limit(200)
+
+      if (!error && Array.isArray(rows)) {
+        for (const r of rows) {
+          const mapped = this.mapOrder(r)
+          const orderNumUpper = (mapped.orderNumber || '').toUpperCase()
+          const trackUpper = (mapped.trackingNumber || '').toUpperCase()
+          const derivedTrackUpper = `TRK-${orderNumUpper}`
+          if (
+            trackUpper === cleaned ||
+            orderNumUpper === cleaned ||
+            derivedTrackUpper === cleaned ||
+            r.id === identifier.trim()
+          ) {
+            return mapped
+          }
+        }
+      }
+    } catch {
+      // Fallback to direct PostgreSQL pool if needed
+    }
+
+    if (this.pool) {
+      const res = await this.pool.query(
+        `SELECT * FROM public.orders
+         WHERE UPPER(COALESCE(tracking_number, '')) = $1
+            OR UPPER(order_number) = $1
+            OR UPPER('TRK-' || order_number) = $1
+            OR notes ILIKE $2
+         ORDER BY created_at DESC LIMIT 1`,
+        [cleaned, `%[TRACKING:${cleaned}]%`]
+      )
+      if (res.rows[0]) {
+        return this.findOrderById(res.rows[0].id)
+      }
+    }
+
+    return null
+  }
+
+  // ==================== PRODUCT REVIEW OPERATIONS ====================
+  async getProductReviews(productId?: string): Promise<ProductReview[]> {
+    const reviewMap = new Map<string, ProductReview>()
+
+    // 1. Seed from memory cache first
+    if (productId) {
+      for (const r of this.reviewsMemoryCache.get(productId) || []) {
+        reviewMap.set(r.id, r)
+      }
+    } else {
+      for (const list of this.reviewsMemoryCache.values()) {
+        for (const r of list) reviewMap.set(r.id, r)
+      }
+    }
+
+    // 2. Query dedicated product_reviews table via Supabase
+    try {
+      let query = this.supabase
+        .from('product_reviews')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(250)
+
+      if (productId) {
+        query = query.eq('product_id', productId)
+      }
+
+      const { data, error } = await query
+      if (!error && Array.isArray(data)) {
+        for (const row of data) {
+          const mapped = this.mapProductReview(row)
+          reviewMap.set(mapped.id, mapped)
+        }
+      }
+    } catch {
+      // Fallback to pool / events
+    }
+
+    // 3. Query via PostgreSQL pool if available
+    if (this.pool && reviewMap.size === 0) {
+      try {
+        const sql = productId
+          ? 'SELECT * FROM public.product_reviews WHERE product_id = $1 ORDER BY created_at DESC LIMIT 100'
+          : 'SELECT * FROM public.product_reviews ORDER BY created_at DESC LIMIT 250'
+        const params = productId ? [productId] : []
+        const res = await this.pool.query(sql, params)
+        for (const row of res.rows) {
+          const mapped = this.mapProductReview(row)
+          reviewMap.set(mapped.id, mapped)
+        }
+      } catch {
+        // Ignore if table not yet created
+      }
+    }
+
+    // 4. Check public.events fallback (category = 'PRODUCT_REVIEW')
+    try {
+      let evQuery = this.supabase
+        .from('events')
+        .select('*')
+        .eq('category', 'PRODUCT_REVIEW')
+        .order('created_at', { ascending: false })
+        .limit(200)
+
+      if (productId) {
+        evQuery = evQuery.eq('location', productId)
+      }
+
+      const { data: evRows } = await evQuery
+      for (const ev of evRows || []) {
+        if (ev.description && !reviewMap.has(ev.id)) {
+          try {
+            const parsed = JSON.parse(ev.description)
+            const mapped = this.mapProductReview({ ...parsed, id: ev.id })
+            if (!productId || mapped.productId === productId) {
+              reviewMap.set(mapped.id, mapped)
+            }
+          } catch {
+            // Skip malformed JSON
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return Array.from(reviewMap.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )
+  }
+
+  async createProductReview(input: {
+    productId: string
+    userId?: string | null
+    reviewerName: string
+    reviewerEmail?: string | null
+    rating: number
+    title?: string | null
+    comment: string
+    images?: string[]
+  }): Promise<ProductReview> {
+    const id = `rev_${crypto.randomUUID()}`
+    const nowIso = new Date().toISOString()
+    const cleanRating = Math.min(5, Math.max(1, Math.round(Number(input.rating || 5))))
+    const cleanImages = Array.isArray(input.images)
+      ? input.images.filter(Boolean).slice(0, 6)
+      : []
+
+    const reviewObj: ProductReview = {
+      id,
+      productId: input.productId,
+      userId: input.userId || null,
+      reviewerName: (input.reviewerName || 'Verified Customer').trim(),
+      reviewerEmail: input.reviewerEmail ? input.reviewerEmail.trim() : null,
+      rating: cleanRating,
+      title: input.title ? input.title.trim() : null,
+      comment: input.comment.trim(),
+      images: cleanImages,
+      verifiedPurchase: true,
+      createdAt: new Date(nowIso),
+      updatedAt: new Date(nowIso)
+    }
+
+    const existingList = this.reviewsMemoryCache.get(input.productId) || []
+    this.reviewsMemoryCache.set(input.productId, [reviewObj, ...existingList])
+
+    let persistedToTable = false
+
+    // 1. Insert into public.product_reviews via Supabase
+    try {
+      const { error } = await this.supabase.from('product_reviews').insert({
+        id: reviewObj.id,
+        product_id: reviewObj.productId,
+        user_id: reviewObj.userId,
+        reviewer_name: reviewObj.reviewerName,
+        reviewer_email: reviewObj.reviewerEmail,
+        rating: reviewObj.rating,
+        title: reviewObj.title,
+        comment: reviewObj.comment,
+        images: reviewObj.images,
+        verified_purchase: true,
+        created_at: nowIso,
+        updated_at: nowIso
+      })
+      if (!error) persistedToTable = true
+    } catch {
+      // Fallback below
+    }
+
+    // 2. Fallback via PostgreSQL pool
+    if (!persistedToTable && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.product_reviews
+           (id, product_id, user_id, reviewer_name, reviewer_email, rating, title, comment, images, verified_purchase, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $10)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            reviewObj.id,
+            reviewObj.productId,
+            reviewObj.userId,
+            reviewObj.reviewerName,
+            reviewObj.reviewerEmail,
+            reviewObj.rating,
+            reviewObj.title,
+            reviewObj.comment,
+            reviewObj.images,
+            nowIso
+          ]
+        )
+        persistedToTable = true
+      } catch {
+        // Fallback to events table below
+      }
+    }
+
+    // 3. Mirror in public.events (category = 'PRODUCT_REVIEW') for zero-downtime persistence
+    try {
+      await this.supabase.from('events').upsert({
+        id: reviewObj.id,
+        title: `REVIEW:${reviewObj.productId}:${reviewObj.reviewerName}`,
+        description: JSON.stringify(reviewObj),
+        date: nowIso.slice(0, 10),
+        time: nowIso,
+        location: reviewObj.productId,
+        category: 'PRODUCT_REVIEW',
+        status: 'upcoming',
+        updated_at: nowIso
+      }, { onConflict: 'id' })
+    } catch {
+      // Non-fatal
+    }
+
+    // 4. Update product aggregate review count & rating
+    try {
+      const prod = await this.findProductById(input.productId)
+      if (prod) {
+        const prevCount = Math.max(5, Number(prod.reviews || 5))
+        const prevRating = Number(prod.rating || 4.9)
+        const nextCount = prevCount + 1
+        const nextRating = Number(((prevRating * prevCount + cleanRating) / nextCount).toFixed(2))
+        await this.supabase
+          .from('products')
+          .update({
+            reviews: nextCount,
+            rating: Math.min(5, Math.max(1, nextRating)),
+            updated_at: nowIso
+          })
+          .eq('id', input.productId)
+      }
+    } catch {
+      // Non-fatal
+    }
+
+    return reviewObj
   }
 
   async updateOrderStatus(id: string, status: string): Promise<Order> {
@@ -804,6 +1181,565 @@ export class DatabaseService {
     const { count, error } = await this.supabase.from('users').select('*', { count: 'exact', head: true })
     if (error) throw error
     return count ?? 0
+  }
+
+  // ==================== REAL-TIME LIVECHAT & SUPPORT OPERATIONS ====================
+  private supportMemoryCache: Map<string, any> = new Map()
+
+  private formatRelativePresence(lastSeenIso?: string, explicitOnline?: boolean): { isOnline: boolean; lastSeenText: string } {
+    if (!lastSeenIso) {
+      return { isOnline: false, lastSeenText: 'Offline' }
+    }
+    const lastMs = new Date(lastSeenIso).getTime()
+    const diffSec = Math.max(0, Math.floor((Date.now() - lastMs) / 1000))
+    const isCurrentlyOnline = Boolean(explicitOnline) && diffSec <= 50
+
+    if (isCurrentlyOnline) {
+      return { isOnline: true, lastSeenText: 'Online now' }
+    }
+    if (diffSec < 60) {
+      return { isOnline: false, lastSeenText: 'Last online just now' }
+    }
+    const diffMin = Math.floor(diffSec / 60)
+    if (diffMin < 60) {
+      return { isOnline: false, lastSeenText: `Last online ~${diffMin}m ago` }
+    }
+    const diffHours = Math.floor(diffMin / 60)
+    if (diffHours < 24) {
+      return { isOnline: false, lastSeenText: `Last online ~${diffHours}h ago` }
+    }
+    const diffDays = Math.floor(diffHours / 24)
+    return { isOnline: false, lastSeenText: `Last online ~${diffDays}d ago` }
+  }
+
+  private enrichSupportSession(session: any): any {
+    const presence = this.formatRelativePresence(session.lastSeenAt, session.isOnline)
+    return {
+      ...session,
+      isOnline: presence.isOnline,
+      lastSeenText: presence.lastSeenText,
+      selectedProducts: Array.isArray(session.selectedProducts) ? session.selectedProducts : [],
+      messages: Array.isArray(session.messages) ? session.messages : []
+    }
+  }
+
+  private async persistSupportSessionToDb(session: any): Promise<void> {
+    this.supportMemoryCache.set(session.id, session)
+
+    // 1. Try dedicated support_sessions & support_messages tables first
+    try {
+      const { error: sessionErr } = await this.supabase
+        .from('support_sessions')
+        .upsert({
+          id: session.id,
+          visitor_id: session.visitorId || session.id,
+          user_id: session.userId || null,
+          visitor_name: session.visitorName || 'Store Visitor',
+          visitor_email: session.visitorEmail || null,
+          visitor_phone: session.visitorPhone || null,
+          topic: session.topic || 'General Inquiry',
+          selected_products: session.selectedProducts || [],
+          status: session.status || 'OPEN',
+          is_online: Boolean(session.isOnline),
+          last_seen_at: session.lastSeenAt || new Date().toISOString(),
+          unread_admin_count: Number(session.unreadAdminCount || 0),
+          unread_client_count: Number(session.unreadClientCount || 0),
+          created_at: session.createdAt || new Date().toISOString(),
+          updated_at: session.updatedAt || new Date().toISOString()
+        }, { onConflict: 'id' })
+
+      if (!sessionErr && Array.isArray(session.messages) && session.messages.length > 0) {
+        const lastMsg = session.messages[session.messages.length - 1]
+        if (lastMsg && lastMsg.id) {
+          await this.supabase
+            .from('support_messages')
+            .upsert({
+              id: lastMsg.id,
+              session_id: session.id,
+              sender_role: lastMsg.senderRole || 'CLIENT',
+              sender_name: lastMsg.senderName || 'Visitor',
+              content: lastMsg.content || '',
+              metadata: lastMsg.metadata || {},
+              created_at: lastMsg.createdAt || new Date().toISOString()
+            }, { onConflict: 'id' })
+        }
+        return
+      }
+    } catch {
+      // Fallback to public.events below
+    }
+
+    // 2. Fallback persistence in public.events (category = 'LIVECHAT_SESSION') so database persistence works even before running SQL migration
+    try {
+      const todayDate = new Date().toISOString().slice(0, 10)
+      await this.supabase
+        .from('events')
+        .upsert({
+          id: session.id,
+          title: `LIVECHAT:${session.visitorName || 'Visitor'} (${session.topic || 'General Inquiry'})`,
+          description: JSON.stringify(session),
+          date: todayDate,
+          time: session.lastSeenAt || new Date().toISOString(),
+          location: session.visitorEmail || session.visitorId || session.id,
+          category: 'LIVECHAT_SESSION',
+          status: session.status === 'RESOLVED' ? 'past' : 'upcoming',
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'id' })
+    } catch (err) {
+      console.warn('Support chat DB persistence fallback notice:', err)
+    }
+  }
+
+  async getSupportSession(sessionId: string): Promise<any | null> {
+    if (!sessionId) return null
+
+    // 1. Check dedicated support_sessions table
+    try {
+      const { data: row, error } = await this.supabase
+        .from('support_sessions')
+        .select('*')
+        .eq('id', sessionId)
+        .maybeSingle()
+
+      if (!error && row) {
+        const { data: msgRows } = await this.supabase
+          .from('support_messages')
+          .select('*')
+          .eq('session_id', sessionId)
+          .order('created_at', { ascending: true })
+
+        const built = {
+          id: row.id,
+          visitorId: row.visitor_id,
+          userId: row.user_id || undefined,
+          visitorName: row.visitor_name || 'Store Visitor',
+          visitorEmail: row.visitor_email || '',
+          visitorPhone: row.visitor_phone || '',
+          topic: row.topic || 'General Inquiry',
+          selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+          status: row.status || 'OPEN',
+          isOnline: Boolean(row.is_online),
+          lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
+          unreadAdminCount: Number(row.unread_admin_count || 0),
+          unreadClientCount: Number(row.unread_client_count || 0),
+          createdAt: row.created_at || new Date().toISOString(),
+          updatedAt: row.updated_at || new Date().toISOString(),
+          messages: (msgRows || []).map((m: any) => ({
+            id: m.id,
+            sessionId: m.session_id,
+            senderRole: m.sender_role,
+            senderName: m.sender_name,
+            content: m.content,
+            metadata: m.metadata || {},
+            createdAt: m.created_at
+          }))
+        }
+        this.supportMemoryCache.set(sessionId, built)
+        return this.enrichSupportSession(built)
+      }
+    } catch {
+      // Fallback
+    }
+
+    // 2. Check public.events fallback table
+    try {
+      const { data: evRow } = await this.supabase
+        .from('events')
+        .select('*')
+        .eq('id', sessionId)
+        .eq('category', 'LIVECHAT_SESSION')
+        .maybeSingle()
+
+      if (evRow && evRow.description) {
+        const parsed = JSON.parse(evRow.description)
+        this.supportMemoryCache.set(sessionId, parsed)
+        return this.enrichSupportSession(parsed)
+      }
+    } catch {
+      // Ignore parse error
+    }
+
+    // 3. Check memory cache
+    const cached = this.supportMemoryCache.get(sessionId)
+    return cached ? this.enrichSupportSession(cached) : null
+  }
+
+  async listSupportSessions(): Promise<any[]> {
+    const sessionMap = new Map<string, any>()
+
+    for (const [k, v] of this.supportMemoryCache.entries()) {
+      sessionMap.set(k, v)
+    }
+
+    // 1. Load from dedicated support_sessions table if present
+    try {
+      const { data: rows, error } = await this.supabase
+        .from('support_sessions')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(100)
+
+      if (!error && Array.isArray(rows) && rows.length > 0) {
+        const sessionIds = rows.map((r: any) => r.id)
+        const { data: allMsgs } = await this.supabase
+          .from('support_messages')
+          .select('*')
+          .in('session_id', sessionIds)
+          .order('created_at', { ascending: true })
+
+        const msgsBySession = new Map<string, any[]>()
+        for (const m of allMsgs || []) {
+          const list = msgsBySession.get(m.session_id) || []
+          list.push({
+            id: m.id,
+            sessionId: m.session_id,
+            senderRole: m.sender_role,
+            senderName: m.sender_name,
+            content: m.content,
+            metadata: m.metadata || {},
+            createdAt: m.created_at
+          })
+          msgsBySession.set(m.session_id, list)
+        }
+
+        for (const row of rows) {
+          const built = {
+            id: row.id,
+            visitorId: row.visitor_id,
+            userId: row.user_id || undefined,
+            visitorName: row.visitor_name || 'Store Visitor',
+            visitorEmail: row.visitor_email || '',
+            visitorPhone: row.visitor_phone || '',
+            topic: row.topic || 'General Inquiry',
+            selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+            status: row.status || 'OPEN',
+            isOnline: Boolean(row.is_online),
+            lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
+            unreadAdminCount: Number(row.unread_admin_count || 0),
+            unreadClientCount: Number(row.unread_client_count || 0),
+            createdAt: row.created_at || new Date().toISOString(),
+            updatedAt: row.updated_at || new Date().toISOString(),
+            messages: msgsBySession.get(row.id) || []
+          }
+          sessionMap.set(row.id, built)
+          this.supportMemoryCache.set(row.id, built)
+        }
+      }
+    } catch {
+      // Fallback
+    }
+
+    // 2. Load from public.events fallback table
+    try {
+      const { data: evRows } = await this.supabase
+        .from('events')
+        .select('*')
+        .eq('category', 'LIVECHAT_SESSION')
+        .order('updated_at', { ascending: false })
+        .limit(100)
+
+      for (const ev of evRows || []) {
+        if (ev.description && !sessionMap.has(ev.id)) {
+          try {
+            const parsed = JSON.parse(ev.description)
+            sessionMap.set(ev.id, parsed)
+            this.supportMemoryCache.set(ev.id, parsed)
+          } catch {
+            // Skip malformed JSON
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return Array.from(sessionMap.values())
+      .map(s => this.enrichSupportSession(s))
+      .sort((a, b) => new Date(b.updatedAt || b.lastSeenAt).getTime() - new Date(a.updatedAt || a.lastSeenAt).getTime())
+  }
+
+  async upsertSupportSession(payload: {
+    sessionId?: string
+    visitorId?: string
+    userId?: string
+    visitorName?: string
+    visitorEmail?: string
+    visitorPhone?: string
+    topic?: string
+    selectedProducts?: any[]
+  }): Promise<any> {
+    const sessionId = payload.sessionId || payload.visitorId || `chat_${crypto.randomUUID()}`
+    const nowIso = new Date().toISOString()
+    const existing = await this.getSupportSession(sessionId)
+
+    const mergedProducts = payload.selectedProducts !== undefined
+      ? payload.selectedProducts
+      : (existing?.selectedProducts || [])
+
+    const nextTopic = payload.topic || existing?.topic || 'General Inquiry'
+
+    const session: any = {
+      id: sessionId,
+      visitorId: payload.visitorId || existing?.visitorId || sessionId,
+      userId: payload.userId || existing?.userId,
+      visitorName: payload.visitorName || existing?.visitorName || 'Store Visitor',
+      visitorEmail: payload.visitorEmail || existing?.visitorEmail || '',
+      visitorPhone: payload.visitorPhone || existing?.visitorPhone || '',
+      topic: nextTopic,
+      selectedProducts: mergedProducts,
+      status: existing?.status || 'OPEN',
+      isOnline: true,
+      lastSeenAt: nowIso,
+      unreadAdminCount: existing?.unreadAdminCount || 0,
+      unreadClientCount: existing?.unreadClientCount || 0,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso,
+      messages: existing?.messages || []
+    }
+
+    // Seed welcome message if new session
+    if (session.messages.length === 0) {
+      const welcomeMsg = {
+        id: `msg_${crypto.randomUUID()}`,
+        sessionId,
+        senderRole: 'AI_ASSISTANT',
+        senderName: 'DriveFlyElectric Concierge',
+        content: `Welcome to DriveFlyElectric Support! Select an inquiry topic above (Payment Issue, Item Purchase, General Inquiry, or Shipping Issue) or pick the rigs you're looking to buy today from our catalogue, and I'll assist you immediately or connect you with a live specialist.`,
+        metadata: { type: 'welcome' },
+        createdAt: nowIso
+      }
+      session.messages.push(welcomeMsg)
+    }
+
+    await this.persistSupportSessionToDb(session)
+    return this.enrichSupportSession(session)
+  }
+
+  async updateSupportPresence(sessionId: string, isOnline: boolean, visitorMeta?: { visitorName?: string; visitorEmail?: string; currentPath?: string }): Promise<any | null> {
+    const existing = await this.getSupportSession(sessionId)
+    if (!existing) return null
+
+    const nowIso = new Date().toISOString()
+    existing.isOnline = Boolean(isOnline)
+    existing.lastSeenAt = nowIso
+    if (visitorMeta?.visitorName) existing.visitorName = visitorMeta.visitorName
+    if (visitorMeta?.visitorEmail) existing.visitorEmail = visitorMeta.visitorEmail
+
+    await this.persistSupportSessionToDb(existing)
+    return this.enrichSupportSession(existing)
+  }
+
+  async markSupportSessionRead(sessionId: string, readerRole: 'ADMIN' | 'CLIENT'): Promise<any | null> {
+    const existing = await this.getSupportSession(sessionId)
+    if (!existing) return null
+
+    if (readerRole === 'ADMIN') {
+      existing.unreadAdminCount = 0
+    } else {
+      existing.unreadClientCount = 0
+    }
+    await this.persistSupportSessionToDb(existing)
+    return this.enrichSupportSession(existing)
+  }
+
+  async updateSupportSessionStatus(sessionId: string, status: 'OPEN' | 'RESOLVED'): Promise<any | null> {
+    const existing = await this.getSupportSession(sessionId)
+    if (!existing) return null
+
+    existing.status = status
+    existing.updatedAt = new Date().toISOString()
+    await this.persistSupportSessionToDb(existing)
+    return this.enrichSupportSession(existing)
+  }
+
+  async generateIntelligentSupportReply(session: any, clientMessage: string): Promise<string> {
+    const lowerMsg = (clientMessage || '').toLowerCase()
+    const topic = session.topic || 'General Inquiry'
+    const selectedProducts: any[] = Array.isArray(session.selectedProducts) ? session.selectedProducts : []
+
+    // Detect if the user provided an email or phone inside their message for lead acquisition
+    const emailMatch = clientMessage.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)
+    const phoneMatch = clientMessage.match(/(?:\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/)
+    let capturedContactNote = ''
+    if (emailMatch && !session.visitorEmail) {
+      session.visitorEmail = emailMatch[0]
+      capturedContactNote = `Thank you! We have saved your email (${session.visitorEmail}) to this support ticket so our specialist team can send you direct updates and invoices. `
+    }
+    if (phoneMatch && !session.visitorPhone) {
+      session.visitorPhone = phoneMatch[0]
+      capturedContactNote += `We also logged your phone number (${session.visitorPhone}) for priority dispatch updates. `
+    }
+
+    // Load live catalog products to match product inquiries accurately
+    let catalogProducts: Product[] = []
+    try {
+      catalogProducts = await this.findProducts({ limit: 100 })
+    } catch {
+      catalogProducts = []
+    }
+
+    // Match any product mentioned by name, category, or in selectedProducts
+    const matchedProducts: Product[] = []
+    for (const sp of selectedProducts) {
+      const found = catalogProducts.find(p => p.id === sp.id || p.sku === sp.sku)
+      if (found && !matchedProducts.some(m => m.id === found.id)) {
+        matchedProducts.push(found)
+      }
+    }
+    for (const prod of catalogProducts) {
+      const pName = (prod.name || '').toLowerCase()
+      const pCat = (prod.category || '').toLowerCase()
+      if (
+        (lowerMsg.includes('heli') && pCat.includes('heli')) ||
+        (lowerMsg.includes('microcar') && pCat.includes('micro')) ||
+        (lowerMsg.includes('jeep') && pName.includes('jeep')) ||
+        (lowerMsg.includes('trike') && pCat.includes('trike')) ||
+        (lowerMsg.includes('kart') && pCat.includes('kart')) ||
+        (lowerMsg.includes('dirt') && pCat.includes('dirt')) ||
+        (pName.length > 5 && lowerMsg.includes(pName.slice(0, 12)))
+      ) {
+        if (!matchedProducts.some(m => m.id === prod.id)) {
+          matchedProducts.push(prod)
+        }
+      }
+    }
+
+    const contactPrompt = !session.visitorEmail
+      ? `\n\n💡 Tip: Please share your email address or phone number in this chat (or in the contact bar above) so our specialist can send you an official spec sheet, custom quote, or direct payment link.`
+      : `\n\n✅ Our live support team has also been notified and can reply directly in this chat window at any moment.`
+
+    // 1. Handle Topic: Payment Issue
+    if (topic === 'Payment Issue' || lowerMsg.includes('payment') || lowerMsg.includes('stripe') || lowerMsg.includes('paypal') || lowerMsg.includes('card') || lowerMsg.includes('declin')) {
+      const totalSelected = matchedProducts.reduce((sum, p) => sum + Number(p.price || 0), 0)
+      const selectedSummary = matchedProducts.length > 0
+        ? `\n• Selected Rig(s): ${matchedProducts.map(p => `${p.name} ($${Number(p.price).toLocaleString()} USD)`).join(', ')} — Subtotal: $${totalSelected.toLocaleString()} USD.`
+        : ''
+      return `${capturedContactNote}💳 **DriveFlyElectric Payment Support**:\n• We accept **Stripe Instant Card** (Visa, Mastercard, Amex, Discover) and **PayPal Express Checkout** in USD ($).${selectedSummary}\n• If your card is declined on high-value rigs (such as MiniHeliCopters or Microcars), it is usually a bank 3D-Secure or daily limit hold—authorizing the transaction with your bank or choosing **PayPal** at checkout resolves it immediately.\n• Every completed checkout automatically generates an official **DriveFlyElectric PDF Purchase Receipt** emailed to you immediately.${contactPrompt}`
+    }
+
+    // 2. Handle Topic: Shipping Issue
+    if (topic === 'Shipping Issue' || lowerMsg.includes('ship') || lowerMsg.includes('deliver') || lowerMsg.includes('track') || lowerMsg.includes('freight') || lowerMsg.includes('warehouse')) {
+      const deliveryWindow = matchedProducts[0]?.averageDeliveryTime || '14-25 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)'
+      return `${capturedContactNote}🚚 **DriveFlyElectric Shipping & Freight Support**:\n• **100% Free Express Doorstep Shipping** is included on all orders.\n• **Dispatch & Transit Window**: ${deliveryWindow}, with North American coordination out of our Austin, Texas HQ.\n• All MiniHeliCopters, Microcars, Go Karts, Trikes, and Dirtbikes ship in reinforced steel-framed crates with full customs clearance and tracking.\n• For instant live freight & tracking assistance, you can also click the **green WhatsApp Shipping button** at the bottom-right (+1 909-308-8313).${contactPrompt}`
+    }
+
+    // 3. Handle Matched / Selected Catalogue Items or Item Purchase Inquiry
+    if (matchedProducts.length > 0 || topic === 'Item Purchase') {
+      if (matchedProducts.length > 0) {
+        const lines = matchedProducts.slice(0, 3).map(p => {
+          const stockStatus = p.stock > 0 ? `In Stock (${p.stock} units ready)` : 'Built to Order'
+          return `• **${p.name}** (SKU: \`${p.sku}\` | Category: ${p.category}) — **$${Number(p.price).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD** | ${stockStatus} | Delivery: ${p.averageDeliveryTime || '14-25 business days'}`
+        }).join('\n')
+
+        return `${capturedContactNote}⚡ **DriveFlyElectric Product & Purchase Breakdown**:\n${lines}\n\nYou can add ${matchedProducts.length === 1 ? 'this rig' : 'these rigs'} directly to your cart and complete checkout via Stripe or PayPal with **Free Express Shipping** and a **12-Month Powertrain & Avionics Warranty**. Would you like a specialist to prepare an order or answer a technical question about ${matchedProducts[0].name}?${contactPrompt}`
+      }
+
+      return `${capturedContactNote}⚡ **DriveFlyElectric Fleet Purchase Concierge**:\nWe currently stock 5 flagship categories in USD:\n1. **MiniHeliCopters** (Personal Single-Seat & Twin-Rotor Ultralights from $4,800 USD)\n2. **Microcars** (Enclosed Electric Microcars & 200cc Adult Mini Jeep Willys from $850 USD)\n3. **Go Karts** (Off-Road Racing Buggies & Drift Karts)\n4. **Trikes** (3000W Brushless Electric Drift Trikes)\n5. **Dirtbikes** (High-Discharge Lithium Off-Road Trail Bikes)\n\nUse the **"What are you looking to buy today?"** catalogue selector above to pick the exact rig(s) you're interested in!${contactPrompt}`
+    }
+
+    // 4. General Inquiry & Store Details Acquisition
+    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA | **Dispatch Warehouse**: Nanshan, Shenzhen, Guangdong Province, China\n• **Official Support Email**: info-eurotopmobility@driveflyelectric.shop\n• **Shipping WhatsApp Line**: +1 (909) 308-8313\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your rig selection today?${contactPrompt}`
+  }
+
+  async appendSupportMessage(
+    sessionId: string,
+    messageInput: {
+      senderRole: 'CLIENT' | 'ADMIN' | 'AI_ASSISTANT'
+      senderName?: string
+      content: string
+      topic?: string
+      selectedProducts?: any[]
+      visitorName?: string
+      visitorEmail?: string
+      visitorPhone?: string
+    }
+  ): Promise<{ session: any; newMessages: any[] }> {
+    let session = await this.getSupportSession(sessionId)
+    if (!session) {
+      session = await this.upsertSupportSession({
+        sessionId,
+        visitorName: messageInput.visitorName,
+        visitorEmail: messageInput.visitorEmail,
+        visitorPhone: messageInput.visitorPhone,
+        topic: messageInput.topic,
+        selectedProducts: messageInput.selectedProducts
+      })
+    }
+
+    const nowIso = new Date().toISOString()
+    if (messageInput.topic) session.topic = messageInput.topic
+    if (messageInput.selectedProducts !== undefined) session.selectedProducts = messageInput.selectedProducts
+    if (messageInput.visitorName) session.visitorName = messageInput.visitorName
+    if (messageInput.visitorEmail) session.visitorEmail = messageInput.visitorEmail
+    if (messageInput.visitorPhone) session.visitorPhone = messageInput.visitorPhone
+
+    const primaryMsg = {
+      id: `msg_${crypto.randomUUID()}`,
+      sessionId: session.id,
+      senderRole: messageInput.senderRole,
+      senderName:
+        messageInput.senderName ||
+        (messageInput.senderRole === 'ADMIN'
+          ? 'DriveFlyElectric Support Specialist'
+          : messageInput.senderRole === 'AI_ASSISTANT'
+          ? 'DriveFlyElectric Concierge'
+          : session.visitorName || 'Store Visitor'),
+      content: messageInput.content,
+      metadata: {
+        topic: session.topic,
+        selectedProductIds: (session.selectedProducts || []).map((p: any) => p.id)
+      },
+      createdAt: nowIso
+    }
+
+    session.messages = [...(session.messages || []), primaryMsg]
+    session.updatedAt = nowIso
+    session.lastSeenAt = nowIso
+
+    if (messageInput.senderRole === 'CLIENT') {
+      session.isOnline = true
+      session.status = 'OPEN'
+      session.unreadAdminCount = Number(session.unreadAdminCount || 0) + 1
+    } else if (messageInput.senderRole === 'ADMIN') {
+      session.unreadClientCount = Number(session.unreadClientCount || 0) + 1
+      session.unreadAdminCount = 0
+    }
+
+    await this.persistSupportSessionToDb(session)
+    const createdList: any[] = [primaryMsg]
+
+    // If message is from CLIENT, generate an immediate intelligent assistant reply unless an ADMIN just replied within the last 2 minutes
+    if (messageInput.senderRole === 'CLIENT') {
+      const recentAdminMsg = (session.messages || [])
+        .slice()
+        .reverse()
+        .find((m: any) => m.senderRole === 'ADMIN')
+      const adminRecentlyActive =
+        recentAdminMsg &&
+        Date.now() - new Date(recentAdminMsg.createdAt).getTime() < 2 * 60 * 1000
+
+      if (!adminRecentlyActive) {
+        const aiReplyContent = await this.generateIntelligentSupportReply(session, messageInput.content)
+        const aiMsg = {
+          id: `msg_${crypto.randomUUID()}`,
+          sessionId: session.id,
+          senderRole: 'AI_ASSISTANT',
+          senderName: 'DriveFlyElectric Intelligent Assistant',
+          content: aiReplyContent,
+          metadata: { automated: true, topic: session.topic },
+          createdAt: new Date(Date.now() + 250).toISOString()
+        }
+        session.messages = [...session.messages, aiMsg]
+        session.updatedAt = aiMsg.createdAt
+        await this.persistSupportSessionToDb(session)
+        createdList.push(aiMsg)
+      }
+    }
+
+    return {
+      session: this.enrichSupportSession(session),
+      newMessages: createdList
+    }
   }
 
   // ==================== CONTROLLER COMPATIBILITY LAYER ====================

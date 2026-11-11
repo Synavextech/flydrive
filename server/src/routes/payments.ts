@@ -1,6 +1,7 @@
 import express from 'express'
 import Stripe from 'stripe'
 import dotenv from 'dotenv'
+import { emailService } from '../utils/emailService.js'
 
 dotenv.config()
 
@@ -62,13 +63,64 @@ async function getPayPalAccessToken(): Promise<{ token: string; baseUrl: string 
 }
 
 // ==========================================
+// 0. PAYMENT GATEWAY RUNTIME CONFIGURATION
+// ==========================================
+
+// Returns public client keys and PayPal Client Token for JS SDK Buttons & Hosted Card Fields
+router.get('/config', async (_req, res) => {
+  const stripePublishableKey =
+    process.env.STRIPE_PUBLISHABLE_KEY ||
+    process.env.VITE_STRIPE_PUBLISHABLE_KEY ||
+    'pk_live_51U1OVJAZusdAC7Xt4oUvFKuo36Qv6bYLXClwuWTzykMfDGJm29pZJPTSU98hS4R13id0KB0BFRp8sjHTcCClExjh00TOV3ZXSq'
+  const paypalClientId =
+    process.env.PAYPAL_CLIENT_ID ||
+    process.env.VITE_PAYPAL_CLIENT_ID ||
+    'AeZPJVk6Zp1zLPnNtCcOdXvQFQi-iLkWnSdbB7c0vYwyOpQMG845TpUz6MZSJd-TXLfHgFfiBrLEWxpt'
+  const paypalMerchantId =
+    process.env.PAYPAL_MERCHANT_ID ||
+    process.env.VITE_PAYPAL_MERCHANT_ID ||
+    'N7YM95SPUR8P8'
+  const paypalMode = process.env.PAYPAL_MODE === 'live' ? 'live' : 'sandbox'
+
+  let paypalClientToken: string | null = null
+  try {
+    const { token, baseUrl } = await getPayPalAccessToken()
+    const tokenRes = await fetch(`${baseUrl}/v1/identity/generate-token`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Accept-Language': 'en_US',
+        'Content-Type': 'application/json'
+      }
+    })
+    if (tokenRes.ok) {
+      const tokenData = await tokenRes.json()
+      paypalClientToken = tokenData.client_token || null
+    }
+  } catch {
+    // Non-fatal: PayPal Smart Buttons work with clientId alone; clientToken enhances Hosted Card Fields
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      stripePublishableKey,
+      paypalClientId,
+      paypalMerchantId,
+      paypalMode,
+      paypalClientToken
+    }
+  })
+})
+
+// ==========================================
 // 1. STRIPE PAYMENT INTEGRATION (USD)
 // ==========================================
 
 // Create Payment Intent for Stripe Elements & Card Checkout
 router.post('/stripe/create-intent', async (req, res) => {
   try {
-    const { amount } = req.body
+    const { amount, customerEmail } = req.body
 
     if (!amount || Number(amount) <= 0) {
       return res.status(400).json({
@@ -85,11 +137,22 @@ router.post('/stripe/create-intent', async (req, res) => {
       automatic_payment_methods: {
         enabled: true
       },
+      receipt_email: customerEmail || undefined,
       description: 'DriveFlyElectric - E-Commerce Purchase',
       metadata: {
         company: 'DriveFlyElectric',
         head_office: 'Austin, Texas, USA'
       }
+    })
+
+    emailService.recordActivity({
+      type: 'PAYMENT_AUTHORIZED',
+      title: `Stripe Card Intent Initialized • $${Number(amount).toFixed(2)} USD`,
+      message: `Stripe PaymentIntent (${paymentIntent.id}) created for $${Number(amount).toFixed(2)} USD.`,
+      userEmail: customerEmail || undefined,
+      amount: Number(amount),
+      emailDispatched: false,
+      systemMailDispatched: false
     })
 
     res.status(200).json({
@@ -121,13 +184,25 @@ router.post('/stripe/confirm', async (req, res) => {
     }
 
     const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId)
+    const usdAmount = paymentIntent.amount / 100
+
+    if (paymentIntent.status === 'succeeded') {
+      emailService.recordActivity({
+        type: 'PAYMENT_CAPTURED',
+        title: `Stripe Card Payment Settled • $${usdAmount.toFixed(2)} USD`,
+        message: `Stripe PaymentIntent (${paymentIntent.id}) verified as SUCCEEDED for $${usdAmount.toFixed(2)} USD.`,
+        amount: usdAmount,
+        emailDispatched: false,
+        systemMailDispatched: false
+      })
+    }
 
     res.status(200).json({
       success: true,
       data: {
         status: paymentIntent.status,
         paymentId: paymentIntent.id,
-        amount: paymentIntent.amount / 100,
+        amount: usdAmount,
         currency: paymentIntent.currency
       }
     })
@@ -144,10 +219,10 @@ router.post('/stripe/confirm', async (req, res) => {
 // 2. PAYPAL PAYMENT INTEGRATION (USD)
 // ==========================================
 
-// Create PayPal Order
+// Create PayPal Order (Supports PayPal JS SDK Buttons, Hosted Card Fields & Redirect)
 router.post('/paypal/create-order', async (req, res) => {
   try {
-    const { amount } = req.body
+    const { amount, customerEmail } = req.body
 
     if (!amount || Number(amount) <= 0) {
       return res.status(400).json({
@@ -198,6 +273,16 @@ router.post('/paypal/create-order', async (req, res) => {
 
     const approveLink = orderData.links?.find((l: any) => l.rel === 'approve')?.href || ''
 
+    emailService.recordActivity({
+      type: 'PAYMENT_AUTHORIZED',
+      title: `PayPal Order Initialized • $${formattedAmount} USD`,
+      message: `PayPal Order (${orderData.id}) created for $${formattedAmount} USD.`,
+      userEmail: customerEmail || undefined,
+      amount: Number(amount),
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(200).json({
       success: true,
       data: {
@@ -215,7 +300,7 @@ router.post('/paypal/create-order', async (req, res) => {
   }
 })
 
-// Capture PayPal Order
+// Capture PayPal Order (Called by PayPal JS SDK onApprove / CardFields or Return Redirect)
 router.post('/paypal/capture', async (req, res) => {
   try {
     const { orderId } = req.body
@@ -243,11 +328,27 @@ router.post('/paypal/capture', async (req, res) => {
       throw new Error(captureData.message || 'Failed to capture PayPal payment')
     }
 
+    const captureUnit = captureData.purchase_units?.[0]?.payments?.captures?.[0]
+    const captureId = captureUnit?.id || captureData.id || orderId
+    const capturedValue = Number(captureUnit?.amount?.value || 0)
+    const payerEmail = captureData.payer?.email_address
+
+    emailService.recordActivity({
+      type: 'PAYMENT_CAPTURED',
+      title: `PayPal Payment Captured • ${capturedValue > 0 ? `$${capturedValue.toFixed(2)} USD` : captureId}`,
+      message: `PayPal Order (${orderId} / Capture ${captureId}) settled by ${payerEmail || 'Customer'}.`,
+      userEmail: payerEmail || undefined,
+      amount: capturedValue || undefined,
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(200).json({
       success: true,
       data: {
         status: captureData.status || 'COMPLETED',
-        paymentId: captureData.id,
+        paymentId: captureId,
+        orderId: captureData.id || orderId,
         payer: captureData.payer
       }
     })

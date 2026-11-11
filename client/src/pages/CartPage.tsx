@@ -41,7 +41,7 @@ const CartPage = () => {
     return (
       <div className="pt-24 min-h-screen flex items-center justify-center bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white transition-colors duration-200">
         <div className="text-center">
-          <div className="w-12 h-12 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
+          <div className="w-12 h-12 border-4 border-creamy-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
           <p className="mt-4 text-gray-600 dark:text-gray-400 font-bold text-sm">Loading your cart...</p>
         </div>
       </div>
@@ -70,7 +70,7 @@ const CartPage = () => {
         <div className="flex items-center justify-between mb-8 pb-4 border-b border-gray-200 dark:border-neutral-800">
           <div>
             <h1 className="text-3xl font-black uppercase tracking-tight text-gray-900 dark:text-white flex items-center gap-2">
-              <ShoppingBag className="w-7 h-7 text-amber-500" />
+              <ShoppingBag className="w-7 h-7 text-creamy-500" />
               Shopping Cart
             </h1>
             <p className="text-xs text-gray-500 dark:text-neutral-400 mt-1 font-medium">
@@ -90,7 +90,7 @@ const CartPage = () => {
 
         {items.length === 0 ? (
           <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-12 text-center max-w-lg mx-auto">
-            <div className="w-16 h-16 bg-amber-50 dark:bg-amber-500/10 text-amber-500 rounded-full flex items-center justify-center mx-auto mb-4">
+            <div className="w-16 h-16 bg-creamy-50 dark:bg-creamy-500/10 text-creamy-500 rounded-full flex items-center justify-center mx-auto mb-4">
               <ShoppingBag className="w-8 h-8" />
             </div>
             <h2 className="text-lg font-black text-gray-900 dark:text-white mb-2 uppercase">Your cart is empty</h2>
@@ -99,7 +99,7 @@ const CartPage = () => {
             </p>
             <button
               onClick={() => navigate('/')}
-              className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider px-6 py-3 rounded-xl transition-all shadow-lg shadow-amber-500/20"
+              className="inline-flex items-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider px-6 py-3 rounded-xl transition-all shadow-lg shadow-creamy-500/20"
             >
               <ArrowLeft className="w-4 h-4" />
               Shop Drift Rigs & Bikes
@@ -145,7 +145,7 @@ const CartPage = () => {
                           <h3 className="font-bold text-sm text-gray-900 dark:text-white">
                             {item.product.name}
                           </h3>
-                          <p className="text-xs font-semibold text-amber-500 mt-0.5">
+                          <p className="text-xs font-semibold text-creamy-500 mt-0.5">
                             {formatPrice(item.product.price)} each
                           </p>
                           <span className="inline-block mt-1 text-[10px] uppercase font-bold text-gray-400">
@@ -220,13 +220,13 @@ const CartPage = () => {
                   </div>
                   <div className="pt-3 border-t border-gray-200 dark:border-neutral-800 flex justify-between items-baseline">
                     <span className="text-sm font-black uppercase text-gray-900 dark:text-white">Subtotal</span>
-                    <span className="text-xl font-black text-amber-500">{formatPrice(totalPrice)}</span>
+                    <span className="text-xl font-black text-creamy-500">{formatPrice(totalPrice)}</span>
                   </div>
                 </div>
 
                 <button
                   onClick={handleCheckout}
-                  className="w-full mt-6 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider py-3.5 px-4 rounded-xl shadow-lg shadow-amber-500/20 transition-all text-sm flex items-center justify-center gap-2"
+                  className="w-full mt-6 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-3.5 px-4 rounded-xl shadow-lg shadow-creamy-500/20 transition-all text-sm flex items-center justify-center gap-2"
                 >
                   Proceed to Checkout
                 </button>

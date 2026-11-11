@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import {
   Package,
   ShoppingBag,
@@ -17,12 +17,14 @@ import {
   FileText,
   Printer,
   Copy,
-  Check
+  Check,
+  MessageSquare,
+  Send
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useProducts } from '../contexts/ProductContext'
 import { adminApi } from '../services/api'
-import { Product, Order, User } from '../types'
+import { Product, Order, User, SupportSession } from '../types'
 import {
   OrderReceiptData,
   generateReceiptText,
@@ -46,7 +48,7 @@ const isVideoMedia = (url?: string) => {
 export const AdminDashboard: React.FC = () => {
   const { user } = useAuth()
   const { fetchProducts: fetchGlobalProducts } = useProducts()
-  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'users'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'users' | 'support'>('overview')
 
   // Dashboard Stats
   const [stats, setStats] = useState<{
@@ -102,6 +104,28 @@ export const AdminDashboard: React.FC = () => {
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null)
   const [notificationsList, setNotificationsList] = useState<any[]>([])
 
+  // Support & LiveChat Management state
+  const [supportSessions, setSupportSessions] = useState<SupportSession[]>([])
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [supportTopicFilter, setSupportTopicFilter] = useState<string>('ALL')
+  const [supportStatusFilter, setSupportStatusFilter] = useState<'ALL' | 'OPEN' | 'RESOLVED'>('ALL')
+  const [supportSearchQuery, setSupportSearchQuery] = useState<string>('')
+  const [adminReplyText, setAdminReplyText] = useState<string>('')
+  const [isSendingReply, setIsSendingReply] = useState<boolean>(false)
+  const adminChatEndRef = useRef<HTMLDivElement>(null)
+
+  const fetchSupportSessions = async () => {
+    try {
+      const res = await adminApi.getSupportSessions()
+      if (res.success && Array.isArray(res.data)) {
+        setSupportSessions(res.data)
+        setSelectedSessionId(prev => prev || (res.data && res.data.length > 0 ? res.data[0].id : null))
+      }
+    } catch {
+      // Silent fallback
+    }
+  }
+
   const fetchNotifications = async () => {
     try {
       const res = await adminApi.getNotifications()
@@ -116,16 +140,27 @@ export const AdminDashboard: React.FC = () => {
   useEffect(() => {
     fetchDashboardStats()
     fetchNotifications()
+    fetchSupportSessions()
     const interval = setInterval(() => {
       fetchNotifications()
-    }, 15000)
+      fetchSupportSessions()
+    }, 5000)
     return () => clearInterval(interval)
   }, [])
+
+  // Auto-scroll Admin Support chat thread when messages update or active session changes
+  const activeSupportSessionForScroll = supportSessions.find(s => s.id === selectedSessionId)
+  useEffect(() => {
+    if (activeTab === 'support') {
+      adminChatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [activeTab, selectedSessionId, activeSupportSessionForScroll?.messages?.length])
 
   useEffect(() => {
     if (activeTab === 'products') fetchProducts()
     if (activeTab === 'orders') fetchOrders()
     if (activeTab === 'users') fetchUsers()
+    if (activeTab === 'support') fetchSupportSessions()
   }, [activeTab, orderFilter])
 
   const notify = (type: 'success' | 'error', text: string) => {
@@ -394,6 +429,54 @@ export const AdminDashboard: React.FC = () => {
     }
   }
 
+  // Handle selecting a support chat session & marking unread admin messages as read
+  const handleSelectSupportSession = async (session: SupportSession) => {
+    setSelectedSessionId(session.id)
+    if (session.unreadAdminCount > 0) {
+      try {
+        const res = await adminApi.updateSupportSessionStatus(session.id, { markRead: true })
+        if (res.success && res.data) {
+          setSupportSessions(prev => prev.map(s => (s.id === session.id ? res.data! : s)))
+        }
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  // Handle sending Admin reply to Client LiveChat
+  const handleSendAdminReply = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!selectedSessionId || !adminReplyText.trim() || isSendingReply) return
+    try {
+      setIsSendingReply(true)
+      const res = await adminApi.replySupportSession(selectedSessionId, adminReplyText.trim())
+      if (res.success && res.data) {
+        setAdminReplyText('')
+        setSupportSessions(prev => prev.map(s => (s.id === selectedSessionId ? res.data! : s)))
+        notify('success', 'Support reply delivered to client LiveChat')
+      }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to send reply')
+    } finally {
+      setIsSendingReply(false)
+    }
+  }
+
+  // Handle toggling support session status (OPEN / RESOLVED)
+  const handleToggleSupportStatus = async (sessionId: string, currentStatus: 'OPEN' | 'RESOLVED') => {
+    const nextStatus = currentStatus === 'OPEN' ? 'RESOLVED' : 'OPEN'
+    try {
+      const res = await adminApi.updateSupportSessionStatus(sessionId, { status: nextStatus, markRead: true })
+      if (res.success && res.data) {
+        setSupportSessions(prev => prev.map(s => (s.id === sessionId ? res.data! : s)))
+        notify('success', `Support ticket marked as ${nextStatus}`)
+      }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to update support session status')
+    }
+  }
+
   // Build standardized OrderReceiptData from a database Order object
   const buildOrderReceipt = (ord: any): OrderReceiptData => {
     const orderDateStr = ord.createdAt
@@ -443,6 +526,7 @@ export const AdminDashboard: React.FC = () => {
       date: orderDateStr,
       orderDate: orderDateStr,
       orderNumber: ord.orderNumber || ord.id,
+      trackingNumber: ord.trackingNumber || `TRK-${ord.orderNumber || ord.id}`,
       transactionId,
       userName: customerName,
       address: formattedAddress,
@@ -487,7 +571,7 @@ export const AdminDashboard: React.FC = () => {
         {/* Top Control Bar */}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-8">
           <div>
-            <div className="flex items-center gap-2 text-xs font-bold text-amber-500 uppercase tracking-widest mb-1">
+            <div className="flex items-center gap-2 text-xs font-bold text-creamy-500 uppercase tracking-widest mb-1">
               <span>DriveFlyElectric</span>
               <span>•</span>
               <span>Nanshan, Shenzhen, Guangdong Province, China HQ Operations</span>
@@ -513,16 +597,17 @@ export const AdminDashboard: React.FC = () => {
                 if (activeTab === 'products') fetchProducts()
                 if (activeTab === 'orders') fetchOrders()
                 if (activeTab === 'users') fetchUsers()
+                if (activeTab === 'support') fetchSupportSessions()
               }}
-              className="p-2.5 bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-xl text-gray-600 dark:text-gray-300 hover:text-amber-500 shadow-sm transition-colors"
+              className="p-2.5 bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-xl text-gray-600 dark:text-gray-300 hover:text-creamy-500 shadow-sm transition-colors"
               title="Refresh Data"
               disabled={isLoading}
             >
-              <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-amber-500' : ''}`} />
+              <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-creamy-500' : ''}`} />
             </button>
             <button
               onClick={openAddModal}
-              className="bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs shadow-lg shadow-amber-500/20 flex items-center gap-2 transition-all active:scale-95"
+              className="bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs shadow-lg shadow-creamy-500/20 flex items-center gap-2 transition-all active:scale-95"
             >
               <Plus className="w-4 h-4" />
               <span>Create Item & Upload</span>
@@ -554,7 +639,13 @@ export const AdminDashboard: React.FC = () => {
             { id: 'products', label: 'Fleet Products', icon: Package },
             { id: 'orders', label: 'Orders & Settlements', icon: ShoppingBag },
             { id: 'users', label: 'User Accounts', icon: Users },
-          ].map((tab) => {
+            {
+              id: 'support',
+              label: 'Support',
+              icon: MessageSquare,
+              badge: supportSessions.reduce((acc, s) => acc + (s.unreadAdminCount || 0), 0)
+            },
+          ].map((tab: any) => {
             const Icon = tab.icon
             const isActive = activeTab === tab.id
             return (
@@ -562,12 +653,17 @@ export const AdminDashboard: React.FC = () => {
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id as any)}
                 className={`flex items-center gap-2 py-4 px-1 text-xs font-black uppercase tracking-wider border-b-2 transition-colors whitespace-nowrap ${isActive
-                  ? 'border-amber-500 text-amber-500'
+                  ? 'border-creamy-500 text-creamy-500'
                   : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
                   }`}
               >
                 <Icon className="w-4 h-4" />
                 <span>{tab.label}</span>
+                {tab.badge > 0 && (
+                  <span className="ml-1 px-1.5 py-0.5 text-[10px] font-black rounded-full bg-red-600 text-white">
+                    {tab.badge}
+                  </span>
+                )}
               </button>
             )
           })}
@@ -580,7 +676,7 @@ export const AdminDashboard: React.FC = () => {
               <div className="bg-white dark:bg-[#16181e] p-6 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-[11px] font-bold text-gray-500 uppercase tracking-widest">Total Catalog Rigs</span>
-                  <div className="w-9 h-9 rounded-xl bg-amber-500/10 text-amber-500 flex items-center justify-center">
+                  <div className="w-9 h-9 rounded-xl bg-creamy-500/10 text-creamy-500 flex items-center justify-center">
                     <Package className="w-5 h-5" />
                   </div>
                 </div>
@@ -606,7 +702,7 @@ export const AdminDashboard: React.FC = () => {
                     <DollarSign className="w-5 h-5" />
                   </div>
                 </div>
-                <p className="text-3xl font-black text-amber-500 font-anton">{formatPrice(stats.totalRevenue)}</p>
+                <p className="text-3xl font-black text-creamy-500 font-anton">{formatPrice(stats.totalRevenue)}</p>
                 <span className="text-[10px] text-emerald-500 font-bold mt-1 inline-block">Currency: USD ($)</span>
               </div>
 
@@ -632,7 +728,7 @@ export const AdminDashboard: React.FC = () => {
               </div>
               <button
                 onClick={() => setActiveTab('products')}
-                className="bg-amber-500 hover:bg-amber-400 text-black font-extrabold px-5 py-2.5 rounded-xl text-xs uppercase tracking-wider"
+                className="bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold px-5 py-2.5 rounded-xl text-xs uppercase tracking-wider"
               >
                 Manage Fleet Catalog
               </button>
@@ -654,7 +750,7 @@ export const AdminDashboard: React.FC = () => {
                 </div>
                 <button
                   onClick={fetchNotifications}
-                  className="text-xs font-bold text-amber-500 hover:text-amber-400 px-3 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10"
+                  className="text-xs font-bold text-creamy-500 hover:text-creamy-400 px-3 py-1.5 rounded-lg border border-creamy-500/30 bg-creamy-500/10"
                 >
                   Sync Feed
                 </button>
@@ -663,31 +759,59 @@ export const AdminDashboard: React.FC = () => {
               <div className="divide-y divide-gray-100 dark:divide-neutral-800 max-h-80 overflow-y-auto">
                 {notificationsList.length === 0 && stats.recentOrders.length === 0 ? (
                   <div className="p-6 text-center text-xs text-gray-400">
-                    Monitoring live store activity. Purchase notifications and account creation alerts will appear here in real time.
+                    Monitoring live store activity. Purchase notifications, payment authorizations, support inquiries, and account creation alerts will appear here in real time.
                   </div>
                 ) : (
                   <>
-                    {notificationsList.map((act: any) => (
-                      <div key={act.id} className="px-6 py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-gray-50/50 dark:hover:bg-[#191b22]">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-amber-500/15 text-amber-500">
-                              {act.type}
-                            </span>
-                            <p className="text-xs font-bold text-gray-900 dark:text-white">{act.title}</p>
+                    {notificationsList.map((act: any) => {
+                      const typeStr = String(act.type || 'ACTIVITY')
+                      const badgeClass =
+                        typeStr === 'ORDER_PURCHASED' || typeStr === 'PAYMENT_CAPTURED'
+                          ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30'
+                          : typeStr === 'PAYMENT_AUTHORIZED'
+                          ? 'bg-blue-500/15 text-blue-500 border border-blue-500/30'
+                          : typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY'
+                          ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
+                          : typeStr === 'USER_REGISTERED' || typeStr === 'USER_LOGIN'
+                          ? 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/30'
+                          : 'bg-creamy-500/15 text-creamy-500 border border-creamy-500/30'
+
+                      return (
+                        <div key={act.id} className="px-6 py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-gray-50/50 dark:hover:bg-[#191b22]">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${badgeClass}`}>
+                                {typeStr.replace(/_/g, ' ')}
+                              </span>
+                              <p className="text-xs font-bold text-gray-900 dark:text-white">{act.title}</p>
+                            </div>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{act.message}</p>
                           </div>
-                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{act.message}</p>
+                          <div className="flex items-center gap-3 self-end sm:self-center flex-shrink-0">
+                            {typeStr === 'SUPPORT_INQUIRY' && act.metadata?.sessionId && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedSessionId(act.metadata.sessionId)
+                                  setActiveTab('support')
+                                }}
+                                className="px-2.5 py-1 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black text-[10px] uppercase tracking-wider"
+                              >
+                                Reply in Support
+                              </button>
+                            )}
+                            <div className="text-right">
+                              <span className="text-[10px] font-mono text-gray-400 block">
+                                {new Date(act.timestamp).toLocaleTimeString()}
+                              </span>
+                              <span className="text-[10px] font-bold text-emerald-500">
+                                {act.emailDispatched || act.systemMailDispatched ? 'SMTP Dispatched' : 'Logged & Streamed'}
+                              </span>
+                            </div>
+                          </div>
                         </div>
-                        <div className="text-right flex-shrink-0">
-                          <span className="text-[10px] font-mono text-gray-400 block">
-                            {new Date(act.timestamp).toLocaleTimeString()}
-                          </span>
-                          <span className="text-[10px] font-bold text-emerald-500">
-                            {act.emailDispatched || act.systemMailDispatched ? 'SMTP Dispatched' : 'Logged & Queued'}
-                          </span>
-                        </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                     {stats.recentOrders.map((ord: any) => (
                       <div key={`recent-${ord.id}`} className="px-6 py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-gray-50/50 dark:hover:bg-[#191b22]">
                         <div>
@@ -706,7 +830,7 @@ export const AdminDashboard: React.FC = () => {
                         <div className="flex items-center gap-2">
                           <button
                             onClick={() => handleDownloadOrderReceipt(ord)}
-                            className="inline-flex items-center gap-1.5 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider text-[10px] px-3 py-1.5 rounded-lg shadow-sm cursor-pointer"
+                            className="inline-flex items-center gap-1.5 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[10px] px-3 py-1.5 rounded-lg shadow-sm cursor-pointer"
                           >
                             <Download className="w-3 h-3" />
                             <span>Receipt (.pdf)</span>
@@ -733,7 +857,7 @@ export const AdminDashboard: React.FC = () => {
               </div>
               <button
                 onClick={openAddModal}
-                className="bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs flex items-center gap-1.5 self-start sm:self-auto shadow-md"
+                className="bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs flex items-center gap-1.5 self-start sm:self-auto shadow-md"
               >
                 <Plus className="w-4 h-4" />
                 <span>Upload New Product</span>
@@ -796,12 +920,12 @@ export const AdminDashboard: React.FC = () => {
 
                         <td className="px-6 py-4">
                           <p className="font-mono text-xs font-semibold text-gray-700 dark:text-gray-300">{p.sku}</p>
-                          <span className="text-[10px] text-amber-500 uppercase font-black px-2 py-0.5 rounded bg-amber-500/10">
+                          <span className="text-[10px] text-creamy-500 uppercase font-black px-2 py-0.5 rounded bg-creamy-500/10">
                             {p.category}
                           </span>
                         </td>
 
-                        <td className="px-6 py-4 font-black text-gray-900 dark:text-amber-400">
+                        <td className="px-6 py-4 font-black text-gray-900 dark:text-creamy-400">
                           {formatPrice(p.price)}
                         </td>
 
@@ -819,7 +943,7 @@ export const AdminDashboard: React.FC = () => {
                         <td className="px-6 py-4 text-right space-x-2">
                           <button
                             onClick={() => openEditModal(p)}
-                            className="p-1.5 text-gray-500 hover:text-amber-500 rounded-lg hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+                            className="p-1.5 text-gray-500 hover:text-creamy-500 rounded-lg hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
                             title="Edit"
                           >
                             <Edit2 className="w-4 h-4" />
@@ -856,7 +980,7 @@ export const AdminDashboard: React.FC = () => {
                 <select
                   value={orderFilter}
                   onChange={(e) => setOrderFilter(e.target.value)}
-                  className="px-3 py-1.5 text-xs font-bold border border-gray-300 dark:border-neutral-700 rounded-xl bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-amber-500"
+                  className="px-3 py-1.5 text-xs font-bold border border-gray-300 dark:border-neutral-700 rounded-xl bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
                 >
                   <option value="ALL">All Statuses</option>
                   <option value="PENDING">Pending</option>
@@ -892,6 +1016,9 @@ export const AdminDashboard: React.FC = () => {
                       <tr key={ord.id} className="hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors">
                         <td className="px-6 py-4">
                           <p className="font-mono font-bold text-gray-900 dark:text-white text-xs">#{ord.orderNumber}</p>
+                          <p className="font-mono text-[10px] font-bold text-creamy-500 mt-0.5">
+                            {ord.trackingNumber || `TRK-${ord.orderNumber}`}
+                          </p>
                           <span className="text-[11px] text-gray-400">
                             {new Date(ord.createdAt).toLocaleDateString()}
                           </span>
@@ -904,7 +1031,7 @@ export const AdminDashboard: React.FC = () => {
                           <span className="text-[11px] text-gray-500">{ord.user?.email || 'Guest checkout'}</span>
                         </td>
 
-                        <td className="px-6 py-4 font-black text-amber-500">
+                        <td className="px-6 py-4 font-black text-creamy-500">
                           {formatPrice(ord.total)}
                         </td>
 
@@ -918,7 +1045,7 @@ export const AdminDashboard: React.FC = () => {
                           <select
                             value={ord.status}
                             onChange={(e) => handleUpdateOrderStatus(ord.id, e.target.value as any)}
-                            className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-amber-500"
+                            className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
                           >
                             <option value="PENDING">PENDING</option>
                             <option value="PROCESSING">PROCESSING</option>
@@ -932,7 +1059,7 @@ export const AdminDashboard: React.FC = () => {
                           <div className="inline-flex items-center justify-end gap-2">
                             <button
                               onClick={() => handleDownloadOrderReceipt(ord)}
-                              className="inline-flex items-center gap-1.5 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider text-[11px] px-3 py-1.5 rounded-lg shadow-sm transition-all active:scale-95 cursor-pointer"
+                              className="inline-flex items-center gap-1.5 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[11px] px-3 py-1.5 rounded-lg shadow-sm transition-all active:scale-95 cursor-pointer"
                               title="Download Generated Purchase Receipt (.pdf)"
                             >
                               <Download className="w-3.5 h-3.5" />
@@ -943,7 +1070,7 @@ export const AdminDashboard: React.FC = () => {
                               className="inline-flex items-center gap-1 bg-gray-100 hover:bg-gray-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-gray-700 dark:text-gray-200 font-bold text-[11px] px-2.5 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 transition-colors cursor-pointer"
                               title="Preview Receipt Details"
                             >
-                              <FileText className="w-3.5 h-3.5 text-amber-500" />
+                              <FileText className="w-3.5 h-3.5 text-creamy-500" />
                               <span>View</span>
                             </button>
                           </div>
@@ -1031,6 +1158,384 @@ export const AdminDashboard: React.FC = () => {
             </div>
           </div>
         )}
+
+        {/* Tab 5: SUPPORT & LIVECHAT MANAGEMENT */}
+        {activeTab === 'support' && (() => {
+          const filteredSessions = supportSessions.filter(s => {
+            const matchesTopic = supportTopicFilter === 'ALL' ? true : s.topic === supportTopicFilter
+            const matchesStatus = supportStatusFilter === 'ALL' ? true : s.status === supportStatusFilter
+            if (!matchesTopic || !matchesStatus) return false
+            if (!supportSearchQuery.trim()) return true
+            const q = supportSearchQuery.toLowerCase()
+            const inName = (s.visitorName || '').toLowerCase().includes(q)
+            const inEmail = (s.visitorEmail || '').toLowerCase().includes(q)
+            const inPhone = (s.visitorPhone || '').toLowerCase().includes(q)
+            const inMessages = (s.messages || []).some(m => (m.content || '').toLowerCase().includes(q))
+            return inName || inEmail || inPhone || inMessages
+          })
+          const activeSession =
+            supportSessions.find(s => s.id === selectedSessionId) || filteredSessions[0] || null
+
+          return (
+            <div className="bg-white dark:bg-[#16181e] rounded-2xl shadow-sm border border-gray-200 dark:border-neutral-800 overflow-hidden">
+              {/* Top Header */}
+              <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">
+                      Real-Time Client LiveChat & Support Center
+                    </h3>
+                    <span className="px-2 py-0.5 text-[10px] font-black uppercase rounded-full bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+                      {supportSessions.filter(s => s.isOnline).length} Visitors Online
+                    </span>
+                    <span className="px-2 py-0.5 text-[10px] font-black uppercase rounded-full bg-creamy-500/15 text-creamy-500 border border-creamy-500/30">
+                      {supportSessions.filter(s => s.status === 'OPEN').length} Open Tickets
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    Track live site visitors, view online/offline presence & approximate last active time, inspect selected catalogue rigs, and reply in real time.
+                  </p>
+                </div>
+
+                {/* Filters: Search, Status Pills, and Topic Dropdown */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    value={supportSearchQuery}
+                    onChange={(e) => setSupportSearchQuery(e.target.value)}
+                    placeholder="Search client, email, or message..."
+                    className="px-3 py-1.5 text-xs rounded-xl border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-creamy-500"
+                  />
+
+                  <div className="flex items-center rounded-xl border border-gray-200 dark:border-neutral-700 overflow-hidden bg-gray-50 dark:bg-[#1a1d24]">
+                    {(['ALL', 'OPEN', 'RESOLVED'] as const).map(st => (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={() => setSupportStatusFilter(st)}
+                        className={`px-2.5 py-1.5 text-[10px] font-black uppercase tracking-wider transition-colors ${
+                          supportStatusFilter === st
+                            ? 'bg-creamy-500 text-black'
+                            : 'text-gray-500 hover:text-gray-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {st}
+                      </button>
+                    ))}
+                  </div>
+
+                  <select
+                    value={supportTopicFilter}
+                    onChange={(e) => setSupportTopicFilter(e.target.value)}
+                    className="px-3 py-1.5 text-xs font-bold border border-gray-300 dark:border-neutral-700 rounded-xl bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
+                  >
+                    <option value="ALL">All Topics ({supportSessions.length})</option>
+                    <option value="Item Purchase">Item Purchase</option>
+                    <option value="Payment Issue">Payment Issue</option>
+                    <option value="Shipping Issue">Shipping Issue</option>
+                    <option value="General Inquiry">General Inquiry</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Split View: Sessions List (Left) & Active Chat Thread (Right) */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 min-h-[560px]">
+                {/* Left Column: Visitor Sessions List */}
+                <div className="lg:col-span-4 border-r border-gray-200 dark:border-neutral-800 divide-y divide-gray-100 dark:divide-neutral-800 max-h-[620px] overflow-y-auto">
+                  {filteredSessions.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-gray-400">
+                      No visitor support sessions recorded yet. Visitors opening the site or starting a LiveChat will appear here automatically.
+                    </div>
+                  ) : (
+                    filteredSessions.map((sess) => {
+                      const isSelected = activeSession?.id === sess.id
+                      const lastMsg =
+                        sess.messages && sess.messages.length > 0
+                          ? sess.messages[sess.messages.length - 1]
+                          : null
+
+                      return (
+                        <div
+                          key={sess.id}
+                          onClick={() => handleSelectSupportSession(sess)}
+                          className={`p-4 cursor-pointer transition-colors ${
+                            isSelected
+                              ? 'bg-creamy-500/10 dark:bg-creamy-500/15 border-l-4 border-l-creamy-500'
+                              : 'hover:bg-gray-50 dark:hover:bg-[#1b1e26]'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                {/* Online / Offline Dot */}
+                                <span
+                                  className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                                    sess.isOnline
+                                      ? 'bg-emerald-500 animate-pulse shadow-sm shadow-emerald-500'
+                                      : 'bg-gray-400 dark:bg-neutral-600'
+                                  }`}
+                                />
+                                <p className="font-bold text-xs text-gray-900 dark:text-white truncate">
+                                  {sess.visitorName || 'Store Visitor'}
+                                </p>
+                              </div>
+                              <p className="text-[10px] text-gray-500 dark:text-gray-400 truncate mt-0.5">
+                                {sess.visitorEmail || sess.visitorPhone || `ID: ${sess.id.slice(0, 16)}`}
+                              </p>
+                            </div>
+
+                            <div className="flex flex-col items-end flex-shrink-0">
+                              <span
+                                className={`text-[10px] font-bold ${
+                                  sess.isOnline ? 'text-emerald-500' : 'text-gray-400'
+                                }`}
+                              >
+                                {sess.lastSeenText || (sess.isOnline ? 'Online now' : 'Offline')}
+                              </span>
+                              {sess.unreadAdminCount > 0 && (
+                                <span className="mt-1 px-1.5 py-0.5 text-[9px] font-black rounded-full bg-red-600 text-white">
+                                  {sess.unreadAdminCount} new
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Topic & Selected Catalogue Rigs Badges */}
+                          <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                            <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded bg-creamy-500/15 text-creamy-500">
+                              {sess.topic || 'General Inquiry'}
+                            </span>
+                            {sess.selectedProducts && sess.selectedProducts.length > 0 && (
+                              <span className="text-[9px] font-bold px-2 py-0.5 rounded bg-blue-500/15 text-blue-500">
+                                {sess.selectedProducts.length} rig(s) selected
+                              </span>
+                            )}
+                            <span
+                              className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                sess.status === 'RESOLVED'
+                                  ? 'bg-gray-200 dark:bg-neutral-800 text-gray-500'
+                                  : 'bg-emerald-500/15 text-emerald-500'
+                              }`}
+                            >
+                              {sess.status}
+                            </span>
+                          </div>
+
+                          {lastMsg && (
+                            <p className="text-[11px] text-gray-600 dark:text-gray-400 truncate mt-2">
+                              <span className="font-bold">
+                                {lastMsg.senderRole === 'CLIENT'
+                                  ? 'Client: '
+                                  : lastMsg.senderRole === 'ADMIN'
+                                  ? 'You: '
+                                  : 'Bot: '}
+                              </span>
+                              {lastMsg.content}
+                            </p>
+                          )}
+                        </div>
+                      )
+                    })
+                  )}
+                </div>
+
+                {/* Right Column: Active Conversation Thread & Reply Console */}
+                <div className="lg:col-span-8 flex flex-col max-h-[620px]">
+                  {!activeSession ? (
+                    <div className="flex-1 flex items-center justify-center p-12 text-xs text-gray-400">
+                      Select a client conversation on the left to view messages and reply.
+                    </div>
+                  ) : (
+                    <>
+                      {/* Active Session Header */}
+                      <div className="p-4 border-b border-gray-200 dark:border-neutral-800 bg-gray-50/60 dark:bg-[#191c24] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={`w-2.5 h-2.5 rounded-full ${
+                                activeSession.isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-gray-400'
+                              }`}
+                            />
+                            <h4 className="font-bold text-sm text-gray-900 dark:text-white">
+                              {activeSession.visitorName || 'Store Visitor'}
+                            </h4>
+                            <span
+                              className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
+                                activeSession.isOnline
+                                  ? 'bg-emerald-500/20 text-emerald-500 border border-emerald-500/30'
+                                  : 'bg-gray-200 dark:bg-neutral-800 text-gray-500 dark:text-gray-400'
+                              }`}
+                            >
+                              {activeSession.lastSeenText || (activeSession.isOnline ? 'Online now' : 'Offline')}
+                            </span>
+                            <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-creamy-500/20 text-creamy-500">
+                              {activeSession.topic}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
+                            Email: <span className="font-mono font-semibold text-gray-800 dark:text-gray-200">{activeSession.visitorEmail || 'Not provided yet'}</span>
+                            {' • '}
+                            Phone: <span className="font-mono font-semibold text-gray-800 dark:text-gray-200">{activeSession.visitorPhone || 'Not provided'}</span>
+                            {' • '}
+                            Last Activity: {new Date(activeSession.lastSeenAt).toLocaleString()}
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleSupportStatus(activeSession.id, activeSession.status)}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-colors ${
+                              activeSession.status === 'OPEN'
+                                ? 'bg-emerald-500 hover:bg-emerald-400 text-black'
+                                : 'bg-gray-200 dark:bg-neutral-800 text-gray-700 dark:text-gray-200'
+                            }`}
+                          >
+                            {activeSession.status === 'OPEN' ? 'Mark Resolved' : 'Reopen Ticket'}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Selected Catalogue Products ("What are you looking to buy today?") */}
+                      {activeSession.selectedProducts && activeSession.selectedProducts.length > 0 && (
+                        <div className="px-4 py-2.5 bg-creamy-500/5 border-b border-gray-200 dark:border-neutral-800">
+                          <p className="text-[10px] font-black uppercase tracking-wider text-creamy-500 mb-1.5">
+                            Selected Catalogue Rigs (Looking to Buy Today):
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {activeSession.selectedProducts.map((prod) => (
+                              <div
+                                key={prod.id}
+                                className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#13151b] border border-gray-200 dark:border-neutral-700 shadow-2xs"
+                              >
+                                <img
+                                  src={getSafeMediaUrl(prod.image)}
+                                  alt={prod.name}
+                                  className="w-7 h-7 rounded object-cover bg-gray-100"
+                                  onError={(e) => {
+                                    (e.target as HTMLImageElement).src = '/images/hero1.jpeg'
+                                  }}
+                                />
+                                <div>
+                                  <p className="text-[11px] font-bold text-gray-900 dark:text-white leading-tight">
+                                    {prod.name}
+                                  </p>
+                                  <p className="text-[9px] text-gray-500 font-mono">
+                                    {prod.sku} • {formatPrice(prod.price)}
+                                  </p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Messages History */}
+                      <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-white dark:bg-[#14161c]">
+                        {(activeSession.messages || []).map((msg) => {
+                          const isAdmin = msg.senderRole === 'ADMIN'
+                          const isClient = msg.senderRole === 'CLIENT'
+                          return (
+                            <div
+                              key={msg.id}
+                              className={`flex flex-col ${isAdmin ? 'items-end' : 'items-start'}`}
+                            >
+                              <div className="flex items-center gap-1.5 mb-1 px-1">
+                                <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400">
+                                  {msg.senderName}
+                                </span>
+                                <span
+                                  className={`text-[8px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                    isClient
+                                      ? 'bg-blue-500/20 text-blue-400'
+                                      : isAdmin
+                                      ? 'bg-emerald-500/20 text-emerald-400'
+                                      : 'bg-creamy-500/20 text-creamy-400'
+                                  }`}
+                                >
+                                  {msg.senderRole}
+                                </span>
+                                <span className="text-[9px] text-gray-400">
+                                  {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              </div>
+                              <div
+                                className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-xs leading-relaxed whitespace-pre-line ${
+                                  isAdmin
+                                    ? 'bg-creamy-500 text-black font-semibold rounded-br-xs'
+                                    : isClient
+                                    ? 'bg-blue-600 text-white font-medium rounded-bl-xs shadow-sm'
+                                    : 'bg-gray-100 dark:bg-[#1d202a] text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-neutral-800 rounded-bl-xs'
+                                }`}
+                              >
+                                {msg.content}
+                              </div>
+                            </div>
+                          )
+                        })}
+                        <div ref={adminChatEndRef} />
+                      </div>
+
+                      {/* Quick Templates & Admin Reply Form */}
+                      <div className="p-3.5 bg-gray-50 dark:bg-[#191c24] border-t border-gray-200 dark:border-neutral-800 space-y-2">
+                        <div className="flex flex-wrap gap-1.5">
+                          {activeSession.selectedProducts && activeSession.selectedProducts.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const summary = activeSession.selectedProducts
+                                  .map(p => `${p.name} (${p.sku}) at ${formatPrice(p.price)}`)
+                                  .join(', ')
+                                setAdminReplyText(
+                                  `Hi ${activeSession.visitorName || 'there'}! Confirming availability for your selected rig(s): ${summary}. In stock and ready for crated dispatch with free shipping. Would you like assistance completing your checkout?`
+                                )
+                              }}
+                              className="text-[10px] font-black px-2.5 py-1 rounded-lg bg-creamy-500/15 border border-creamy-500/40 text-creamy-600 dark:text-creamy-400 hover:bg-creamy-500 hover:text-black transition-colors"
+                            >
+                              + Quote Selected Rig(s)
+                            </button>
+                          )}
+                          {[
+                            'Hello! I am a live DriveFlyElectric specialist. Your selected rig is in stock and ready for dispatch.',
+                            'You can complete your purchase securely via Stripe Card or PayPal at checkout—free express crate shipping is included.',
+                            'All rigs ship from our Nanshan, Shenzhen warehouse with full tracking and a 12-month warranty. How can I assist further?'
+                          ].map((tpl, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => setAdminReplyText(tpl)}
+                              className="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-white dark:bg-[#14161c] border border-gray-200 dark:border-neutral-700 text-gray-600 dark:text-gray-300 hover:border-creamy-500 hover:text-creamy-500 transition-colors truncate max-w-[230px]"
+                            >
+                              + {tpl.slice(0, 38)}...
+                            </button>
+                          ))}
+                        </div>
+
+                        <form onSubmit={handleSendAdminReply} className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={adminReplyText}
+                            onChange={(e) => setAdminReplyText(e.target.value)}
+                            placeholder={`Reply directly to ${activeSession.visitorName || 'visitor'}...`}
+                            className="flex-1 px-3.5 py-2.5 text-xs rounded-xl bg-white dark:bg-[#14161c] border border-gray-300 dark:border-neutral-700 text-gray-900 dark:text-white placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-creamy-500"
+                          />
+                          <button
+                            type="submit"
+                            disabled={isSendingReply || !adminReplyText.trim()}
+                            className="bg-creamy-500 hover:bg-creamy-400 disabled:opacity-50 text-black font-black uppercase tracking-wider px-4 py-2.5 rounded-xl text-xs flex items-center gap-1.5 transition-all active:scale-95"
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            <span>Send Reply</span>
+                          </button>
+                        </form>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          )
+        })()}
       </div>
 
       {/* Add / Edit Product Modal with Direct Image File Upload */}
@@ -1066,7 +1571,7 @@ export const AdminDashboard: React.FC = () => {
                         Select multiple images or video clips. First media item is the primary thumbnail.
                       </p>
                     </div>
-                    <span className="text-[10px] font-mono bg-amber-500/20 text-amber-500 font-bold px-2 py-0.5 rounded">
+                    <span className="text-[10px] font-mono bg-creamy-500/20 text-creamy-500 font-bold px-2 py-0.5 rounded">
                       {productForm.images.length} uploaded
                     </span>
                   </div>
@@ -1079,10 +1584,10 @@ export const AdminDashboard: React.FC = () => {
                       accept="image/*,video/*"
                       onChange={handleFileUpload}
                       disabled={isUploadingImage}
-                      className="text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-amber-500 file:text-black hover:file:bg-amber-400 cursor-pointer w-full"
+                      className="text-xs text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-creamy-500 file:text-black hover:file:bg-creamy-400 cursor-pointer w-full"
                     />
                     {isUploadingImage && (
-                      <p className="text-[10px] text-amber-500 font-bold mt-1 animate-pulse">
+                      <p className="text-[10px] text-creamy-500 font-bold mt-1 animate-pulse">
                         Uploading media file(s) to server...
                       </p>
                     )}
@@ -1111,7 +1616,7 @@ export const AdminDashboard: React.FC = () => {
                           })
                           setManualMediaUrl('')
                         }}
-                        className="px-3 py-1.5 bg-gray-200 dark:bg-neutral-800 hover:bg-amber-500 hover:text-black text-gray-700 dark:text-gray-200 rounded-lg text-xs font-bold transition-colors"
+                        className="px-3 py-1.5 bg-gray-200 dark:bg-neutral-800 hover:bg-creamy-500 hover:text-black text-gray-700 dark:text-gray-200 rounded-lg text-xs font-bold transition-colors"
                       >
                         Add Media
                       </button>
@@ -1124,7 +1629,7 @@ export const AdminDashboard: React.FC = () => {
                       {productForm.images.map((imgUrl, idx) => (
                         <div
                           key={idx}
-                          className={`group relative aspect-square rounded-lg overflow-hidden border-2 bg-gray-200 dark:bg-neutral-800 ${idx === 0 ? 'border-amber-500 shadow-sm' : 'border-gray-300 dark:border-neutral-700'
+                          className={`group relative aspect-square rounded-lg overflow-hidden border-2 bg-gray-200 dark:bg-neutral-800 ${idx === 0 ? 'border-creamy-500 shadow-sm' : 'border-gray-300 dark:border-neutral-700'
                             }`}
                         >
                           {isVideoMedia(imgUrl) ? (
@@ -1148,7 +1653,7 @@ export const AdminDashboard: React.FC = () => {
                             />
                           )}
                           {idx === 0 && (
-                            <span className="absolute top-1 left-1 bg-amber-500 text-black text-[8px] font-black uppercase px-1 rounded">
+                            <span className="absolute top-1 left-1 bg-creamy-500 text-black text-[8px] font-black uppercase px-1 rounded">
                               Main
                             </span>
                           )}
@@ -1157,7 +1662,7 @@ export const AdminDashboard: React.FC = () => {
                               <button
                                 type="button"
                                 onClick={() => setPrimaryImage(idx)}
-                                className="text-[8px] bg-amber-500 text-black font-bold px-1.5 py-0.5 rounded uppercase"
+                                className="text-[8px] bg-creamy-500 text-black font-bold px-1.5 py-0.5 rounded uppercase"
                               >
                                 Make Main
                               </button>
@@ -1184,7 +1689,7 @@ export const AdminDashboard: React.FC = () => {
                     required
                     value={productForm.name}
                     onChange={(e) => setProductForm({ ...productForm, name: e.target.value })}
-                    className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                     placeholder="e.g. Apex 3000W Electric Drift Trike"
                   />
                 </div>
@@ -1199,7 +1704,7 @@ export const AdminDashboard: React.FC = () => {
                       required
                       value={productForm.price}
                       onChange={(e) => setProductForm({ ...productForm, price: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                       placeholder="400.00"
                     />
                   </div>
@@ -1210,7 +1715,7 @@ export const AdminDashboard: React.FC = () => {
                       step="0.01"
                       value={productForm.originalPrice}
                       onChange={(e) => setProductForm({ ...productForm, originalPrice: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                       placeholder="550.00"
                     />
                   </div>
@@ -1225,7 +1730,7 @@ export const AdminDashboard: React.FC = () => {
                       required
                       value={productForm.sku}
                       onChange={(e) => setProductForm({ ...productForm, sku: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors font-mono"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors font-mono"
                       placeholder="DFE-HELI-1000"
                     />
                   </div>
@@ -1235,7 +1740,7 @@ export const AdminDashboard: React.FC = () => {
                       type="number"
                       value={productForm.stock}
                       onChange={(e) => setProductForm({ ...productForm, stock: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                       placeholder="25"
                     />
                   </div>
@@ -1244,7 +1749,7 @@ export const AdminDashboard: React.FC = () => {
                     <select
                       value={productForm.category}
                       onChange={(e) => setProductForm({ ...productForm, category: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-amber-500 outline-none transition-colors font-bold"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500 outline-none transition-colors font-bold"
                     >
                       <option value="mini-helicopter">MiniHeliCopters (mini-helicopter)</option>
                       <option value="Microcars">Microcars</option>
@@ -1263,7 +1768,7 @@ export const AdminDashboard: React.FC = () => {
                       type="text"
                       value={productForm.brand}
                       onChange={(e) => setProductForm({ ...productForm, brand: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                     />
                   </div>
                   <div>
@@ -1272,7 +1777,7 @@ export const AdminDashboard: React.FC = () => {
                       type="text"
                       value={productForm.deliveryTime}
                       onChange={(e) => setProductForm({ ...productForm, deliveryTime: e.target.value })}
-                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                      className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                     />
                   </div>
                 </div>
@@ -1284,7 +1789,7 @@ export const AdminDashboard: React.FC = () => {
                     rows={3}
                     value={productForm.description}
                     onChange={(e) => setProductForm({ ...productForm, description: e.target.value })}
-                    className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 outline-none transition-colors"
+                    className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                     placeholder="Highlight motor wattage, battery capacity, frame materials, top speed, and range..."
                   />
                 </div>
@@ -1295,7 +1800,7 @@ export const AdminDashboard: React.FC = () => {
                     id="isNew"
                     checked={productForm.isNew}
                     onChange={(e) => setProductForm({ ...productForm, isNew: e.target.checked })}
-                    className="w-4 h-4 text-amber-500 rounded border-gray-300 dark:border-neutral-700 accent-amber-500"
+                    className="w-4 h-4 text-creamy-500 rounded border-gray-300 dark:border-neutral-700 accent-creamy-500"
                   />
                   <label htmlFor="isNew" className="text-xs font-bold text-gray-700 dark:text-gray-300">
                     Mark as "NEW" featured product in store
@@ -1312,7 +1817,7 @@ export const AdminDashboard: React.FC = () => {
                   </button>
                   <button
                     type="submit"
-                    className="bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider px-6 py-2.5 rounded-xl text-xs shadow-md transition-all active:scale-95"
+                    className="bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider px-6 py-2.5 rounded-xl text-xs shadow-md transition-all active:scale-95"
                   >
                     {editingProductId ? 'Update Rig Details' : 'Publish Rig to Catalog'}
                   </button>
@@ -1336,7 +1841,7 @@ export const AdminDashboard: React.FC = () => {
               <div className="relative bg-white dark:bg-[#16181e] text-gray-900 dark:text-white rounded-2xl shadow-2xl max-w-2xl w-full p-6 sm:p-8 border border-gray-200 dark:border-neutral-800 font-mono text-xs">
                 <div className="flex items-center justify-between pb-4 border-b border-gray-200 dark:border-neutral-800 mb-4 no-print">
                   <div className="flex items-center gap-2">
-                    <FileText className="w-5 h-5 text-amber-500" />
+                    <FileText className="w-5 h-5 text-creamy-500" />
                     <div>
                       <h3 className="text-base font-black uppercase tracking-wider font-sans text-gray-900 dark:text-white">
                         Purchase Receipt • #{previewReceipt.orderNumber}
@@ -1358,7 +1863,7 @@ export const AdminDashboard: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-2.5 mb-5 no-print font-sans">
                   <button
                     onClick={() => handleDownloadOrderReceipt(selectedReceiptOrder)}
-                    className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider text-xs px-4 py-2.5 rounded-xl shadow-md shadow-amber-500/20 transition-all cursor-pointer"
+                    className="inline-flex items-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs px-4 py-2.5 rounded-xl shadow-md shadow-creamy-500/20 transition-all cursor-pointer"
                   >
                     <Download className="w-4 h-4" />
                     <span>Download Receipt (.pdf)</span>

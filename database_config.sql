@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS public.orders (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     user_id TEXT REFERENCES public.users(id) ON DELETE CASCADE,
     order_number TEXT UNIQUE NOT NULL,
+    tracking_number TEXT UNIQUE,
     status TEXT CHECK (status IN ('PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED')) DEFAULT 'PENDING',
     total DECIMAL(10,2) NOT NULL,
     subtotal DECIMAL(10,2) NOT NULL,
@@ -129,6 +130,22 @@ CREATE TABLE IF NOT EXISTS public.order_items (
     total DECIMAL(10,2) NOT NULL
 );
 
+-- Product Reviews Table (Customer Reviews with Image Upload Support)
+CREATE TABLE IF NOT EXISTS public.product_reviews (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE NOT NULL,
+    user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
+    reviewer_name TEXT NOT NULL,
+    reviewer_email TEXT,
+    rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL DEFAULT 5,
+    title TEXT,
+    comment TEXT NOT NULL,
+    images TEXT[] DEFAULT '{}',
+    verified_purchase BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Events Table
 CREATE TABLE IF NOT EXISTS public.events (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -141,6 +158,36 @@ CREATE TABLE IF NOT EXISTS public.events (
     status TEXT CHECK (status IN ('upcoming', 'past', 'cancelled')) DEFAULT 'upcoming',
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Support Sessions Table (Real-Time LiveChat & Presence Tracking)
+CREATE TABLE IF NOT EXISTS public.support_sessions (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    visitor_id TEXT NOT NULL,
+    user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
+    visitor_name TEXT DEFAULT 'Store Visitor',
+    visitor_email TEXT,
+    visitor_phone TEXT,
+    topic TEXT DEFAULT 'General Inquiry',
+    selected_products JSONB DEFAULT '[]'::jsonb,
+    status TEXT CHECK (status IN ('OPEN', 'RESOLVED')) DEFAULT 'OPEN',
+    is_online BOOLEAN DEFAULT true,
+    last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+    unread_admin_count INTEGER DEFAULT 0,
+    unread_client_count INTEGER DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Support Messages Table (Client, Intelligent Assistant & Admin Replies)
+CREATE TABLE IF NOT EXISTS public.support_messages (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    session_id TEXT REFERENCES public.support_sessions(id) ON DELETE CASCADE,
+    sender_role TEXT CHECK (sender_role IN ('CLIENT', 'ADMIN', 'AI_ASSISTANT')) NOT NULL,
+    sender_name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- =====================================================
@@ -160,6 +207,10 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'reviews') THEN
         ALTER TABLE public.products ADD COLUMN reviews INTEGER DEFAULT 0;
     END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'tracking_number') THEN
+        ALTER TABLE public.orders ADD COLUMN tracking_number TEXT;
+    END IF;
 END $$;
 
 -- =====================================================
@@ -178,8 +229,14 @@ CREATE INDEX IF NOT EXISTS idx_addresses_user_id ON public.addresses(user_id);
 CREATE INDEX IF NOT EXISTS idx_addresses_type ON public.addresses(type);
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON public.orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_tracking_number ON public.orders(tracking_number);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_product_id ON public.product_reviews(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_created_at ON public.product_reviews(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_sessions_visitor_id ON public.support_sessions(visitor_id);
+CREATE INDEX IF NOT EXISTS idx_support_sessions_updated_at ON public.support_sessions(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_messages_session_id ON public.support_messages(session_id);
 
 -- =====================================================
 -- 4. ROW LEVEL SECURITY (RLS) POLICIES
@@ -193,7 +250,32 @@ ALTER TABLE public.cart_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.addresses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.order_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.product_reviews ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.support_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.support_messages ENABLE ROW LEVEL SECURITY;
+
+-- Product Reviews: Public read & submit, Admins full access
+DROP POLICY IF EXISTS "Public can view product reviews" ON public.product_reviews;
+CREATE POLICY "Public can view product reviews" ON public.product_reviews
+    FOR SELECT USING (true);
+
+DROP POLICY IF EXISTS "Anyone can submit product reviews" ON public.product_reviews;
+CREATE POLICY "Anyone can submit product reviews" ON public.product_reviews
+    FOR INSERT WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Admins can manage product reviews" ON public.product_reviews;
+CREATE POLICY "Admins can manage product reviews" ON public.product_reviews
+    FOR ALL USING (true) WITH CHECK (true);
+
+-- Support Sessions & Messages: Service & visitors can create/read/update their sessions, Admins manage all
+DROP POLICY IF EXISTS "Support sessions accessible to service and clients" ON public.support_sessions;
+CREATE POLICY "Support sessions accessible to service and clients" ON public.support_sessions
+    FOR ALL USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Support messages accessible to service and clients" ON public.support_messages;
+CREATE POLICY "Support messages accessible to service and clients" ON public.support_messages
+    FOR ALL USING (true) WITH CHECK (true);
 
 -- Events: Public read, Admins manage
 DROP POLICY IF EXISTS "Public can view events" ON public.events;

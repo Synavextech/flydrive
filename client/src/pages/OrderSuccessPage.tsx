@@ -10,7 +10,8 @@ import {
   Printer,
   Copy,
   Check,
-  FileText
+  FileText,
+  Truck
 } from 'lucide-react'
 import { paymentApi, orderApi } from '../services/api'
 import { useCart } from '../contexts/CartContext'
@@ -25,6 +26,7 @@ export type { OrderReceiptData }
 
 interface LocationState {
   orderNumber?: string
+  trackingNumber?: string
   total?: number
   paymentMethod?: string
   shippingAddress?: string
@@ -55,6 +57,14 @@ const OrderSuccessPage = () => {
   const [orderNumber, setOrderNumber] = useState<string>(
     state.orderNumber || initialReceipt?.orderNumber || ''
   )
+  const [trackingNumber, setTrackingNumber] = useState<string>(
+    state.trackingNumber ||
+      initialReceipt?.trackingNumber ||
+      (state.orderNumber || initialReceipt?.orderNumber
+        ? `TRK-${state.orderNumber || initialReceipt?.orderNumber}`
+        : '')
+  )
+  const [copiedTracking, setCopiedTracking] = useState(false)
   const [paymentMethod, setPaymentMethod] = useState<string>(
     state.paymentMethod || (initialReceipt?.paymentSource?.includes('PayPal') ? 'PAYPAL' : 'STRIPE')
   )
@@ -114,7 +124,10 @@ const OrderSuccessPage = () => {
 
           if (createRes.data) {
             const confirmedOrderNumber = createRes.data.orderNumber || `ORD-${Date.now()}`
+            const confirmedTrackingNumber =
+              createRes.data.trackingNumber || `TRK-${confirmedOrderNumber}`
             setOrderNumber(confirmedOrderNumber)
+            setTrackingNumber(confirmedTrackingNumber)
             setPaymentMethod('PAYPAL')
             const finalTotal = Number(parsed.grandTotal || parsed.total || createRes.data.total || 0)
             setTotal(finalTotal)
@@ -130,6 +143,7 @@ const OrderSuccessPage = () => {
               date: orderDateStr,
               orderDate: orderDateStr,
               orderNumber: confirmedOrderNumber,
+              trackingNumber: confirmedTrackingNumber,
               transactionId: captureRes.data.paymentId || (typeof payPalToken === 'string' ? payPalToken : `PP-${Date.now()}`),
               userName: `${parsed.shippingData?.firstName || ''} ${parsed.shippingData?.lastName || ''}`.trim() || 'Valued Customer',
               address: fullAddress,
@@ -150,6 +164,22 @@ const OrderSuccessPage = () => {
 
             setReceipt(ppReceipt)
             localStorage.setItem('latest_order_receipt', JSON.stringify(ppReceipt))
+            try {
+              const prevTrackings = JSON.parse(localStorage.getItem('dfe_recent_trackings') || '[]')
+              const nextEntry = {
+                orderNumber: confirmedOrderNumber,
+                trackingNumber: confirmedTrackingNumber,
+                date: orderDateStr,
+                total: finalTotal,
+                destination: fullAddress,
+                status: 'PROCESSING',
+                items: ppReceipt.items
+              }
+              const deduped = [nextEntry, ...prevTrackings.filter((t: any) => t.trackingNumber !== confirmedTrackingNumber && t.orderNumber !== confirmedOrderNumber)].slice(0, 8)
+              localStorage.setItem('dfe_recent_trackings', JSON.stringify(deduped))
+            } catch {
+              // Ignore storage error
+            }
 
             // Auto-login if guest account was registered
             if ((createRes as any).token && (createRes as any).user) {
@@ -218,20 +248,43 @@ const OrderSuccessPage = () => {
   const [showReceiptPreview, setShowReceiptPreview] = useState(true)
 
   const displayOrderNumber = orderNumber || `DFE-${Math.floor(100000 + Math.random() * 900000)}`
+  const displayTrackingNumber =
+    trackingNumber || receipt?.trackingNumber || `TRK-${displayOrderNumber}`
   const formattedTotal = total ? `$${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : null
 
-  const activeReceipt: OrderReceiptData = receipt || {
-    date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-    orderDate: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-    orderNumber: displayOrderNumber,
-    transactionId: `TXN-${Math.floor(100000 + Math.random() * 900000)}`,
-    userName: 'Valued Customer',
-    address: 'Express Shipping to Destination on File',
-    paymentSource: paymentMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : paymentMethod === 'PAYPAL' ? 'PayPal Express' : paymentMethod,
-    initialCharge: formattedTotal || '$0.00',
-    finalCost: formattedTotal || '$0.00',
-    totalRefund: '$0.00',
-    refundTrans: 'N/A'
+  const activeReceipt: OrderReceiptData = receipt
+    ? { ...receipt, trackingNumber: receipt.trackingNumber || displayTrackingNumber }
+    : {
+        date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+        orderDate: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+        orderNumber: displayOrderNumber,
+        trackingNumber: displayTrackingNumber,
+        transactionId: `TXN-${Math.floor(100000 + Math.random() * 900000)}`,
+        userName: 'Valued Customer',
+        address: 'Express Shipping to Destination on File',
+        paymentSource: paymentMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : paymentMethod === 'PAYPAL' ? 'PayPal Express' : paymentMethod,
+        initialCharge: formattedTotal || '$0.00',
+        finalCost: formattedTotal || '$0.00',
+        totalRefund: '$0.00',
+        refundTrans: 'N/A'
+      }
+
+  const handleCopyTrackingNumber = async () => {
+    try {
+      await navigator.clipboard.writeText(displayTrackingNumber)
+      setCopiedTracking(true)
+      setTimeout(() => setCopiedTracking(false), 2000)
+    } catch {
+      // Ignore
+    }
+  }
+
+  const handleOpenLiveTracker = () => {
+    window.dispatchEvent(
+      new CustomEvent('dfe:open-track-order', {
+        detail: { trackingNumber: displayTrackingNumber }
+      })
+    )
   }
 
   // Automatically generate and download PDF receipt once when purchase completes
@@ -285,7 +338,7 @@ const OrderSuccessPage = () => {
             Order Confirmed!
           </h1>
           <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 max-w-xl mx-auto mt-2 font-medium">
-            Thank you for choosing <span className="text-amber-500 font-bold">DriveFlyElectric</span>. Your order has been placed and registered for express dispatch from our Nanshan, Shenzhen, Guangdong Province, China Warehouse.
+            Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been placed and registered for express dispatch from our Nanshan, Shenzhen, Guangdong Province, China Warehouse.
           </p>
 
           <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3 bg-gray-50 dark:bg-[#1a1d24] rounded-xl p-4 border border-gray-200 dark:border-neutral-800 text-left">
@@ -294,14 +347,12 @@ const OrderSuccessPage = () => {
               <p className="text-xs font-black text-gray-900 dark:text-white font-mono truncate">{displayOrderNumber}</p>
             </div>
             <div>
-              <p className="text-[10px] uppercase font-bold text-gray-500 dark:text-neutral-400">Payment</p>
-              <p className="text-xs font-bold text-gray-900 dark:text-white">
-                {paymentMethod === 'STRIPE' ? 'Stripe Card' : 'PayPal'}
-              </p>
+              <p className="text-[10px] uppercase font-bold text-gray-500 dark:text-neutral-400">Tracking #</p>
+              <p className="text-xs font-black text-creamy-500 font-mono truncate">{displayTrackingNumber}</p>
             </div>
             <div>
               <p className="text-[10px] uppercase font-bold text-gray-500 dark:text-neutral-400">Total USD</p>
-              <p className="text-xs font-black text-amber-500 font-anton">{activeReceipt.finalCost}</p>
+              <p className="text-xs font-black text-creamy-500 font-anton">{activeReceipt.finalCost}</p>
             </div>
             <div>
               <p className="text-[10px] uppercase font-bold text-gray-500 dark:text-neutral-400">Dispatch</p>
@@ -309,11 +360,51 @@ const OrderSuccessPage = () => {
             </div>
           </div>
 
+          {/* Dedicated Tracking Number & Live Order Tracking Callout */}
+          <div className="mt-5 p-4 sm:p-5 rounded-xl bg-creamy-500/10 border border-creamy-500/30 flex flex-col sm:flex-row items-center justify-between gap-4 text-left">
+            <div className="flex items-center gap-3.5">
+              <div className="w-11 h-11 rounded-xl bg-creamy-500 text-black flex items-center justify-center shrink-0 shadow-md">
+                <Truck className="w-6 h-6" />
+              </div>
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-creamy-500">
+                  Official Shipment Tracking Number Issued
+                </p>
+                <p className="text-sm sm:text-base font-black font-mono text-gray-900 dark:text-white mt-0.5">
+                  {displayTrackingNumber}
+                </p>
+                <p className="text-[11px] text-gray-600 dark:text-neutral-300">
+                  Use this tracking number anytime via the <strong>Track Order</strong> button on the top navigation bar.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto justify-end shrink-0">
+              <button
+                type="button"
+                onClick={handleCopyTrackingNumber}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-white dark:bg-[#13151b] border border-gray-300 dark:border-neutral-700 text-xs font-bold text-gray-800 dark:text-white hover:border-creamy-500 transition-colors cursor-pointer"
+              >
+                {copiedTracking ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5 text-creamy-500" />}
+                <span>{copiedTracking ? 'Copied!' : 'Copy Tracking #'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenLiveTracker}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs shadow-md transition-all cursor-pointer"
+              >
+                <Truck className="w-3.5 h-3.5" />
+                <span>Track Order Live</span>
+              </button>
+            </div>
+          </div>
+
           {/* Quick Action Buttons */}
           <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
             <button
               onClick={handleDownloadReceipt}
-              className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider text-xs px-5 py-3 rounded-xl shadow-lg shadow-amber-500/20 transition-all cursor-pointer"
+              className="inline-flex items-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs px-5 py-3 rounded-xl shadow-lg shadow-creamy-500/20 transition-all cursor-pointer"
             >
               <Download className="w-4 h-4" />
               Download Receipt (.pdf)
@@ -345,7 +436,7 @@ const OrderSuccessPage = () => {
           <div className="flex items-center justify-between border-b border-gray-200 dark:border-neutral-800 pb-4 mb-5">
             <div>
               <div className="flex items-center gap-2">
-                <FileText className="w-5 h-5 text-amber-500 no-print" />
+                <FileText className="w-5 h-5 text-creamy-500 no-print" />
                 <h2 className="text-base sm:text-lg font-black uppercase tracking-wider font-sans text-gray-900 dark:text-white">
                   Official Purchase Receipt
                 </h2>
@@ -355,7 +446,7 @@ const OrderSuccessPage = () => {
               </p>
             </div>
             <div className="text-right">
-              <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+              <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-creamy-500/10 text-creamy-600 dark:text-creamy-400 border border-creamy-500/20">
                 Settled in Full
               </span>
             </div>
@@ -387,7 +478,11 @@ const OrderSuccessPage = () => {
               </div>
               <div className="grid grid-cols-12 gap-2">
                 <span className="col-span-4 sm:col-span-3 text-gray-500 dark:text-neutral-400">Order Number   :</span>
-                <span className="col-span-8 sm:col-span-9 font-bold text-amber-600 dark:text-amber-400">{activeReceipt.orderNumber}</span>
+                <span className="col-span-8 sm:col-span-9 font-bold text-creamy-600 dark:text-creamy-400">{activeReceipt.orderNumber}</span>
+              </div>
+              <div className="grid grid-cols-12 gap-2">
+                <span className="col-span-4 sm:col-span-3 text-gray-500 dark:text-neutral-400">Tracking Number:</span>
+                <span className="col-span-8 sm:col-span-9 font-bold text-creamy-600 dark:text-creamy-400 font-mono">{displayTrackingNumber}</span>
               </div>
               <div className="grid grid-cols-12 gap-2">
                 <span className="col-span-4 sm:col-span-3 text-gray-500 dark:text-neutral-400">Transaction ID :</span>
@@ -433,9 +528,9 @@ const OrderSuccessPage = () => {
                 If you've purchased a this item, it means you know the item you purchased and have agreed with our terms and conditions that says payment is non-refundable.
               </p>
               <p>
-                Feel free to contact our Customer Service via email (<span className="text-amber-500 font-semibold underline">info-eurotopmobility@driveflyelectric.shop</span>) or WhatsApp (<a href="https://wa.me/19093088313" target="_blank" rel="noopener noreferrer" className="text-amber-500 font-semibold underline">+1 909 308-8313</a>) if you have any questions or concerns. They're available 24/7.
+                Feel free to contact our Customer Service via email (<span className="text-creamy-500 font-semibold underline">info-eurotopmobility@driveflyelectric.shop</span>) or WhatsApp (<a href="https://wa.me/19093088313" target="_blank" rel="noopener noreferrer" className="text-creamy-500 font-semibold underline">+1 909 308-8313</a>) if you have any questions or concerns. They're available 24/7.
               </p>
-              <p className="pt-1">Regards,<br />DriveFlyElectric Team<br /><a href="https://driveflyelectric.shop/" target="_blank" rel="noreferrer" className="text-amber-500 font-semibold hover:underline">https://driveflyelectric.shop/</a></p>
+              <p className="pt-1">Regards,<br />DriveFlyElectric Team<br /><a href="https://driveflyelectric.shop/" target="_blank" rel="noreferrer" className="text-creamy-500 font-semibold hover:underline">https://driveflyelectric.shop/</a></p>
             </div>
           </div>
 
@@ -461,7 +556,7 @@ const OrderSuccessPage = () => {
         <div className="no-print flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-gray-200 dark:border-neutral-800">
           <Link
             to="/"
-            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3.5 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider text-xs rounded-xl shadow-lg shadow-amber-500/20 transition-all"
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3.5 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs rounded-xl shadow-lg shadow-creamy-500/20 transition-all"
           >
             <Home className="w-4 h-4" />
             Continue Shopping

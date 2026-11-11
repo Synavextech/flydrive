@@ -49,19 +49,19 @@ const RegisterPage = () => {
   }
 
   const inputClasses =
-    'w-full px-4 py-2.5 bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-amber-500 focus:border-transparent outline-none transition-colors text-sm font-medium'
+    'w-full px-4 py-2.5 bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 focus:border-transparent outline-none transition-colors text-sm font-medium'
 
   return (
     <div className="pt-24 pb-16 min-h-screen bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white transition-colors duration-200 flex flex-col justify-center py-12 sm:px-6 lg:px-8">
       <div className="sm:mx-auto sm:w-full sm:max-w-md text-center">
         <div className="flex flex-col items-center justify-center">
-          <div className="h-10 w-10 rounded-xl bg-amber-500 flex items-center justify-center font-black text-black text-xl shadow-lg shadow-amber-500/30 mb-2">
+          <div className="h-10 w-10 rounded-xl bg-creamy-500 flex items-center justify-center font-black text-black text-xl shadow-lg shadow-creamy-500/30 mb-2">
             ⚡
           </div>
           <h1 className="text-2xl font-black uppercase tracking-tight text-gray-900 dark:text-white font-anton">
-            DRIVEFLY<span className="text-amber-500">ELECTRIC</span>
+            DRIVEFLY<span className="text-creamy-500">ELECTRIC</span>
           </h1>
-          <span className="text-[10px] uppercase font-bold text-amber-500 tracking-wider">
+          <span className="text-[10px] uppercase font-bold text-creamy-500 tracking-wider">
             electric microcars, minihelicopters & rides
           </span>
         </div>
@@ -70,7 +70,7 @@ const RegisterPage = () => {
         </h2>
         <p className="mt-2 text-xs text-gray-500 dark:text-gray-400 font-medium">
           Already have an account?{' '}
-          <Link to="/login" className="font-bold text-amber-500 hover:text-amber-400 transition-colors">
+          <Link to="/login" className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors">
             Sign in
           </Link>
         </p>
@@ -181,7 +181,7 @@ const RegisterPage = () => {
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full bg-amber-500 hover:bg-amber-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-3.5 px-4 rounded-xl shadow-lg shadow-amber-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
+                className="w-full bg-creamy-500 hover:bg-creamy-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-3.5 px-4 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
               >
                 <UserPlus className="h-4 w-4" />
                 {isLoading ? 'Creating account...' : 'Create Account'}

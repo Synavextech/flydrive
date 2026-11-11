@@ -11,8 +11,15 @@ import {
   Filter,
   ShoppingBag,
   Plus,
-  Minus
+  Minus,
+  Camera,
+  Upload,
+  X,
+  CheckCircle2,
+  MessageSquare,
+  ZoomIn
 } from 'lucide-react'
+import { Product } from '../types'
 import { useProducts } from '../contexts/ProductContext'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
@@ -39,9 +46,9 @@ const getSafeMediaUrl = (url?: string) => {
 export const HomePage: React.FC = () => {
   const navigate = useNavigate()
   const location = useLocation()
-  const { products, isLoading, error, fetchProducts } = useProducts()
+  const { products, isLoading, error, fetchProducts, getReviewsForProduct, submitProductReview } = useProducts()
   const { addToCart, totalItems, totalPrice } = useCart()
-  const { isAuthenticated } = useAuth()
+  const { isAuthenticated, user } = useAuth()
 
   const [selectedCategory, setSelectedCategory] = useState<string>('all')
   const [quantities, setQuantities] = useState<Record<string, number>>({})
@@ -50,6 +57,94 @@ export const HomePage: React.FC = () => {
   // Modals state
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false)
   const [isCartDrawerOpen, setIsCartDrawerOpen] = useState(false)
+
+  // Quick Review Composer & Photo Zoom Modal state
+  const [reviewModalProduct, setReviewModalProduct] = useState<Product | null>(null)
+  const [reviewName, setReviewName] = useState('')
+  const [reviewEmail, setReviewEmail] = useState('')
+  const [reviewRating, setReviewRating] = useState(5)
+  const [reviewTitle, setReviewTitle] = useState('')
+  const [reviewComment, setReviewComment] = useState('')
+  const [reviewFiles, setReviewFiles] = useState<File[]>([])
+  const [reviewPreviewUrls, setReviewPreviewUrls] = useState<string[]>([])
+  const [isSubmittingReview, setIsSubmittingReview] = useState(false)
+  const [reviewFeedback, setReviewFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [zoomedReviewImage, setZoomedReviewImage] = useState<string | null>(null)
+
+  const openReviewModal = (product: Product) => {
+    const fullName = [user?.firstName, user?.lastName].filter(Boolean).join(' ').trim()
+    setReviewModalProduct(product)
+    setReviewName(fullName || '')
+    setReviewEmail(user?.email || '')
+    setReviewRating(5)
+    setReviewTitle('')
+    setReviewComment('')
+    reviewPreviewUrls.forEach((url) => URL.revokeObjectURL(url))
+    setReviewFiles([])
+    setReviewPreviewUrls([])
+    setReviewFeedback(null)
+  }
+
+  const closeReviewModal = () => {
+    reviewPreviewUrls.forEach((url) => URL.revokeObjectURL(url))
+    setReviewModalProduct(null)
+    setReviewFiles([])
+    setReviewPreviewUrls([])
+    setReviewFeedback(null)
+  }
+
+  const handleReviewFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(e.target.files || [])
+    if (selected.length === 0) return
+    const combinedFiles = [...reviewFiles, ...selected].slice(0, 4)
+    reviewPreviewUrls.forEach((url) => URL.revokeObjectURL(url))
+    setReviewFiles(combinedFiles)
+    setReviewPreviewUrls(combinedFiles.map((file) => URL.createObjectURL(file)))
+    e.target.value = ''
+  }
+
+  const handleRemoveReviewFile = (index: number) => {
+    const nextFiles = reviewFiles.filter((_, idx) => idx !== index)
+    reviewPreviewUrls.forEach((url) => URL.revokeObjectURL(url))
+    setReviewFiles(nextFiles)
+    setReviewPreviewUrls(nextFiles.map((file) => URL.createObjectURL(file)))
+  }
+
+  const handleSubmitReview = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!reviewModalProduct) return
+    if (!reviewName.trim() || !reviewComment.trim()) {
+      setReviewFeedback({ type: 'error', text: 'Please provide your name and review comment.' })
+      return
+    }
+
+    try {
+      setIsSubmittingReview(true)
+      setReviewFeedback(null)
+      await submitProductReview(
+        reviewModalProduct.id,
+        {
+          reviewerName: reviewName.trim(),
+          reviewerEmail: reviewEmail.trim() || undefined,
+          rating: reviewRating,
+          title: reviewTitle.trim() || undefined,
+          comment: reviewComment.trim(),
+        },
+        reviewFiles
+      )
+      setReviewFeedback({ type: 'success', text: 'Thank you! Your verified review & photos are now live.' })
+      setTimeout(() => {
+        closeReviewModal()
+      }, 900)
+    } catch (err: any) {
+      setReviewFeedback({
+        type: 'error',
+        text: err?.message || 'Unable to submit review right now. Please try again.',
+      })
+    } finally {
+      setIsSubmittingReview(false)
+    }
+  }
 
   useEffect(() => {
     fetchProducts()
@@ -261,8 +356,8 @@ export const HomePage: React.FC = () => {
       <div className="pt-28 min-h-screen flex items-center justify-center bg-[#131316] text-white">
         <div className="text-center p-8 bg-[#17171c] rounded-2xl shadow-2xl border border-white/10 max-w-sm w-full mx-4">
           <div className="relative w-16 h-16 mx-auto mb-4">
-            <div className="w-16 h-16 rounded-full border-4 border-gray-800 border-t-amber-500 animate-spin" />
-            <ShoppingBag className="w-6 h-6 text-amber-500 absolute inset-0 m-auto" />
+            <div className="w-16 h-16 rounded-full border-4 border-gray-800 border-t-creamy-500 animate-spin" />
+            <ShoppingBag className="w-6 h-6 text-creamy-500 absolute inset-0 m-auto" />
           </div>
           <h3 className="font-anton text-2xl uppercase tracking-wider text-white mb-1">Loading Fleet</h3>
           <p className="text-xs text-gray-400">Fetching DriveFlyElectric inventory...</p>
@@ -282,7 +377,7 @@ export const HomePage: React.FC = () => {
           <p className="text-xs text-gray-400 mb-6">{error}</p>
           <button
             onClick={() => fetchProducts()}
-            className="w-full bg-amber-500 hover:bg-amber-400 text-black font-extrabold py-3 px-6 rounded-xl uppercase tracking-widest text-xs transition-colors"
+            className="w-full bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold py-3 px-6 rounded-xl uppercase tracking-widest text-xs transition-colors"
           >
             Retry Connection
           </button>
@@ -292,7 +387,7 @@ export const HomePage: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen bg-white dark:bg-[#131316] text-gray-900 dark:text-white selection:bg-amber-500 selection:text-black transition-colors duration-200">
+    <div className="min-h-screen bg-white dark:bg-[#131316] text-gray-900 dark:text-white selection:bg-creamy-500 selection:text-black transition-colors duration-200">
       {/* High-Impact Hero Section — Locally Hosted Files & Brand Tagline */}
       <header className="relative w-full h-[64vh] min-h-[480px] max-h-[740px] flex items-center overflow-hidden bg-black border-b border-gray-200 dark:border-white/10">
         <div className="absolute inset-0 z-0">
@@ -310,17 +405,17 @@ export const HomePage: React.FC = () => {
 
         <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="max-w-4xl space-y-5 md:space-y-6">
-            <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-400 text-xs font-bold uppercase tracking-widest backdrop-blur-md">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+            <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-creamy-500/20 border border-creamy-500/40 text-creamy-400 text-xs font-bold uppercase tracking-widest backdrop-blur-md">
+              <span className="w-2 h-2 rounded-full bg-creamy-400 animate-pulse" />
               Nanshan, Shenzhen, Guangdong Province, China
             </div>
 
             <h1 className="font-anton text-5xl sm:text-7xl lg:text-8xl text-white leading-none tracking-tight uppercase">
-              DRIVEFLY<span className="text-amber-500">ELECTRIC</span>
+              DRIVEFLY<span className="text-creamy-500">ELECTRIC</span>
             </h1>
 
-            <p className="text-base sm:text-lg text-gray-300 max-w-2xl border-l-4 border-amber-500 pl-6 leading-relaxed font-medium">
-              <span className="font-extrabold text-amber-400 block text-sm sm:text-base uppercase tracking-wider mb-1">
+            <p className="text-base sm:text-lg text-gray-300 max-w-2xl border-l-4 border-creamy-500 pl-6 leading-relaxed font-medium">
+              <span className="font-extrabold text-creamy-400 block text-sm sm:text-base uppercase tracking-wider mb-1">
                 Electric Microcars, MiniHeliCopters & Performance Rides
               </span>
             </p>
@@ -329,35 +424,35 @@ export const HomePage: React.FC = () => {
               <a
                 href="#store-catalog"
                 onClick={() => setSelectedCategory('mini-helicopter')}
-                className="bg-amber-500 hover:bg-amber-400 text-black px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg active:scale-95 transition-all shadow-lg shadow-amber-500/20"
+                className="bg-creamy-500 hover:bg-creamy-400 text-black px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg active:scale-95 transition-all shadow-lg shadow-creamy-500/20"
               >
                 Shop MiniHeliCopters
               </a>
               <a
                 href="#store-catalog"
                 onClick={() => setSelectedCategory('microcars')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-amber-500 hover:text-amber-500 active:scale-95 transition-all"
+                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
               >
                 Shop Microcars
               </a>
               <a
                 href="#store-catalog"
                 onClick={() => setSelectedCategory('go karts')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-amber-500 hover:text-amber-500 active:scale-95 transition-all"
+                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
               >
                 Shop Go Karts
               </a>
               <a
                 href="#store-catalog"
                 onClick={() => setSelectedCategory('trikes')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-amber-500 hover:text-amber-500 active:scale-95 transition-all"
+                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
               >
                 Shop Trikes
               </a>
               <a
                 href="#store-catalog"
                 onClick={() => setSelectedCategory('dirtbikes')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-amber-500 hover:text-amber-500 active:scale-95 transition-all"
+                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
               >
                 Shop Dirtbikes
               </a>
@@ -371,7 +466,7 @@ export const HomePage: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 sm:gap-6">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 flex items-center justify-center text-amber-500 flex-shrink-0 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 flex items-center justify-center text-creamy-500 flex-shrink-0 shadow-sm">
                 <Truck className="w-5 h-5" />
               </div>
               <div>
@@ -391,7 +486,7 @@ export const HomePage: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 flex items-center justify-center text-amber-500 dark:text-amber-400 flex-shrink-0 shadow-sm">
+              <div className="w-10 h-10 rounded-xl bg-white dark:bg-white/5 border border-gray-200 dark:border-white/10 flex items-center justify-center text-creamy-500 dark:text-creamy-400 flex-shrink-0 shadow-sm">
                 <ShieldCheck className="w-5 h-5" />
               </div>
               <div>
@@ -418,7 +513,7 @@ export const HomePage: React.FC = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4 mb-8">
             <div>
-              <span className="font-bold text-xs text-amber-500 uppercase tracking-widest">
+              <span className="font-bold text-xs text-creamy-500 uppercase tracking-widest">
                 Shop Everything
               </span>
               <h2 className="font-anton text-4xl sm:text-5xl uppercase tracking-tight text-gray-900 dark:text-white mt-1">
@@ -434,8 +529,8 @@ export const HomePage: React.FC = () => {
                   key={cat.id}
                   onClick={() => setSelectedCategory(cat.id)}
                   className={`px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider whitespace-nowrap transition-all ${selectedCategory === cat.id
-                    ? 'bg-amber-500 text-black shadow-lg shadow-amber-500/20'
-                    : 'bg-white dark:bg-[#17171c] text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white border border-gray-200 dark:border-white/10 hover:border-amber-500/40 shadow-sm'
+                    ? 'bg-creamy-500 text-black shadow-lg shadow-creamy-500/20'
+                    : 'bg-white dark:bg-[#17171c] text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white border border-gray-200 dark:border-white/10 hover:border-creamy-500/40 shadow-sm'
                     }`}
                 >
                   {cat.label}
@@ -452,7 +547,7 @@ export const HomePage: React.FC = () => {
               <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">No rigs matching "{selectedCategory}" in catalog.</p>
               <button
                 onClick={() => setSelectedCategory('all')}
-                className="bg-amber-500 text-black font-extrabold px-6 py-2.5 rounded-lg text-xs uppercase tracking-wider hover:bg-amber-400 transition-colors"
+                className="bg-creamy-500 text-black font-extrabold px-6 py-2.5 rounded-lg text-xs uppercase tracking-wider hover:bg-creamy-400 transition-colors"
               >
                 View Full Range
               </button>
@@ -467,7 +562,7 @@ export const HomePage: React.FC = () => {
                 return (
                   <div
                     key={product.id}
-                    className="group bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-lg overflow-hidden flex flex-col hover-lift hover:border-amber-500 transition-all shadow-sm dark:shadow-md"
+                    className="group bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-lg overflow-hidden flex flex-col hover-lift hover:border-creamy-500 transition-all shadow-sm dark:shadow-md"
                   >
                     {/* Aspect-square image container with Cut-Corner Badge */}
                     <Link
@@ -494,7 +589,7 @@ export const HomePage: React.FC = () => {
                       )}
 
                       {/* Cut-Corner SALE / NEW Badge matching edrifttrikes.shop */}
-                      <span className="absolute top-2.5 left-2.5 cut-corner-badge font-extrabold text-[10px] uppercase tracking-widest px-3 py-1 bg-amber-500 text-black shadow-md">
+                      <span className="absolute top-2.5 left-2.5 cut-corner-badge font-extrabold text-[10px] uppercase tracking-widest px-3 py-1 bg-creamy-500 text-black shadow-md">
                         {product.isNew ? 'NEW' : 'SALE'}
                       </span>
 
@@ -508,7 +603,7 @@ export const HomePage: React.FC = () => {
                     {/* Card Body */}
                     <div className="p-3.5 sm:p-4 flex flex-col flex-1 text-gray-900 dark:text-white">
                       <Link to={`/product/${product.id}`}>
-                        <h3 className="font-anton text-base sm:text-lg uppercase leading-tight line-clamp-2 hover:text-amber-500 transition-colors text-gray-900 dark:text-white">
+                        <h3 className="font-anton text-base sm:text-lg uppercase leading-tight line-clamp-2 hover:text-creamy-500 transition-colors text-gray-900 dark:text-white">
                           {product.name}
                         </h3>
                       </Link>
@@ -519,11 +614,11 @@ export const HomePage: React.FC = () => {
 
                       {/* 2-Column Key Specifications with orange left border */}
                       <div className="grid grid-cols-2 gap-2 my-3 text-[10px] uppercase font-bold border-t border-b border-gray-100 dark:border-white/5 py-2">
-                        <div className="border-l-2 border-amber-500 pl-2">
+                        <div className="border-l-2 border-creamy-500 pl-2">
                           <p className="text-gray-500 dark:text-gray-400 text-[9px] uppercase tracking-widest font-medium">Top Speed</p>
                           <p className="font-extrabold text-gray-900 dark:text-white">{specs.speed}</p>
                         </div>
-                        <div className="border-l-2 border-amber-500 pl-2">
+                        <div className="border-l-2 border-creamy-500 pl-2">
                           <p className="text-gray-500 dark:text-gray-400 text-[9px] uppercase tracking-widest font-medium">Range</p>
                           <p className="font-extrabold text-gray-900 dark:text-white">{specs.range}</p>
                         </div>
@@ -532,7 +627,7 @@ export const HomePage: React.FC = () => {
                       {/* Pricing & Free Shipping Tag */}
                       <div className="mt-auto flex items-center justify-between gap-2 pt-2">
                         <div>
-                          <span className="text-amber-500 font-anton text-lg sm:text-xl">
+                          <span className="text-creamy-500 font-anton text-lg sm:text-xl">
                             {formatPrice(product.price)}
                           </span>
                           {product.originalPrice && product.originalPrice > product.price && (
@@ -541,7 +636,7 @@ export const HomePage: React.FC = () => {
                             </span>
                           )}
                         </div>
-                        <span className="font-bold text-[9px] uppercase tracking-widest text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-transparent border border-amber-500/40 rounded px-2 py-0.5">
+                        <span className="font-bold text-[9px] uppercase tracking-widest text-creamy-600 dark:text-creamy-400 bg-creamy-50 dark:bg-transparent border border-creamy-500/40 rounded px-2 py-0.5">
                           Free shipping
                         </span>
                       </div>
@@ -571,7 +666,7 @@ export const HomePage: React.FC = () => {
                           onClick={(e) => handleAddToCart(product, e)}
                           className={`flex-1 py-2 sm:py-2.5 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest rounded transition-all active:scale-95 flex items-center justify-center gap-1.5 ${isAdded
                             ? 'bg-green-600 text-white'
-                            : 'bg-gray-900 text-white dark:bg-white dark:text-black hover:bg-amber-500 hover:text-black dark:hover:bg-amber-500 dark:hover:text-black'
+                            : 'bg-gray-900 text-white dark:bg-white dark:text-black hover:bg-creamy-500 hover:text-black dark:hover:bg-creamy-500 dark:hover:text-black'
                             }`}
                         >
                           {isAdded ? (
@@ -588,6 +683,124 @@ export const HomePage: React.FC = () => {
                         </button>
                       </div>
                     </div>
+
+                    {/* Constantly Visible 5 Customer Reviews Below Every Item Listing */}
+                    {(() => {
+                      const visibleReviews = getReviewsForProduct(product).slice(0, 5)
+                      const avgRating =
+                        visibleReviews.length > 0
+                          ? (
+                              visibleReviews.reduce((acc, item) => acc + (Number(item.rating) || 5), 0) /
+                              visibleReviews.length
+                            ).toFixed(1)
+                          : '5.0'
+
+                      return (
+                        <div className="border-t border-gray-200 dark:border-white/10 bg-gray-50/90 dark:bg-[#121216] p-2.5 sm:p-3 space-y-2 text-[10px]">
+                          <div className="flex items-center justify-between gap-1.5">
+                            <div className="flex items-center gap-1 min-w-0">
+                              <div className="flex items-center gap-0.5 text-[#58b970]">
+                                {[1, 2, 3, 4, 5].map((starIdx) => (
+                                  <Star key={starIdx} className="w-2.5 h-2.5 fill-[#58b970] text-[#58b970]" />
+                                ))}
+                              </div>
+                              <span className="font-extrabold text-gray-900 dark:text-white truncate">
+                                {avgRating}
+                              </span>
+                              <span className="text-gray-500 dark:text-gray-400 font-semibold truncate">
+                                • 5 Reviews
+                              </span>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => openReviewModal(product)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#e1f6e5] dark:bg-[#255131]/60 text-[#2c623a] dark:text-[#9de0ab] hover:bg-[#58b970] hover:text-black font-bold uppercase tracking-wider text-[9px] transition-colors flex-shrink-0"
+                            >
+                              <Camera className="w-2.5 h-2.5" />
+                              <span>+ Photo Review</span>
+                            </button>
+                          </div>
+
+                          <div className="space-y-1.5">
+                            {visibleReviews.map((review) => (
+                              <div
+                                key={review.id}
+                                className="rounded-md bg-white dark:bg-[#191920] border border-gray-200/80 dark:border-white/5 px-2 py-1.5 space-y-1"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <div className="flex items-center gap-1 min-w-0">
+                                    <span className="font-bold text-gray-900 dark:text-white truncate">
+                                      {review.reviewerName}
+                                    </span>
+                                    {review.verifiedPurchase && (
+                                      <CheckCircle2 className="w-2.5 h-2.5 text-[#58b970] flex-shrink-0" />
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-0.5 flex-shrink-0">
+                                    {[1, 2, 3, 4, 5].map((starVal) => (
+                                      <Star
+                                        key={starVal}
+                                        className={`w-2 h-2 ${
+                                          starVal <= (review.rating || 5)
+                                            ? 'fill-[#58b970] text-[#58b970]'
+                                            : 'text-gray-300 dark:text-gray-700'
+                                        }`}
+                                      />
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <p className="text-[10px] leading-snug text-gray-600 dark:text-gray-300 line-clamp-2">
+                                  {review.comment}
+                                </p>
+
+                                {review.images && review.images.length > 0 && (
+                                  <div className="flex items-center gap-1 pt-0.5">
+                                    {review.images.slice(0, 3).map((imgUrl, imgIdx) => (
+                                      <button
+                                        key={imgIdx}
+                                        type="button"
+                                        onClick={() => setZoomedReviewImage(getSafeMediaUrl(imgUrl))}
+                                        className="relative group/img w-8 h-8 rounded overflow-hidden border border-gray-200 dark:border-white/10 hover:border-[#58b970] transition-colors flex-shrink-0"
+                                        title="Click to inspect customer photo"
+                                      >
+                                        <img
+                                          src={getSafeMediaUrl(imgUrl)}
+                                          alt={`Review photo by ${review.reviewerName}`}
+                                          className="w-full h-full object-cover"
+                                        />
+                                        <span className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 flex items-center justify-center transition-opacity">
+                                          <ZoomIn className="w-3 h-3 text-white" />
+                                        </span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="flex items-center justify-between pt-0.5 text-[9px] font-bold uppercase tracking-wider">
+                            <button
+                              type="button"
+                              onClick={() => openReviewModal(product)}
+                              className="text-[#357c47] dark:text-[#76cf89] hover:underline flex items-center gap-1"
+                            >
+                              <MessageSquare className="w-2.5 h-2.5" />
+                              <span>Write Review</span>
+                            </button>
+                            <Link
+                              to={`/product/${product.id}#reviews`}
+                              className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center gap-0.5"
+                            >
+                              <span>Full Gallery</span>
+                              <ArrowRight className="w-2.5 h-2.5" />
+                            </Link>
+                          </div>
+                        </div>
+                      )
+                    })()}
                   </div>
                 )
               })}
@@ -603,14 +816,14 @@ export const HomePage: React.FC = () => {
             {/* Col 1: Brand & Bio */}
             <div className="space-y-4">
               <div className="flex items-center gap-2">
-                <div className="h-8 w-8 rounded-lg bg-amber-500 flex items-center justify-center font-black text-black text-lg">
+                <div className="h-8 w-8 rounded-lg bg-creamy-500 flex items-center justify-center font-black text-black text-lg">
                   ⚡
                 </div>
                 <div className="flex flex-col">
-                  <span className="font-anton text-xl text-amber-500 tracking-wide leading-none">
+                  <span className="font-anton text-xl text-creamy-500 tracking-wide leading-none">
                     DRIVEFLY<span className="text-gray-900 dark:text-white">ELECTRIC</span>
                   </span>
-                  <span className="text-[9px] uppercase tracking-wider text-amber-600 dark:text-amber-400 font-bold">
+                  <span className="text-[9px] uppercase tracking-wider text-creamy-600 dark:text-creamy-400 font-bold">
                     electric microcars, minihelicopters & rides
                   </span>
                 </div>
@@ -624,11 +837,11 @@ export const HomePage: React.FC = () => {
                   href="https://wa.me/19093088313?text=Hello!%20I%20would%20like%20some%20assistance%20regarding%20DriveFlyElectric."
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-amber-600 dark:text-amber-400 font-semibold pt-1 block hover:underline"
+                  className="text-creamy-600 dark:text-creamy-400 font-semibold pt-1 block hover:underline"
                 >
                   📞 WhatsApp / Call: +1 (909) 308-8313
                 </a>
-                <p className="text-amber-600 dark:text-amber-400 font-semibold">✉️ info-eurotopmobility@driveflyelectric.shop</p>
+                <p className="text-creamy-600 dark:text-creamy-400 font-semibold">✉️ info-eurotopmobility@driveflyelectric.shop</p>
               </div>
 
               {/* Social Media Links */}
@@ -674,7 +887,7 @@ export const HomePage: React.FC = () => {
                     rel="noopener noreferrer"
                     aria-label="Follow on X"
                     title="Follow on X"
-                    className="w-9 h-9 rounded-lg flex items-center justify-center bg-white dark:bg-[#17171c] border border-gray-300 dark:border-white/10 text-gray-600 dark:text-gray-400 hover:text-amber-500 dark:hover:text-white hover:border-amber-500/50 hover:bg-amber-500/10 hover:scale-105 transition-all shadow-sm"
+                    className="w-9 h-9 rounded-lg flex items-center justify-center bg-white dark:bg-[#17171c] border border-gray-300 dark:border-white/10 text-gray-600 dark:text-gray-400 hover:text-creamy-500 dark:hover:text-white hover:border-creamy-500/50 hover:bg-creamy-500/10 hover:scale-105 transition-all shadow-sm"
                   >
                     <svg className="w-4 h-4 fill-current" viewBox="0 0 24 24">
                       <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z" />
@@ -700,31 +913,31 @@ export const HomePage: React.FC = () => {
 
             {/* Col 2: Fleet Links */}
             <div>
-              <p className="font-bold text-xs text-amber-500 uppercase tracking-widest mb-4">The Fleet</p>
+              <p className="font-bold text-xs text-creamy-500 uppercase tracking-widest mb-4">The Fleet</p>
               <ul className="space-y-2.5 text-xs text-gray-600 dark:text-gray-400 font-medium">
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('mini-helicopter')} className="hover:text-amber-500 dark:hover:text-white transition-colors">MiniHeliCopters & Rotorcraft</a></li>
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('microcars')} className="hover:text-amber-500 dark:hover:text-white transition-colors">Microcars & Mini Jeeps</a></li>
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('go karts')} className="hover:text-amber-500 dark:hover:text-white transition-colors">Racing Go Karts & Buggies</a></li>
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('trikes')} className="hover:text-amber-500 dark:hover:text-white transition-colors">Electric Drift Trikes</a></li>
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('dirtbikes')} className="hover:text-amber-500 dark:hover:text-white transition-colors">Dirtbikes & Enduro</a></li>
-                <li><a href="#store-catalog" onClick={() => setSelectedCategory('all')} className="hover:text-amber-500 dark:hover:text-white transition-colors">The Full Range Catalog</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('mini-helicopter')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">MiniHeliCopters & Rotorcraft</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('microcars')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Microcars & Mini Jeeps</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('go karts')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Racing Go Karts & Buggies</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('trikes')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Electric Drift Trikes</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('dirtbikes')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Dirtbikes & Enduro</a></li>
+                <li><a href="#store-catalog" onClick={() => setSelectedCategory('all')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">The Full Range Catalog</a></li>
               </ul>
             </div>
 
             {/* Col 3: Support & Security */}
             <div>
-              <p className="font-bold text-xs text-amber-500 uppercase tracking-widest mb-4">Support & Care</p>
+              <p className="font-bold text-xs text-creamy-500 uppercase tracking-widest mb-4">Support & Care</p>
               <ul className="space-y-2.5 text-xs text-gray-600 dark:text-gray-400 font-medium">
-                <li><a href="#shipping" className="hover:text-amber-500 dark:hover:text-white transition-colors">China Depot Express Dispatch</a></li>
-                <li><a href="#payments" className="hover:text-amber-500 dark:hover:text-white transition-colors">Card & PayPal Protection</a></li>
-                <li><a href="#warranty" className="hover:text-amber-500 dark:hover:text-white transition-colors">Factory Warranty & Guarantees</a></li>
-                <li><Link to="/login" className="hover:text-amber-500 dark:hover:text-white transition-colors">Customer Portal</Link></li>
+                <li><a href="#shipping" className="hover:text-creamy-500 dark:hover:text-white transition-colors">China Depot Express Dispatch</a></li>
+                <li><a href="#payments" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Card & PayPal Protection</a></li>
+                <li><a href="#warranty" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Factory Warranty & Guarantees</a></li>
+                <li><Link to="/login" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Customer Portal</Link></li>
               </ul>
             </div>
 
             {/* Col 4: Newsletter */}
             <div>
-              <p className="font-bold text-xs text-amber-500 uppercase tracking-widest mb-4">Stay in the Drift</p>
+              <p className="font-bold text-xs text-creamy-500 uppercase tracking-widest mb-4">Stay in the Drift</p>
               <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">
                 Get notified first when new limited builds, battery kits, and seasonal sales drop.
               </p>
@@ -732,11 +945,11 @@ export const HomePage: React.FC = () => {
                 <input
                   type="email"
                   placeholder="Enter your email"
-                  className="w-full bg-white dark:bg-[#17171c] border border-gray-300 dark:border-white/10 rounded-lg px-3.5 py-2.5 text-xs text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-amber-500"
+                  className="w-full bg-white dark:bg-[#17171c] border border-gray-300 dark:border-white/10 rounded-lg px-3.5 py-2.5 text-xs text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-creamy-500"
                 />
                 <button
                   type="submit"
-                  className="w-full bg-amber-500 hover:bg-amber-400 text-black font-extrabold py-2.5 rounded-lg text-xs uppercase tracking-widest transition-all shadow-md shadow-amber-500/20"
+                  className="w-full bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold py-2.5 rounded-lg text-xs uppercase tracking-widest transition-all shadow-md shadow-creamy-500/20"
                 >
                   Join VIP Dispatch
                 </button>
@@ -747,9 +960,9 @@ export const HomePage: React.FC = () => {
           <div className="pt-8 flex flex-col sm:flex-row items-center justify-between text-xs text-gray-500 dark:text-gray-400 gap-4">
             <p>© 2026 DriveFlyElectric (driveflyelectric.shop). All rights reserved. By management! All users should create an account to track order progress.</p>
             <div className="flex gap-6">
-              <a href="#privacy" className="hover:text-amber-500 dark:hover:text-gray-300">Privacy</a>
-              <a href="#terms" className="hover:text-amber-500 dark:hover:text-gray-300">Terms</a>
-              <a href="#contact" className="hover:text-amber-500 dark:hover:text-gray-300">China HQ Contact</a>
+              <a href="#privacy" className="hover:text-creamy-500 dark:hover:text-gray-300">Privacy</a>
+              <a href="#terms" className="hover:text-creamy-500 dark:hover:text-gray-300">Terms</a>
+              <a href="#contact" className="hover:text-creamy-500 dark:hover:text-gray-300">China HQ Contact</a>
             </div>
           </div>
         </div>
@@ -762,16 +975,16 @@ export const HomePage: React.FC = () => {
             <div className="flex items-center gap-3">
               <div
                 onClick={() => setIsCartDrawerOpen(true)}
-                className="w-12 h-12 bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl flex items-center justify-center text-amber-500 relative cursor-pointer hover:bg-gray-200 dark:hover:bg-white/10 transition-colors"
+                className="w-12 h-12 bg-gray-100 dark:bg-white/5 border border-gray-200 dark:border-white/10 rounded-xl flex items-center justify-center text-creamy-500 relative cursor-pointer hover:bg-gray-200 dark:hover:bg-white/10 transition-colors"
               >
                 <ShoppingCart className="w-6 h-6" />
-                <span className="absolute -top-1.5 -right-1.5 bg-amber-500 text-black text-[10px] font-black w-5 h-5 rounded-full flex items-center justify-center shadow">
+                <span className="absolute -top-1.5 -right-1.5 bg-creamy-500 text-black text-[10px] font-black w-5 h-5 rounded-full flex items-center justify-center shadow">
                   {totalItems}
                 </span>
               </div>
               <div>
                 <p className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-semibold">Your Cart ({totalItems} items)</p>
-                <p className="font-anton text-xl text-amber-500">{formatPrice(totalPrice)}</p>
+                <p className="font-anton text-xl text-creamy-500">{formatPrice(totalPrice)}</p>
               </div>
             </div>
 
@@ -784,7 +997,7 @@ export const HomePage: React.FC = () => {
               </button>
               <button
                 onClick={handleInstantCheckout}
-                className="bg-amber-500 hover:bg-amber-400 text-black font-extrabold py-3 px-6 sm:px-8 rounded-lg shadow-lg shadow-amber-500/20 flex items-center gap-2 text-xs uppercase tracking-widest transition-all active:scale-95"
+                className="bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold py-3 px-6 sm:px-8 rounded-lg shadow-lg shadow-creamy-500/20 flex items-center gap-2 text-xs uppercase tracking-widest transition-all active:scale-95"
               >
                 <span>{isAuthenticated ? 'Proceed to Checkout' : 'Quick Checkout'}</span>
                 <ArrowRight className="w-4 h-4" />
@@ -794,6 +1007,212 @@ export const HomePage: React.FC = () => {
         </div>
       )}
 
+
+      {/* Quick Review & Multi-Image Upload Modal */}
+      {reviewModalProduct && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl max-w-lg w-full p-5 sm:p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-3 border-b border-gray-200 dark:border-white/10 pb-3">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-[#357c47] dark:text-[#76cf89]">
+                  Verified Customer Review
+                </p>
+                <h3 className="font-anton text-xl uppercase tracking-wide text-gray-900 dark:text-white leading-tight">
+                  {reviewModalProduct.name}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeReviewModal}
+                className="p-1.5 rounded-lg bg-gray-100 dark:bg-white/5 hover:bg-[#58b970] hover:text-black transition-colors"
+                aria-label="Close review modal"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitReview} className="space-y-3.5">
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1.5">
+                  Your Rating
+                </label>
+                <div className="flex items-center gap-1.5">
+                  {[1, 2, 3, 4, 5].map((starValue) => (
+                    <button
+                      key={starValue}
+                      type="button"
+                      onClick={() => setReviewRating(starValue)}
+                      className="p-1 rounded hover:scale-110 transition-transform"
+                      aria-label={`Rate ${starValue} stars`}
+                    >
+                      <Star
+                        className={`w-6 h-6 ${
+                          starValue <= reviewRating
+                            ? 'fill-[#58b970] text-[#58b970]'
+                            : 'text-gray-300 dark:text-gray-600'
+                        }`}
+                      />
+                    </button>
+                  ))}
+                  <span className="ml-2 text-xs font-bold text-gray-600 dark:text-gray-300">
+                    {reviewRating} / 5
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                    Your Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={reviewName}
+                    onChange={(e) => setReviewName(e.target.value)}
+                    placeholder="e.g. Alex Mercer"
+                    className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                    Email (Optional)
+                  </label>
+                  <input
+                    type="email"
+                    value={reviewEmail}
+                    onChange={(e) => setReviewEmail(e.target.value)}
+                    placeholder="you@example.com"
+                    className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                  Headline
+                </label>
+                <input
+                  type="text"
+                  value={reviewTitle}
+                  onChange={(e) => setReviewTitle(e.target.value)}
+                  placeholder="Highlight your delivery or performance experience"
+                  className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1">
+                  Detailed Review *
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  value={reviewComment}
+                  onChange={(e) => setReviewComment(e.target.value)}
+                  placeholder="Share build quality, range, delivery crating, or ride feedback..."
+                  className="w-full px-3 py-2 rounded-lg text-xs bg-gray-50 dark:bg-[#111115] border border-gray-200 dark:border-white/10 text-gray-900 dark:text-white focus:outline-none focus:border-[#58b970]"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-bold uppercase tracking-wider text-gray-600 dark:text-gray-300 mb-1.5">
+                  Upload Review Photos (Up to 4)
+                </label>
+                <label className="flex flex-col items-center justify-center gap-1.5 p-3 rounded-xl border-2 border-dashed border-gray-300 dark:border-white/15 hover:border-[#58b970] bg-gray-50 dark:bg-[#111115] cursor-pointer transition-colors">
+                  <Upload className="w-5 h-5 text-[#58b970]" />
+                  <span className="text-xs font-bold text-gray-700 dark:text-gray-200">
+                    Click to attach delivery or riding photos
+                  </span>
+                  <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                    JPG, PNG, WEBP supported ({reviewFiles.length}/4 selected)
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={handleReviewFileChange}
+                    className="hidden"
+                  />
+                </label>
+
+                {reviewPreviewUrls.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mt-2.5">
+                    {reviewPreviewUrls.map((previewUrl, idx) => (
+                      <div
+                        key={previewUrl}
+                        className="relative w-16 h-16 rounded-lg overflow-hidden border border-gray-200 dark:border-white/10"
+                      >
+                        <img src={previewUrl} alt={`Preview ${idx + 1}`} className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveReviewFile(idx)}
+                          className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/75 text-white hover:bg-red-600"
+                          aria-label="Remove image"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {reviewFeedback && (
+                <div
+                  className={`p-2.5 rounded-lg text-xs font-bold ${
+                    reviewFeedback.type === 'success'
+                      ? 'bg-[#e1f6e5] text-[#255131] border border-[#76cf89]'
+                      : 'bg-red-500/10 text-red-500 border border-red-500/30'
+                  }`}
+                >
+                  {reviewFeedback.text}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-gray-200 dark:border-white/10">
+                <button
+                  type="button"
+                  onClick={closeReviewModal}
+                  className="px-4 py-2 rounded-lg text-xs font-bold text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-white/5"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingReview}
+                  className="px-5 py-2 rounded-lg text-xs font-black uppercase tracking-wider bg-[#58b970] hover:bg-[#76cf89] text-black disabled:opacity-50 transition-colors"
+                >
+                  {isSubmittingReview ? 'Uploading & Saving...' : 'Publish Review'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Fullscreen Customer Review Photo Lightbox */}
+      {zoomedReviewImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setZoomedReviewImage(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setZoomedReviewImage(null)}
+            className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-[#58b970] hover:text-black text-white transition-colors"
+            aria-label="Close zoomed image"
+          >
+            <X className="w-6 h-6" />
+          </button>
+          <img
+            src={zoomedReviewImage}
+            alt="Customer review photo"
+            className="max-h-[85vh] max-w-[92vw] rounded-2xl object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      )}
 
       {/* Slide-Over Quick Cart Drawer */}
       <QuickCartDrawer

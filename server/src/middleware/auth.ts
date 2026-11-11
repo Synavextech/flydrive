@@ -6,6 +6,8 @@ export interface AuthUser {
   id: string
   email: string
   role: string
+  firstName?: string | null
+  lastName?: string | null
 }
 
 declare global {
@@ -47,7 +49,9 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
     req.user = {
       id: user.id,
       email: user.email,
-      role: user.role
+      role: user.role,
+      firstName: user.firstName,
+      lastName: user.lastName
     }
 
     next()
@@ -92,7 +96,9 @@ export const optionalAuth = async (req: Request, res: Response, next: NextFuncti
       req.user = {
         id: user.id,
         email: user.email,
-        role: user.role
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName
       }
     }
   } catch (error) {

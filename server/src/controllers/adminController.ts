@@ -131,6 +131,15 @@ export const createProduct = async (req: Request, res: Response) => {
 
     const newProduct = await databaseService.createProduct(productData)
 
+    emailService.recordActivity({
+      type: 'PRODUCT_UPDATED',
+      title: `New Fleet Item Added • ${newProduct.name}`,
+      message: `Created ${newProduct.name} (SKU: ${newProduct.sku} | Category: ${newProduct.category}) at $${Number(newProduct.price).toLocaleString()} USD.`,
+      amount: Number(newProduct.price),
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(201).json({
       success: true,
       message: 'Product created successfully',
@@ -161,6 +170,15 @@ export const updateProduct = async (req: Request, res: Response) => {
     const updateData = req.body
 
     const updatedProduct = await databaseService.updateProduct(productId, updateData)
+
+    emailService.recordActivity({
+      type: 'PRODUCT_UPDATED',
+      title: `Fleet Item Updated • ${updatedProduct.name}`,
+      message: `Updated ${updatedProduct.name} (SKU: ${updatedProduct.sku} | Stock: ${updatedProduct.stock}).`,
+      amount: Number(updatedProduct.price),
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
 
     res.status(200).json({
       success: true,
@@ -496,6 +514,122 @@ export const downloadAdminOrderReceiptPdf = async (req: Request, res: Response) 
     res.status(500).json({
       success: false,
       error: 'Failed to generate receipt PDF'
+    })
+  }
+}
+
+// @desc    Get all LiveChat support sessions (Admin)
+// @route   GET /api/admin/support/sessions
+// @access  Private/Admin
+export const getSupportSessions = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const sessions = await databaseService.listSupportSessions()
+    res.status(200).json({
+      success: true,
+      data: sessions
+    })
+  } catch (error) {
+    console.error('Error fetching support sessions:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch support sessions'
+    })
+  }
+}
+
+// @desc    Reply to a client LiveChat support session (Admin)
+// @route   POST /api/admin/support/sessions/:id/reply
+// @access  Private/Admin
+export const replySupportSession = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const sessionId = req.params.id
+    const { content } = req.body
+
+    if (!content || !String(content).trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Reply message content is required'
+      })
+    }
+
+    const adminFirstName = (req.user as any)?.firstName
+    const senderName = adminFirstName
+      ? `${adminFirstName} (DriveFlyElectric Support)`
+      : 'DriveFlyElectric Support Specialist'
+
+    const result = await databaseService.appendSupportMessage(sessionId, {
+      senderRole: 'ADMIN',
+      senderName,
+      content: String(content).trim()
+    })
+
+    // Dispatch SMTP email copy to client (if visitorEmail is provided) and log to Real-Time System Activity stream
+    emailService
+      .sendSupportReplyNotification(result.session, String(content).trim(), senderName)
+      .catch((err) => console.error('Support reply notification error:', err))
+
+    res.status(200).json({
+      success: true,
+      data: result.session
+    })
+  } catch (error) {
+    console.error('Error replying to support session:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send support reply'
+    })
+  }
+}
+
+// @desc    Update LiveChat support session status or mark read (Admin)
+// @route   PUT /api/admin/support/sessions/:id/status
+// @access  Private/Admin
+export const updateSupportSessionStatus = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const sessionId = req.params.id
+    const { status, markRead } = req.body
+
+    let session = null
+    if (markRead) {
+      session = await databaseService.markSupportSessionRead(sessionId, 'ADMIN')
+    }
+    if (status === 'OPEN' || status === 'RESOLVED') {
+      session = await databaseService.updateSupportSessionStatus(sessionId, status)
+    }
+    if (!session) {
+      session = await databaseService.getSupportSession(sessionId)
+    }
+
+    res.status(200).json({
+      success: true,
+      data: session
+    })
+  } catch (error) {
+    console.error('Error updating support session status:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update support session'
     })
   }
 }

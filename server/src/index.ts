@@ -14,6 +14,7 @@ const __dirname = path.dirname(__filename)
 // Import database connection
 import { supabase } from './utils/supabase.js'
 import { databaseService } from './services/databaseService.js'
+import { emailService } from './utils/emailService.js'
 
 // Import routes
 import productRoutes from './routes/products.js'
@@ -248,6 +249,80 @@ app.get('/api/addresses', protect, getAddresses)
 app.post('/api/addresses', protect, createAddress)
 app.put('/api/addresses/:id', protect, updateAddress)
 app.delete('/api/addresses/:id', protect, deleteAddress)
+
+// Public Real-Time Client LiveChat & Support Routes
+app.post('/api/support/session', async (req, res) => {
+  try {
+    const session = await databaseService.upsertSupportSession(req.body || {})
+    res.status(200).json({ success: true, data: session })
+  } catch (err) {
+    console.error('Support session init error:', err)
+    res.status(500).json({ success: false, error: 'Failed to initialize support session' })
+  }
+})
+
+app.get('/api/support/session/:id', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    await databaseService.updateSupportPresence(sessionId, true)
+    if (req.query.open === 'true') {
+      await databaseService.markSupportSessionRead(sessionId, 'CLIENT')
+    }
+    const session = await databaseService.getSupportSession(sessionId)
+    if (!session) {
+      return res.status(404).json({ success: false, error: 'Support session not found' })
+    }
+    res.status(200).json({ success: true, data: session })
+  } catch (err) {
+    console.error('Support session fetch error:', err)
+    res.status(500).json({ success: false, error: 'Failed to load support session' })
+  }
+})
+
+app.post('/api/support/session/:id/messages', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const { content, topic, selectedProducts, visitorName, visitorEmail, visitorPhone } = req.body || {}
+    if (!content || !String(content).trim()) {
+      return res.status(400).json({ success: false, error: 'Message content is required' })
+    }
+    const result = await databaseService.appendSupportMessage(sessionId, {
+      senderRole: 'CLIENT',
+      senderName: visitorName || 'Store Visitor',
+      content: String(content).trim(),
+      topic,
+      selectedProducts,
+      visitorName,
+      visitorEmail,
+      visitorPhone
+    })
+
+    // Stream client support inquiry to Real-Time System Activity feed & SMTP system alert
+    emailService
+      .sendSupportInquiryAlert(result.session, String(content).trim())
+      .catch((err) => console.error('Support inquiry alert error:', err))
+
+    res.status(200).json({
+      success: true,
+      data: result.session,
+      newMessages: result.newMessages
+    })
+  } catch (err) {
+    console.error('Support message send error:', err)
+    res.status(500).json({ success: false, error: 'Failed to send support message' })
+  }
+})
+
+app.post('/api/support/session/:id/heartbeat', async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const isOnline = req.body?.isOnline !== undefined ? Boolean(req.body.isOnline) : true
+    const session = await databaseService.updateSupportPresence(sessionId, isOnline, req.body)
+    res.status(200).json({ success: true, data: session })
+  } catch (err) {
+    res.status(200).json({ success: false })
+  }
+})
 
 // SPA Fallback: Any non-API GET request serves dist/index.html
 app.get('*', (req, res, next) => {

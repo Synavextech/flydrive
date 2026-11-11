@@ -485,3 +485,123 @@ export const downloadOrderReceiptPdf = async (req: Request, res: Response) => {
     })
   }
 }
+
+// @desc    Track an order by Tracking Number (TRK-...) or Order Number (DFE-...)
+// @route   GET /api/orders/track/:identifier
+// @access  Public
+export const trackOrder = async (req: Request, res: Response) => {
+  try {
+    const rawIdentifier = (req.params.identifier || (req.query.q as string) || '').trim()
+    if (!rawIdentifier) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid Tracking Number or Order Number'
+      })
+    }
+
+    const order = await databaseService.findOrderByTrackingOrNumber(rawIdentifier)
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        error: `No shipment found matching "${rawIdentifier}". Please verify your Tracking Number (e.g. TRK-DFE-...) or Order Number (e.g. DFE-...).`
+      })
+    }
+
+    const createdMs = order.createdAt ? new Date(order.createdAt).getTime() : Date.now()
+    const updatedMs = order.updatedAt ? new Date(order.updatedAt).getTime() : createdMs
+    const estStart = new Date(createdMs + 12 * 24 * 60 * 60 * 1000)
+    const estEnd = new Date(createdMs + 20 * 24 * 60 * 60 * 1000)
+    const estimatedDelivery = `${estStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} – ${estEnd.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
+
+    const addr = order.shippingAddress
+    const destinationSummary = addr
+      ? `${addr.city || ''}${addr.state ? `, ${addr.state}` : ''} ${addr.zipCode || ''}, ${addr.country || 'United States'}`.replace(/^,\s*/, '').trim()
+      : 'Customer Delivery Address on File'
+
+    const statusOrder = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED']
+    const currentIdx = Math.max(0, statusOrder.indexOf(order.status))
+    const isCancelledOrRefunded = order.status === 'CANCELLED' || order.status === 'REFUNDED'
+
+    const timeline = [
+      {
+        step: 1,
+        key: 'ORDER_CONFIRMED',
+        title: 'Order Confirmed & Payment Verified',
+        location: 'Austin, Texas HQ / Payment Gateway',
+        description: `Order #${order.orderNumber} logged and assigned Tracking #${order.trackingNumber}.`,
+        completed: !isCancelledOrRefunded && currentIdx >= 0,
+        active: !isCancelledOrRefunded && currentIdx === 0,
+        timestamp: new Date(createdMs).toISOString()
+      },
+      {
+        step: 2,
+        key: 'WAREHOUSE_QC',
+        title: 'Chassis QC Inspection & Steel Crating',
+        location: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
+        description: 'Engineering quality control, battery/powertrain diagnostics, and reinforced export crate sealing.',
+        completed: !isCancelledOrRefunded && currentIdx >= 1,
+        active: !isCancelledOrRefunded && currentIdx === 1,
+        timestamp: new Date(createdMs + 2 * 60 * 60 * 1000).toISOString()
+      },
+      {
+        step: 3,
+        key: 'INTERNATIONAL_TRANSIT',
+        title: 'International Express Freight & Customs Clearance',
+        location: 'Global Air/Sea Express Logistics Corridor',
+        description: 'Dispatched with priority customs documentation and live freight telemetry.',
+        completed: !isCancelledOrRefunded && currentIdx >= 2,
+        active: !isCancelledOrRefunded && currentIdx === 2,
+        timestamp: currentIdx >= 2 ? new Date(updatedMs).toISOString() : null
+      },
+      {
+        step: 4,
+        key: 'FINAL_DELIVERY',
+        title: 'Delivered to Destination',
+        location: destinationSummary,
+        description: 'Signed and delivered directly to recipient doorstep.',
+        completed: !isCancelledOrRefunded && currentIdx >= 3,
+        active: !isCancelledOrRefunded && currentIdx === 3,
+        timestamp: currentIdx >= 3 ? new Date(updatedMs).toISOString() : null
+      }
+    ]
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: order.id,
+        orderNumber: order.orderNumber,
+        trackingNumber: order.trackingNumber,
+        status: order.status,
+        paymentStatus: order.paymentStatus,
+        paymentMethod: order.paymentMethod,
+        total: order.total,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        shipping: order.shipping,
+        carrier: 'DriveFlyExpress Global Freight',
+        dispatchWarehouse: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
+        destination: destinationSummary,
+        estimatedDelivery,
+        createdAt: order.createdAt,
+        updatedAt: order.updatedAt,
+        items: (order.items || []).map(item => ({
+          id: item.id,
+          productId: item.productId,
+          name: item.product?.name || 'DriveFlyElectric Performance Vehicle',
+          image: item.product?.images?.[0] || '/images/MicroHelicpter.jpeg',
+          category: item.product?.category || 'Fleet',
+          quantity: item.quantity,
+          price: item.price,
+          total: item.total
+        })),
+        timeline
+      }
+    })
+  } catch (error) {
+    console.error('Error tracking order:', error)
+    return res.status(500).json({
+      success: false,
+      error: 'Unable to retrieve tracking status right now'
+    })
+  }
+}

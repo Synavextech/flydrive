@@ -50,11 +50,11 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
           {/* Header */}
           <div className="p-5 border-b border-gray-200 dark:border-white/10 flex items-center justify-between bg-gray-50 dark:bg-[#17171c] transition-colors">
             <div className="flex items-center gap-2.5">
-              <div className="h-7 w-7 rounded-lg bg-amber-500 flex items-center justify-center font-black text-black text-sm">
+              <div className="h-7 w-7 rounded-lg bg-creamy-500 flex items-center justify-center font-black text-black text-sm">
                 ⚡
               </div>
               <h2 className="font-anton text-xl uppercase tracking-wider text-gray-900 dark:text-white">Your Cart</h2>
-              <span className="bg-amber-500 text-black text-[10px] font-black px-2 py-0.5 rounded-full">
+              <span className="bg-creamy-500 text-black text-[10px] font-black px-2 py-0.5 rounded-full">
                 {totalItems} {totalItems === 1 ? 'rig' : 'rigs'}
               </span>
             </div>
@@ -79,7 +79,7 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
                 </p>
                 <button
                   onClick={onClose}
-                  className="mt-4 bg-amber-500 hover:bg-amber-400 text-black font-extrabold px-6 py-3 rounded-lg text-xs uppercase tracking-widest transition-all"
+                  className="mt-4 bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold px-6 py-3 rounded-lg text-xs uppercase tracking-widest transition-all"
                 >
                   Explore The Fleet
                 </button>
@@ -88,7 +88,7 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
               items.map((item) => (
                 <div
                   key={item.id}
-                  className="flex gap-4 p-3.5 bg-gray-50 dark:bg-[#17171c] hover:border-amber-500/50 rounded-xl border border-gray-200 dark:border-white/10 transition-all"
+                  className="flex gap-4 p-3.5 bg-gray-50 dark:bg-[#17171c] hover:border-creamy-500/50 rounded-xl border border-gray-200 dark:border-white/10 transition-all"
                 >
                   {/* Product Image */}
                   <div className="w-20 h-20 bg-gray-100 dark:bg-black rounded-lg overflow-hidden flex-shrink-0 relative border border-gray-200 dark:border-white/10">
@@ -115,7 +115,7 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
                   <div className="flex-1 min-w-0 flex flex-col justify-between">
                     <div>
                       <div className="flex items-start justify-between gap-2">
-                        <h4 className="font-anton text-sm uppercase text-gray-900 dark:text-white truncate hover:text-amber-500 transition-colors">
+                        <h4 className="font-anton text-sm uppercase text-gray-900 dark:text-white truncate hover:text-creamy-500 transition-colors">
                           {item.product?.name || 'Item'}
                         </h4>
                         <button
@@ -126,7 +126,7 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
-                      <p className="text-amber-500 font-anton text-base mt-0.5">
+                      <p className="text-creamy-500 font-anton text-base mt-0.5">
                         {formatPrice(item.product?.price || 0)}
                       </p>
                     </div>
@@ -177,23 +177,23 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
                 </div>
                 <div className="pt-2 border-t border-gray-200 dark:border-white/10 flex items-center justify-between">
                   <span className="font-bold text-xs uppercase tracking-widest text-gray-900 dark:text-white">Total Due</span>
-                  <span className="text-amber-500 font-anton text-2xl">{formatPrice(totalPrice)}</span>
+                  <span className="text-creamy-500 font-anton text-2xl">{formatPrice(totalPrice)}</span>
                 </div>
               </div>
 
               {/* Instant Checkout Action */}
               <button
                 onClick={handleCheckoutClick}
-                className="w-full bg-amber-500 hover:bg-amber-400 text-black font-extrabold py-3.5 px-4 rounded-xl shadow-lg shadow-amber-500/25 flex items-center justify-center gap-2 transition-all active:scale-95 text-xs uppercase tracking-widest"
+                className="w-full bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold py-3.5 px-4 rounded-xl shadow-lg shadow-creamy-500/25 flex items-center justify-center gap-2 transition-all active:scale-95 text-xs uppercase tracking-widest"
               >
                 <span>Proceed to Checkout</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
 
               {!isAuthenticated && (
-                <div className="p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs text-amber-700 dark:text-amber-300 flex items-center justify-between">
+                <div className="p-2.5 bg-creamy-500/10 border border-creamy-500/30 rounded-lg text-xs text-creamy-700 dark:text-creamy-300 flex items-center justify-between">
                   <span>By management! Create an account to track order.</span>
-                  <span className="font-extrabold underline cursor-pointer hover:text-amber-800 dark:hover:text-white" onClick={onPromptAuth}>Sign In</span>
+                  <span className="font-extrabold underline cursor-pointer hover:text-creamy-800 dark:hover:text-white" onClick={onPromptAuth}>Sign In</span>
                 </div>
               )}
 

@@ -2,6 +2,7 @@ export interface ServerOrderReceiptData {
   date: string
   orderDate: string
   orderNumber: string
+  trackingNumber?: string
   transactionId: string
   userName: string
   address: string
@@ -79,10 +80,17 @@ export const buildReceiptDataFromOrder = (
   const finalCostVal = Number(ord.total || 0)
   const isRefunded = ord.status === 'REFUNDED' || ord.paymentStatus === 'REFUNDED'
 
+  const orderNumberStr = ord.orderNumber || ord.id
+  const trackingNumberStr =
+    ord.trackingNumber ||
+    ord.tracking_number ||
+    `TRK-${orderNumberStr}`
+
   return {
     date: orderDateStr,
     orderDate: orderDateStr,
-    orderNumber: ord.orderNumber || ord.id,
+    orderNumber: orderNumberStr,
+    trackingNumber: trackingNumberStr,
     transactionId,
     userName: customerName,
     address: formattedAddress,
@@ -106,6 +114,7 @@ export const buildReceiptDataFromOrder = (
 }
 
 export const generateReceiptText = (r: ServerOrderReceiptData): string => {
+  const trackingNum = r.trackingNumber || `TRK-${r.orderNumber}`
   const lines = [
     `Receipt `,
     ` Order Summary `,
@@ -117,6 +126,7 @@ export const generateReceiptText = (r: ServerOrderReceiptData): string => {
     `********************************************************************************  `,
     `Order Date     : ${r.orderDate}`,
     `Order Number   : ${r.orderNumber}`,
+    `Tracking Number: ${trackingNum}`,
     `Transaction ID : ${r.transactionId}`,
     `User Name      : ${r.userName}`,
     `Address        : ${r.address}`,
@@ -208,6 +218,7 @@ export const generateReceiptPdfBuffer = (r: ServerOrderReceiptData): Buffer => {
       trimmed === 'Purchased Units:' ||
       trimmed === 'Additional Transaction Details:' ||
       trimmed.startsWith('Order Number') ||
+      trimmed.startsWith('Tracking Number') ||
       trimmed.startsWith('Final Cost')
 
     const segments = wrapLine(rawLine, 80)
@@ -216,8 +227,9 @@ export const generateReceiptPdfBuffer = (r: ServerOrderReceiptData): Buffer => {
     }
   }
 
+  const trackingNum = r.trackingNumber || `TRK-${r.orderNumber}`
   const commands: string[] = []
-  commands.push('0.96 0.62 0.04 RG')
+  commands.push('0.35 0.73 0.44 RG')
   commands.push('1.5 w')
   commands.push('36 36 540 720 re S')
 
@@ -226,10 +238,10 @@ export const generateReceiptPdfBuffer = (r: ServerOrderReceiptData): Buffer => {
 
   commands.push('1 1 1 rg')
   commands.push('BT /F2 13 Tf 50 731 Td (DRIVEFLYELECTRIC - OFFICIAL PURCHASE RECEIPT) Tj ET')
-  commands.push('0.96 0.62 0.04 rg')
+  commands.push('0.46 0.81 0.54 rg')
   commands.push(
-    `BT /F2 8.5 Tf 50 713 Td (${escapePdfText(
-      `ORDER #${r.orderNumber}  |  STATUS: SETTLED IN FULL  |  DATE: ${r.date}`
+    `BT /F2 8.2 Tf 50 713 Td (${escapePdfText(
+      `ORDER #${r.orderNumber}  |  TRACKING: ${trackingNum}  |  DATE: ${r.date}`
     )}) Tj ET`
   )
 

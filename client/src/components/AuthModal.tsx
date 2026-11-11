@@ -102,10 +102,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           {/* Modal Header */}
           <div className="px-6 pt-6 pb-4 border-b border-gray-100 dark:border-white/10">
             <div className="flex items-center gap-2 mb-1">
-              <span className="text-xl font-anton text-amber-500 uppercase tracking-wide">
+              <span className="text-xl font-anton text-creamy-500 uppercase tracking-wide">
                 DRIVEFLY<span className="text-gray-900 dark:text-white">ELECTRIC</span>
               </span>
-              <span className="text-[10px] bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-400 font-bold px-2 py-0.5 rounded-full uppercase">Fast Checkout</span>
+              <span className="text-[10px] bg-creamy-100 dark:bg-creamy-500/20 text-creamy-800 dark:text-creamy-400 font-bold px-2 py-0.5 rounded-full uppercase">Fast Checkout</span>
             </div>
             <p className="text-sm text-gray-600 dark:text-gray-300">
               {message}
@@ -160,7 +160,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         value={formData.firstName}
                         onChange={handleInputChange}
                         placeholder="John"
-                        className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-creamy-500"
                       />
                     </div>
                   </div>
@@ -175,7 +175,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         value={formData.lastName}
                         onChange={handleInputChange}
                         placeholder="Doe"
-                        className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-creamy-500"
                       />
                     </div>
                   </div>
@@ -191,7 +191,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       value={formData.phone}
                       onChange={handleInputChange}
                       placeholder="+1 (555) 000-0000"
-                      className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-creamy-500"
                     />
                   </div>
                 </div>
@@ -209,7 +209,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   value={formData.email}
                   onChange={handleInputChange}
                   placeholder="you@example.com"
-                  className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  className="w-full pl-9 pr-3 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-creamy-500"
                 />
               </div>
             </div>
@@ -225,7 +225,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   value={formData.password}
                   onChange={handleInputChange}
                   placeholder="••••••••"
-                  className="w-full pl-9 pr-10 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  className="w-full pl-9 pr-10 py-2 text-sm border border-gray-300 dark:border-white/10 rounded-lg bg-white dark:bg-[#131316] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-creamy-500"
                 />
                 <button
                   type="button"
@@ -240,7 +240,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             <button
               type="submit"
               disabled={isLoading}
-              className="w-full mt-2 bg-amber-500 hover:bg-amber-400 text-black font-extrabold py-3 px-4 rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center gap-2 text-xs uppercase tracking-widest disabled:opacity-50"
+              className="w-full mt-2 bg-creamy-500 hover:bg-creamy-400 text-black font-extrabold py-3 px-4 rounded-xl shadow-lg shadow-creamy-500/20 transition-all flex items-center justify-center gap-2 text-xs uppercase tracking-widest disabled:opacity-50"
             >
               {isLoading ? (
                 <>

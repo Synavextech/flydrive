@@ -94,10 +94,26 @@ export interface Address {
   updatedAt: Date
 }
 
+export interface ProductReview {
+  id: string
+  productId: string
+  userId?: string | null
+  reviewerName: string
+  reviewerEmail?: string | null
+  rating: number
+  title?: string | null
+  comment: string
+  images: string[]
+  verifiedPurchase: boolean
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface Order {
   id: string
   userId: string
   orderNumber: string
+  trackingNumber: string
   status: OrderStatus
   total: number
   subtotal: number

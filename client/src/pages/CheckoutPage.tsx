@@ -1,13 +1,15 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { loadStripe } from '@stripe/stripe-js'
 import {
   Elements,
-  CardElement,
+  CardNumberElement,
+  CardExpiryElement,
+  CardCvcElement,
   useStripe,
   useElements
 } from '@stripe/react-stripe-js'
-import { CreditCard, Truck, Lock, CheckCircle, AlertCircle } from 'lucide-react'
+import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, ShieldCheck } from 'lucide-react'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
 import { orderApi, paymentApi, addressApi } from '../services/api'
@@ -26,12 +28,16 @@ const isVideoMedia = (url?: string) => {
   return lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.mov') || lower.endsWith('.ogg')
 }
 
-// Initialize Stripe with Live Publishable Key
-const stripePublishableKey =
+// Initialize Stripe with synced Live Publishable Key from .env
+const defaultStripePublishableKey =
   (import.meta as any).env?.VITE_STRIPE_PUBLISHABLE_KEY ||
-  'pk_live_51TmGHyBwxUQmXC9Magb4FXJbEPQ2EvNKaxNIzg2KlGeMliHNmNLx0hv0ACB6anDy2gFkU8tkZfRnatOJCdTzCwh500CV1Xf3BK'
+  'pk_live_51U1OVJAZusdAC7Xt4oUvFKuo36Qv6bYLXClwuWTzykMfDGJm29pZJPTSU98hS4R13id0KB0BFRp8sjHTcCClExjh00TOV3ZXSq'
 
-const stripePromise = loadStripe(stripePublishableKey)
+const defaultPayPalClientId =
+  (import.meta as any).env?.VITE_PAYPAL_CLIENT_ID ||
+  'AeZPJVk6Zp1zLPnNtCcOdXvQFQi-iLkWnSdbB7c0vYwyOpQMG845TpUz6MZSJd-TXLfHgFfiBrLEWxpt'
+
+const stripePromise = loadStripe(defaultStripePublishableKey)
 
 const ArrowLeft = ({ className }: { className?: string }) => (
   <svg className={className || 'w-4 h-4'} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -65,12 +71,19 @@ const CheckoutForm: React.FC = () => {
   const [createAccount, setCreateAccount] = useState(false)
   const [accountPassword, setAccountPassword] = useState('')
 
-  // Supported payment methods: Stripe and PayPal
+  // Supported payment modes: Direct Card (Stripe Hosted Fields) or PayPal (Smart Button + PayPal Hosted Card Fields)
   const [paymentMethod, setPaymentMethod] = useState<'STRIPE' | 'PAYPAL'>('STRIPE')
+  const [cardholderName, setCardholderName] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
   const [processingStep, setProcessingStep] = useState<string>('')
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const errorRef = useRef<HTMLDivElement>(null)
+
+  // PayPal JS SDK state
+  const [paypalSdkReady, setPaypalSdkReady] = useState(false)
+  const [paypalCardFieldsEligible, setPaypalCardFieldsEligible] = useState(false)
+  const paypalButtonsContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardFieldsInstanceRef = useRef<any>(null)
 
   const [shippingData, setShippingData] = useState<ShippingFormData>({
     firstName: user?.firstName || '',
@@ -85,9 +98,48 @@ const CheckoutForm: React.FC = () => {
     country: 'United States'
   })
 
+  // Keep a ref to latest shippingData & totals so PayPal SDK callbacks always read fresh values
+  const latestCheckoutRef = useRef({
+    shippingData,
+    createAccount,
+    accountPassword,
+    isAuthenticated,
+    items,
+    totalPrice,
+    grandTotal: 0,
+    estimatedTax: 0,
+    shippingCost: 0
+  })
+
+  // Format price in USD
+  const formatPrice = (price: number) => {
+    return `$${(price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  }
+
+  // 100% Free Express Shipping on all store orders
+  const shippingCost = 0
+  const estimatedTax = totalPrice * 0.05
+  const grandTotal = totalPrice + shippingCost + estimatedTax
+
+  useEffect(() => {
+    latestCheckoutRef.current = {
+      shippingData,
+      createAccount,
+      accountPassword,
+      isAuthenticated,
+      items,
+      totalPrice,
+      grandTotal,
+      estimatedTax,
+      shippingCost
+    }
+  }, [shippingData, createAccount, accountPassword, isAuthenticated, items, totalPrice, grandTotal, estimatedTax, shippingCost])
+
   // Sync user profile and saved default shipping address when authenticated
   useEffect(() => {
     if (user) {
+      const fullName = `${user.firstName || ''} ${user.lastName || ''}`.trim()
+      if (fullName && !cardholderName) setCardholderName(fullName)
       setShippingData(prev => ({
         ...prev,
         firstName: prev.firstName || user.firstName || '',
@@ -115,21 +167,307 @@ const CheckoutForm: React.FC = () => {
             }))
           }
         }
-      }).catch(() => {
-        // Ignore address prefill errors silently
-      })
+      }).catch(() => {})
     }
   }, [user, isAuthenticated])
 
-  // Format price in USD
-  const formatPrice = (price: number) => {
-    return `$${(price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-  }
+  const validateShippingBeforeCheckout = useCallback((): boolean => {
+    const { shippingData: sd, isAuthenticated: isAuth, createAccount: ca, accountPassword: pwd } = latestCheckoutRef.current
+    if (!sd.firstName || !sd.lastName || !sd.email || !sd.address1 || !sd.city || !sd.zipCode) {
+      setErrorMessage('Please fill in all required delivery destination fields (First Name, Last Name, Email, Street Address, City, ZIP Code) before completing payment.')
+      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      return false
+    }
+    if (!isAuth && ca && (!pwd || pwd.length < 6)) {
+      setErrorMessage('Please provide an account password with at least 6 characters.')
+      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      return false
+    }
+    setErrorMessage(null)
+    return true
+  }, [])
 
-  // 100% Free Express Shipping on all store orders
-  const shippingCost = 0
-  const estimatedTax = totalPrice * 0.05
-  const grandTotal = totalPrice + shippingCost + estimatedTax
+  // Unified Order Settlement Handler (Used by Stripe Card Fields, PayPal Smart Buttons, and PayPal Hosted Card Fields)
+  const finalizeSettledOrder = useCallback(async (
+    settledMethod: 'STRIPE' | 'PAYPAL',
+    paymentRecordId: string,
+    paymentSourceLabel?: string
+  ) => {
+    const {
+      shippingData: sd,
+      createAccount: ca,
+      accountPassword: pwd,
+      items: currentItems,
+      totalPrice: subTotal,
+      grandTotal: finalTotal,
+      estimatedTax: taxAmt
+    } = latestCheckoutRef.current
+
+    setIsProcessing(true)
+    setProcessingStep('Securing your settled order & generating official PDF receipt...')
+
+    const orderRes = await orderApi.createOrder({
+      items: currentItems.map(i => ({ productId: i.productId, quantity: i.quantity })),
+      paymentMethod: settledMethod,
+      paymentId: paymentRecordId,
+      paymentStatus: 'COMPLETED',
+      shippingAddress: {
+        firstName: sd.firstName,
+        lastName: sd.lastName,
+        email: sd.email,
+        phone: sd.phone,
+        address1: sd.address1,
+        address2: sd.address2,
+        city: sd.city,
+        state: sd.state,
+        postalCode: sd.zipCode,
+        country: sd.country
+      },
+      createAccount: ca,
+      password: ca ? pwd : undefined,
+      notes: `Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Delivery to ${sd.city}, ${sd.state} (${sd.zipCode}). Paid & Settled via ${settledMethod} (${paymentRecordId})`
+    } as any)
+
+    if ((orderRes as any).token && (orderRes as any).user) {
+      setAuthenticatedUser((orderRes as any).user, (orderRes as any).token)
+    }
+
+    const orderNumber = orderRes.data?.orderNumber || `DFE-${Math.floor(100000 + Math.random() * 900000)}`
+    const trackingNumber =
+      orderRes.data?.trackingNumber ||
+      `TRK-DFE-${orderNumber.replace(/^DFE-?/i, '').slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`
+    const formattedOrderDate = new Date().toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    })
+    const fullAddressString = `${sd.address1}${sd.address2 ? `, ${sd.address2}` : ''}, ${sd.city}, ${sd.state} ${sd.zipCode}, ${sd.country}`
+
+    const receiptData = {
+      date: formattedOrderDate,
+      orderDate: formattedOrderDate,
+      orderNumber,
+      trackingNumber,
+      transactionId: paymentRecordId || `TXN-${Date.now()}`,
+      userName: `${sd.firstName} ${sd.lastName}`.trim() || 'Valued Customer',
+      address: fullAddressString,
+      paymentSource: paymentSourceLabel || (settledMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : 'PayPal Express'),
+      initialCharge: `$${subTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+      finalCost: `$${finalTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+      totalRefund: '$0.00',
+      refundTrans: 'N/A',
+      shippingCost: '$0.00 (Free Express Shipping)',
+      tax: `$${taxAmt.toFixed(2)}`,
+      items: currentItems.map(i => ({
+        name: i.product.name,
+        quantity: i.quantity,
+        price: `$${i.product.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        total: `$${(i.quantity * i.product.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+      }))
+    }
+
+    localStorage.setItem('latest_order_receipt', JSON.stringify(receiptData))
+    try {
+      const prevTrackings = JSON.parse(localStorage.getItem('dfe_recent_trackings') || '[]')
+      const nextEntry = {
+        orderNumber,
+        trackingNumber,
+        date: formattedOrderDate,
+        total: finalTotal,
+        destination: `${sd.city}, ${sd.state} ${sd.zipCode}, ${sd.country}`,
+        status: 'PROCESSING',
+        items: receiptData.items
+      }
+      const deduped = [nextEntry, ...prevTrackings.filter((t: any) => t.trackingNumber !== trackingNumber && t.orderNumber !== orderNumber)].slice(0, 8)
+      localStorage.setItem('dfe_recent_trackings', JSON.stringify(deduped))
+    } catch {
+      // Ignore storage error
+    }
+    clearCart()
+
+    navigate('/order-success', {
+      state: {
+        orderNumber,
+        trackingNumber,
+        total: finalTotal,
+        paymentMethod: settledMethod,
+        shippingAddress: fullAddressString,
+        receiptData
+      }
+    })
+  }, [clearCart, navigate, setAuthenticatedUser])
+
+  // Load PayPal JavaScript SDK (Smart Buttons + Expanded Checkout Hosted Card Fields)
+  useEffect(() => {
+    let isMounted = true
+
+    const loadPayPalSdk = async () => {
+      if ((window as any).paypal) {
+        if (isMounted) setPaypalSdkReady(true)
+        return
+      }
+
+      let clientId = defaultPayPalClientId
+      let clientToken: string | null = null
+
+      try {
+        const cfgRes = await paymentApi.getConfig()
+        if (cfgRes.success && cfgRes.data) {
+          if (cfgRes.data.paypalClientId) clientId = cfgRes.data.paypalClientId
+          if (cfgRes.data.paypalClientToken) clientToken = cfgRes.data.paypalClientToken
+        }
+      } catch {
+        // Use fallback clientId
+      }
+
+      const existingScript = document.getElementById('dfe-paypal-js-sdk') as HTMLScriptElement | null
+      if (existingScript) {
+        existingScript.addEventListener('load', () => {
+          if (isMounted) setPaypalSdkReady(true)
+        })
+        return
+      }
+
+      const script = document.createElement('script')
+      script.id = 'dfe-paypal-js-sdk'
+      script.src = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=USD&intent=capture&components=buttons,card-fields&enable-funding=paylater,venmo`
+      script.async = true
+      if (clientToken) {
+        script.setAttribute('data-client-token', clientToken)
+      }
+      script.onload = () => {
+        if (isMounted) setPaypalSdkReady(true)
+      }
+      script.onerror = () => {
+        console.warn('PayPal JS SDK script could not be loaded; fallback redirect remains active.')
+      }
+      document.body.appendChild(script)
+    }
+
+    loadPayPalSdk()
+    return () => {
+      isMounted = false
+    }
+  }, [])
+
+  // Render PayPal Smart Buttons ("Pay with PayPal") & Expanded Checkout Hosted Card Fields when SDK is ready
+  useEffect(() => {
+    const paypal = (window as any).paypal
+    if (!paypalSdkReady || !paypal || items.length === 0) return
+
+    // 1. Render "Pay with PayPal" Smart Button
+    if (paypal.Buttons && paypalButtonsContainerRef.current) {
+      paypalButtonsContainerRef.current.innerHTML = ''
+      try {
+        const buttons = paypal.Buttons({
+          style: {
+            layout: 'vertical',
+            color: 'silver',
+            shape: 'rect',
+            label: 'paypal',
+            height: 44
+          },
+          onClick: (_data: any, actions: any) => {
+            if (!validateShippingBeforeCheckout()) {
+              return actions.reject()
+            }
+            return actions.resolve()
+          },
+          createOrder: async () => {
+            const { grandTotal: totalToCharge, shippingData: sd } = latestCheckoutRef.current
+            setProcessingStep('Creating PayPal USD order...')
+            const res = await paymentApi.createPayPalOrder(totalToCharge, sd.email)
+            if (!res.success || !res.data?.orderId) {
+              throw new Error(res.error || 'Could not initialize PayPal order.')
+            }
+            return res.data.orderId
+          },
+          onApprove: async (data: any) => {
+            try {
+              setIsProcessing(true)
+              setProcessingStep('Capturing PayPal payment...')
+              const capRes = await paymentApi.capturePayPalPayment(data.orderID)
+              if (!capRes.success) {
+                throw new Error(capRes.error || 'Failed to capture PayPal order.')
+              }
+              const txId = capRes.data?.paymentId || data.orderID
+              await finalizeSettledOrder('PAYPAL', txId, 'PayPal Express (JS SDK)')
+            } catch (err: any) {
+              setIsProcessing(false)
+              setErrorMessage(err.message || 'PayPal payment capture failed.')
+            }
+          },
+          onError: (err: any) => {
+            console.warn('PayPal Buttons notice:', err)
+          }
+        })
+        if (buttons.isEligible()) {
+          buttons.render(paypalButtonsContainerRef.current).catch(() => {})
+        }
+      } catch (e) {
+        console.warn('PayPal Buttons render notice:', e)
+      }
+    }
+
+    // 2. Render PayPal Expanded Checkout Hosted Card Fields if eligible on merchant account
+    if (paypal.CardFields) {
+      try {
+        const cardFields = paypal.CardFields({
+          createOrder: async () => {
+            if (!validateShippingBeforeCheckout()) {
+              throw new Error('Missing required shipping address fields.')
+            }
+            const { grandTotal: totalToCharge, shippingData: sd } = latestCheckoutRef.current
+            const res = await paymentApi.createPayPalOrder(totalToCharge, sd.email)
+            if (!res.success || !res.data?.orderId) {
+              throw new Error(res.error || 'Failed to create order for CardFields.')
+            }
+            return res.data.orderId
+          },
+          onApprove: async (data: any) => {
+            try {
+              setIsProcessing(true)
+              setProcessingStep('Capturing card payment via PayPal Expanded Checkout...')
+              const capRes = await paymentApi.capturePayPalPayment(data.orderID)
+              if (!capRes.success) {
+                throw new Error(capRes.error || 'Card capture failed.')
+              }
+              const txId = capRes.data?.paymentId || data.orderID
+              await finalizeSettledOrder('PAYPAL', txId, 'Card via PayPal Expanded Checkout')
+            } catch (err: any) {
+              setIsProcessing(false)
+              setErrorMessage(err.message || 'Card payment capture failed.')
+            }
+          },
+          onError: (err: any) => {
+            setIsProcessing(false)
+            setErrorMessage(err?.message || 'Card authorization failed.')
+          }
+        })
+
+        if (cardFields.isEligible()) {
+          setPaypalCardFieldsEligible(true)
+          paypalCardFieldsInstanceRef.current = cardFields
+          const nameContainer = document.getElementById('paypal-card-name-container')
+          const numberContainer = document.getElementById('paypal-card-number-container')
+          const expiryContainer = document.getElementById('paypal-card-expiry-container')
+          const cvvContainer = document.getElementById('paypal-card-cvv-container')
+          if (nameContainer && numberContainer && expiryContainer && cvvContainer) {
+            nameContainer.innerHTML = ''
+            numberContainer.innerHTML = ''
+            expiryContainer.innerHTML = ''
+            cvvContainer.innerHTML = ''
+            cardFields.NameField().render('#paypal-card-name-container').catch(() => {})
+            cardFields.NumberField().render('#paypal-card-number-container').catch(() => {})
+            cardFields.ExpiryField().render('#paypal-card-expiry-container').catch(() => {})
+            cardFields.CVVField().render('#paypal-card-cvv-container').catch(() => {})
+          }
+        }
+      } catch {
+        setPaypalCardFieldsEligible(false)
+      }
+    }
+  }, [paypalSdkReady, items.length, validateShippingBeforeCheckout, finalizeSettledOrder])
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target
@@ -140,49 +478,38 @@ const CheckoutForm: React.FC = () => {
     }))
   }
 
+  // Primary Submit Handler supporting Direct Card (Stripe Hosted Fields), PayPal Hosted Card Fields, and PayPal Redirect Fallback
   const handlePayment = async () => {
-    if (!shippingData.firstName || !shippingData.lastName || !shippingData.email || !shippingData.address1 || !shippingData.city || !shippingData.zipCode) {
-      setErrorMessage('Please fill in all required shipping address fields (First Name, Last Name, Email, Address, City, ZIP Code).')
-      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
-      return
-    }
-
-    if (!isAuthenticated && createAccount && (!accountPassword || accountPassword.length < 6)) {
-      setErrorMessage('Please provide an account password with at least 6 characters.')
-      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
-      return
-    }
+    if (!validateShippingBeforeCheckout()) return
 
     setErrorMessage(null)
     setIsProcessing(true)
 
     try {
-      let paymentRecordId = ''
-
       if (paymentMethod === 'STRIPE') {
         if (!stripe || !elements) {
-          throw new Error('Payment gateway is still initializing. Please wait a few seconds and try again.')
+          throw new Error('Stripe Card Gateway is initializing. Please wait a moment and try again.')
         }
 
-        const cardElement = elements.getElement(CardElement)
-        if (!cardElement) {
-          throw new Error('Card payment form is not ready. Please refresh the page.')
+        const cardNumberElement = elements.getElement(CardNumberElement)
+        if (!cardNumberElement) {
+          throw new Error('Card input fields are not ready. Please refresh the page.')
         }
 
-        setProcessingStep('Initializing secure transaction with Stripe...')
-        const intentRes = await paymentApi.createStripePaymentIntent(grandTotal)
+        setProcessingStep('Initializing secure USD card transaction with Stripe...')
+        const intentRes = await paymentApi.createStripePaymentIntent(grandTotal, shippingData.email)
         if (!intentRes.success || !intentRes.data?.clientSecret) {
-          throw new Error(intentRes.error || 'Failed to create payment intent with Stripe.')
+          throw new Error(intentRes.error || 'Failed to initialize card payment with Stripe.')
         }
 
         const clientSecret = intentRes.data.clientSecret
 
-        setProcessingStep('Authorizing payment with your financial institution...')
+        setProcessingStep('Authorizing card with your bank (3D-Secure)...')
         const confirmResult = await stripe.confirmCardPayment(clientSecret, {
           payment_method: {
-            card: cardElement,
+            card: cardNumberElement,
             billing_details: {
-              name: `${shippingData.firstName} ${shippingData.lastName}`.trim(),
+              name: cardholderName.trim() || `${shippingData.firstName} ${shippingData.lastName}`.trim(),
               email: shippingData.email,
               phone: shippingData.phone || undefined,
               address: {
@@ -198,17 +525,40 @@ const CheckoutForm: React.FC = () => {
         })
 
         if (confirmResult.error) {
-          throw new Error(confirmResult.error.message || 'Payment authorization was declined. Please verify card details.')
+          throw new Error(confirmResult.error.message || 'Card authorization was declined. Please check your card details or use PayPal below.')
         }
 
         if (!confirmResult.paymentIntent || confirmResult.paymentIntent.status !== 'succeeded') {
           throw new Error(`Payment could not be completed. Status: ${confirmResult.paymentIntent?.status || 'unconfirmed'}`)
         }
 
-        paymentRecordId = confirmResult.paymentIntent.id
-      } else if (paymentMethod === 'PAYPAL') {
-        setProcessingStep('Connecting to PayPal...')
-        const ppRes = await paymentApi.createPayPalOrder(grandTotal)
+        // Confirm on backend to log real-time capture event
+        await paymentApi.confirmStripePayment(confirmResult.paymentIntent.id).catch(() => {})
+
+        await finalizeSettledOrder('STRIPE', confirmResult.paymentIntent.id, 'Credit / Debit Card (Stripe)')
+        return
+      }
+
+      if (paymentMethod === 'PAYPAL') {
+        // If PayPal Expanded Checkout Hosted Card Fields are mounted and user submitted via main button
+        if (paypalCardFieldsEligible && paypalCardFieldsInstanceRef.current) {
+          setProcessingStep('Submitting card via PayPal Expanded Checkout...')
+          await paypalCardFieldsInstanceRef.current.submit({
+            billingAddress: {
+              addressLine1: shippingData.address1,
+              addressLine2: shippingData.address2 || undefined,
+              adminArea1: shippingData.state,
+              adminArea2: shippingData.city,
+              postalCode: shippingData.zipCode,
+              countryCode: 'US'
+            }
+          })
+          return
+        }
+
+        // Otherwise create PayPal order and redirect to PayPal approval URL (or capture directly)
+        setProcessingStep('Connecting to PayPal Express Checkout...')
+        const ppRes = await paymentApi.createPayPalOrder(grandTotal, shippingData.email)
         if (!ppRes.success || !ppRes.data?.orderId) {
           throw new Error(ppRes.error || 'Failed to connect to PayPal.')
         }
@@ -217,7 +567,6 @@ const CheckoutForm: React.FC = () => {
         const approveUrl = ppRes.data.approveUrl
 
         if (approveUrl) {
-          // Prepare complete order payload for database persistence upon capture
           const orderPayload = {
             items: items.map(i => ({ productId: i.productId, quantity: i.quantity })),
             paymentMethod: 'PAYPAL',
@@ -238,7 +587,6 @@ const CheckoutForm: React.FC = () => {
             notes: `Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Delivery to ${shippingData.city}, ${shippingData.state} (${shippingData.zipCode}). Paid & Settled via PAYPAL (${ppOrderId})`
           }
 
-          // Store pending order details so it can be completed after returning from PayPal
           localStorage.setItem('pending_paypal_order', JSON.stringify({
             ppOrderId,
             grandTotal,
@@ -256,96 +604,16 @@ const CheckoutForm: React.FC = () => {
             })),
             orderData: orderPayload
           }))
-          // Redirect to PayPal's secure approval page
           window.location.href = approveUrl
           return
         }
 
-        // If direct capture available without approval redirect
         const captureRes = await paymentApi.capturePayPalPayment(ppOrderId)
         if (!captureRes.success) {
           throw new Error(captureRes.error || 'PayPal capture failed.')
         }
-        paymentRecordId = captureRes.data?.paymentId || ppOrderId
+        await finalizeSettledOrder('PAYPAL', captureRes.data?.paymentId || ppOrderId, 'PayPal Express')
       }
-
-      setProcessingStep('Securing your order in our database...')
-      // Persist settled order in Supabase via backend API
-      const orderRes = await orderApi.createOrder({
-        items: items.map(i => ({ productId: i.productId, quantity: i.quantity })),
-        paymentMethod,
-        paymentId: paymentRecordId,
-        paymentStatus: 'COMPLETED',
-        shippingAddress: {
-          firstName: shippingData.firstName,
-          lastName: shippingData.lastName,
-          email: shippingData.email,
-          phone: shippingData.phone,
-          address1: shippingData.address1,
-          address2: shippingData.address2,
-          city: shippingData.city,
-          state: shippingData.state,
-          postalCode: shippingData.zipCode,
-          country: shippingData.country
-        },
-        createAccount,
-        password: createAccount ? accountPassword : undefined,
-        notes: `Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Delivery to ${shippingData.city}, ${shippingData.state} (${shippingData.zipCode}). Paid & Settled via ${paymentMethod} (${paymentRecordId})`
-      } as any)
-
-      // Auto-authenticate customer if account was established
-      if ((orderRes as any).token && (orderRes as any).user) {
-        setAuthenticatedUser((orderRes as any).user, (orderRes as any).token)
-      }
-
-      const orderNumber = orderRes.data?.orderNumber || `DFE-${Math.floor(100000 + Math.random() * 900000)}`
-
-      const formattedOrderDate = new Date().toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
-      })
-
-      const fullAddressString = `${shippingData.address1}${shippingData.address2 ? `, ${shippingData.address2}` : ''}, ${shippingData.city}, ${shippingData.state} ${shippingData.zipCode}, ${shippingData.country}`
-
-      const receiptData = {
-        date: formattedOrderDate,
-        orderDate: formattedOrderDate,
-        orderNumber,
-        transactionId: paymentRecordId || `TXN-${Date.now()}`,
-        userName: `${shippingData.firstName} ${shippingData.lastName}`.trim() || 'Valued Customer',
-        address: fullAddressString,
-        paymentSource: paymentMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : 'PayPal Express',
-        initialCharge: `$${totalPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-        finalCost: `$${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-        totalRefund: '$0.00',
-        refundTrans: 'N/A',
-        shippingCost: '$0.00 (Free Express Shipping)',
-        tax: `$${estimatedTax.toFixed(2)}`,
-        items: items.map(i => ({
-          name: i.product.name,
-          quantity: i.quantity,
-          price: `$${i.product.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
-          total: `$${(i.quantity * i.product.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-        }))
-      }
-
-      // Persist latest order receipt in localStorage so customer refresh preserves full details
-      localStorage.setItem('latest_order_receipt', JSON.stringify(receiptData))
-
-      // Clear cart
-      clearCart()
-
-      // Redirect to success screen
-      navigate('/order-success', {
-        state: {
-          orderNumber,
-          total: grandTotal,
-          paymentMethod,
-          shippingAddress: fullAddressString,
-          receiptData
-        }
-      })
     } catch (error: any) {
       console.error('Payment checkout error:', error)
       setErrorMessage(error.message || 'Payment processing was unsuccessful. Please verify your details and try again.')
@@ -356,24 +624,41 @@ const CheckoutForm: React.FC = () => {
   }
 
   const inputClasses =
-    'w-full px-4 py-2.5 bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-amber-500 transition-colors text-xs font-medium'
+    'w-full px-4 py-2.5 bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-creamy-500 transition-colors text-xs font-medium'
+
+  const stripeElementOptions = {
+    style: {
+      base: {
+        fontSize: '14px',
+        color: '#f3f4f6',
+        '::placeholder': {
+          color: '#9ca3af',
+        },
+        fontFamily: 'Inter, system-ui, sans-serif',
+      },
+      invalid: {
+        color: '#ef4444',
+        iconColor: '#ef4444',
+      },
+    },
+  }
 
   if (items.length === 0) {
     return (
       <div className="pt-28 pb-16 min-h-screen bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white flex items-center justify-center p-4">
         <div className="max-w-md w-full bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-2xl p-8 text-center">
-          <div className="w-16 h-16 bg-amber-50 dark:bg-amber-500/10 text-amber-500 rounded-full flex items-center justify-center mx-auto mb-4 border border-amber-500/20">
+          <div className="w-16 h-16 bg-creamy-50 dark:bg-creamy-500/10 text-creamy-500 rounded-full flex items-center justify-center mx-auto mb-4 border border-creamy-500/20">
             <Truck className="w-8 h-8" />
           </div>
           <h2 className="text-xl font-black uppercase text-gray-900 dark:text-white mb-2 font-anton">
             Your Cart is Empty
           </h2>
           <p className="text-xs text-gray-500 dark:text-neutral-400 mb-6 font-medium">
-            Select a high-speed drift rig, go kart, or dirt bike from our fleet to proceed to checkout.
+            Select a MiniHelicopter, Electric Microcar, Drift Trike, Go Kart, or Dirt Bike from our fleet to proceed to checkout.
           </p>
           <button
             onClick={() => navigate('/')}
-            className="w-full inline-flex items-center justify-center gap-2 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase tracking-wider py-3.5 px-6 rounded-xl transition-all text-xs"
+            className="w-full inline-flex items-center justify-center gap-2 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-3.5 px-6 rounded-xl transition-all text-xs"
           >
             <ArrowLeft className="w-4 h-4" />
             Browse Fleet Catalog
@@ -395,8 +680,8 @@ const CheckoutForm: React.FC = () => {
         </button>
 
         <div className="mb-8">
-          <span className="text-[10px] font-black uppercase tracking-widest text-amber-500 bg-amber-500/10 px-2.5 py-1 rounded-full border border-amber-500/20">
-            Official Checkout
+          <span className="text-[10px] font-black uppercase tracking-widest text-creamy-500 bg-creamy-500/10 px-2.5 py-1 rounded-full border border-creamy-500/20">
+            DriveFlyElectric Official Checkout
           </span>
           <h1 className="text-2xl sm:text-3xl font-black uppercase tracking-tight text-gray-900 dark:text-white mt-2 font-anton">
             Express Order Finalization
@@ -419,13 +704,13 @@ const CheckoutForm: React.FC = () => {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          {/* Left Column: Shipping & Payment Method */}
+          {/* Left Column: Shipping & Payment Options */}
           <div className="lg:col-span-7 space-y-6">
-            {/* 1. Shipping Address */}
+            {/* 1. Delivery Destination */}
             <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-6 transition-colors">
               <div className="flex items-center justify-between mb-5 border-b border-gray-100 dark:border-neutral-800 pb-3">
                 <h2 className="text-base font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-2">
-                  <Truck className="w-5 h-5 text-amber-500" />
+                  <Truck className="w-5 h-5 text-creamy-500" />
                   1. Delivery Destination (USA & Global)
                 </h2>
                 <span className="text-[11px] text-gray-400 font-bold uppercase tracking-widest">* Required</span>
@@ -461,7 +746,7 @@ const CheckoutForm: React.FC = () => {
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">Email Address *</label>
+                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">Email Address (for PDF Receipt) *</label>
                     <input
                       type="email"
                       name="email"
@@ -575,15 +860,15 @@ const CheckoutForm: React.FC = () => {
                         type="checkbox"
                         checked={createAccount}
                         onChange={(e) => setCreateAccount(e.target.checked)}
-                        className="w-4 h-4 rounded text-amber-500 focus:ring-amber-400 bg-gray-100 dark:bg-neutral-800 border-gray-300 dark:border-neutral-700"
+                        className="w-4 h-4 rounded text-creamy-500 focus:ring-creamy-400 accent-creamy-500 bg-gray-100 dark:bg-neutral-800 border-gray-300 dark:border-neutral-700"
                       />
                       <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
-                        Create an account with this order <span className="text-amber-500 font-semibold">(save address & track deliveries)</span>
+                        Create a DriveFlyElectric account with this order <span className="text-creamy-500 font-semibold">(save address & track deliveries)</span>
                       </span>
                     </label>
 
                     {createAccount && (
-                      <div className="mt-3 p-3.5 bg-gray-50 dark:bg-[#1a1d24] rounded-xl border border-gray-200 dark:border-neutral-800 animate-fadeIn space-y-2">
+                      <div className="mt-3 p-3.5 bg-gray-50 dark:bg-[#1a1d24] rounded-xl border border-gray-200 dark:border-neutral-800 space-y-2">
                         <label className="block text-xs font-bold text-gray-700 dark:text-gray-300">
                           Create Account Password *
                         </label>
@@ -595,7 +880,7 @@ const CheckoutForm: React.FC = () => {
                           className={inputClasses}
                         />
                         <p className="text-[10px] text-gray-400">
-                          Account will be registered to <span className="font-mono text-amber-500">{shippingData.email || 'your email'}</span> automatically upon placing your order.
+                          Account will be registered to <span className="font-mono text-creamy-500">{shippingData.email || 'your email'}</span> automatically upon placing your order.
                         </p>
                       </div>
                     )}
@@ -604,27 +889,73 @@ const CheckoutForm: React.FC = () => {
               </form>
             </div>
 
-            {/* 2. Payment Method */}
+            {/* 2. Payment Method — Direct Card Input Fields Alongside PayPal JS SDK ("Pay with PayPal" + Expanded Card Fields) */}
             <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-6 transition-colors">
               <div className="flex items-center justify-between mb-4 border-b border-gray-100 dark:border-neutral-800 pb-3">
                 <h2 className="text-base font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-2">
-                  <CreditCard className="w-5 h-5 text-amber-500" />
-                  2. Payment Method
+                  <CreditCard className="w-5 h-5 text-creamy-500" />
+                  2. Payment Method (Card or PayPal)
                 </h2>
-                <span className="text-[10px] uppercase font-bold text-amber-500 bg-amber-500/10 px-2 py-0.5 rounded">
-                  USD Currency
+                <span className="text-[10px] uppercase font-bold text-creamy-500 bg-creamy-500/10 px-2 py-0.5 rounded">
+                  USD ($) Encrypted
                 </span>
               </div>
 
+              {/* Express "Pay with PayPal" Smart Button Rendered Directly Above / Alongside Card Fields */}
+              <div className="mb-5 p-4 rounded-xl bg-gray-50 dark:bg-[#1a1d24] border border-gray-200 dark:border-neutral-800">
+                <div className="flex items-center justify-between mb-2.5">
+                  <div className="flex items-center gap-2">
+                    <div className="w-5 h-5 rounded bg-[#003087] flex items-center justify-center font-black text-white text-[11px]">
+                      P
+                    </div>
+                    <span className="text-xs font-extrabold uppercase tracking-wider text-gray-900 dark:text-white">
+                      Express Pay with PayPal / Pay Later
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-bold text-emerald-500 flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    PayPal Buyer Protection
+                  </span>
+                </div>
+
+                {/* Official PayPal JavaScript SDK Buttons Container */}
+                <div ref={paypalButtonsContainerRef} className="min-h-[46px]" />
+
+                {!paypalSdkReady && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPaymentMethod('PAYPAL')
+                      handlePayment()
+                    }}
+                    className="w-full py-3 px-4 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black text-xs uppercase tracking-wider shadow-sm transition-all flex items-center justify-center gap-2"
+                  >
+                    <span>Pay with PayPal ({formatPrice(grandTotal)})</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="relative flex py-1 items-center mb-5">
+                <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
+                <span className="flex-shrink mx-3 text-[10px] font-black uppercase tracking-widest text-gray-400">
+                  Or Pay Directly With Credit / Debit Card
+                </span>
+                <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
+              </div>
+
               <div className="space-y-4">
-                {/* Option 1: Credit / Debit Card Checkout via Real Stripe Elements */}
-                <label
-                  className={`block p-4 border rounded-xl cursor-pointer transition-all ${paymentMethod === 'STRIPE'
-                    ? 'border-amber-500 bg-amber-50/40 dark:bg-amber-500/10 shadow-sm'
-                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24] hover:border-gray-400 dark:hover:border-neutral-600'
-                    }`}
+                {/* Option 1: Direct Credit / Debit Card Input Fields (Hosted Card Fields) */}
+                <div
+                  onClick={() => {
+                    if (paymentMethod !== 'STRIPE') setPaymentMethod('STRIPE')
+                  }}
+                  className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                    paymentMethod === 'STRIPE'
+                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                  }`}
                 >
-                  <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-3">
                       <input
                         type="radio"
@@ -635,61 +966,80 @@ const CheckoutForm: React.FC = () => {
                           setPaymentMethod('STRIPE')
                           if (errorMessage) setErrorMessage(null)
                         }}
-                        className="w-4 h-4 text-amber-500 focus:ring-amber-400 accent-amber-500"
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
                       />
-                      <CreditCard className="w-5 h-5 text-blue-500" />
+                      <CreditCard className="w-5 h-5 text-creamy-500" />
                       <div>
-                        <p className="font-bold text-sm text-gray-900 dark:text-white">Credit / Debit Card</p>
-                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">Visa, Mastercard, American Express, Discover</p>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white">
+                          Credit or Debit Card (Direct Hosted Card Fields)
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Visa, Mastercard, American Express, Discover — Instant 3D-Secure Authorization
+                        </p>
                       </div>
                     </div>
-                    <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">
-                      Stripe Protected
-                    </span>
+                    <div className="flex items-center gap-1 text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">
+                      <Lock className="w-3 h-3" />
+                      <span>256-Bit SSL</span>
+                    </div>
                   </div>
 
                   {paymentMethod === 'STRIPE' && (
-                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3">
-                      <div className="p-3.5 bg-white dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl focus-within:ring-2 focus-within:ring-amber-500 transition-all">
-                        <div className="flex items-center justify-between mb-2 pb-1.5 border-b border-gray-100 dark:border-neutral-800">
-                          <span className="text-[11px] font-bold text-gray-700 dark:text-gray-300">
-                            Card Information
-                          </span>
-                          <div className="flex items-center gap-1 text-[10px] text-emerald-500 font-bold uppercase tracking-wider">
-                            <Lock className="w-3 h-3" />
-                            <span>Secure TLS 256-Bit</span>
+                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3.5">
+                      <div>
+                        <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                          Name on Card *
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="JOHN DOE"
+                          value={cardholderName}
+                          onChange={(e) => setCardholderName(e.target.value)}
+                          className={inputClasses}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                          Card Number *
+                        </label>
+                        <div className="px-4 py-3 bg-white dark:bg-[#14171f] border border-gray-300 dark:border-neutral-700 rounded-xl focus-within:ring-2 focus-within:ring-creamy-500">
+                          <CardNumberElement options={{ ...stripeElementOptions, showIcon: true }} />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3.5">
+                        <div>
+                          <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                            Expiration Date (MM/YY) *
+                          </label>
+                          <div className="px-4 py-3 bg-white dark:bg-[#14171f] border border-gray-300 dark:border-neutral-700 rounded-xl focus-within:ring-2 focus-within:ring-creamy-500">
+                            <CardExpiryElement options={stripeElementOptions} />
                           </div>
                         </div>
-                        <CardElement
-                          options={{
-                            style: {
-                              base: {
-                                fontSize: '13px',
-                                color: '#f3f4f6',
-                                '::placeholder': {
-                                  color: '#9ca3af',
-                                },
-                                fontFamily: 'Inter, system-ui, sans-serif',
-                              },
-                              invalid: {
-                                color: '#ef4444',
-                                iconColor: '#ef4444',
-                              },
-                            },
-                            hidePostalCode: true,
-                          }}
-                        />
+                        <div>
+                          <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                            Security Code (CVC/CVV) *
+                          </label>
+                          <div className="px-4 py-3 bg-white dark:bg-[#14171f] border border-gray-300 dark:border-neutral-700 rounded-xl focus-within:ring-2 focus-within:ring-creamy-500">
+                            <CardCvcElement options={stripeElementOptions} />
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )}
-                </label>
+                </div>
 
-                {/* Option 2: PayPal Express Checkout */}
-                <label
-                  className={`block p-4 border rounded-xl cursor-pointer transition-all ${paymentMethod === 'PAYPAL'
-                    ? 'border-amber-500 bg-amber-50/40 dark:bg-amber-500/10 shadow-sm'
-                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24] hover:border-gray-400 dark:hover:border-neutral-600'
-                    }`}
+                {/* Option 2: PayPal Expanded Checkout / Portal Option */}
+                <div
+                  onClick={() => {
+                    if (paymentMethod !== 'PAYPAL') setPaymentMethod('PAYPAL')
+                  }}
+                  className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                    paymentMethod === 'PAYPAL'
+                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                  }`}
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
@@ -702,30 +1052,62 @@ const CheckoutForm: React.FC = () => {
                           setPaymentMethod('PAYPAL')
                           if (errorMessage) setErrorMessage(null)
                         }}
-                        className="w-4 h-4 text-amber-500 focus:ring-amber-400 accent-amber-500"
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
                       />
                       <div className="w-6 h-6 rounded bg-[#003087] flex items-center justify-center font-black text-white text-xs">
                         P
                       </div>
                       <div>
-                        <p className="font-bold text-sm text-gray-900 dark:text-white">PayPal Express Checkout</p>
-                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">Pay safely using PayPal Balance, Bank, or Linked Cards</p>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white">
+                          PayPal Expanded Checkout {paypalCardFieldsEligible ? '& Hosted Card Fields' : '& Wallet'}
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Pay with PayPal Balance, Pay Later, Venmo, or PayPal Hosted Card Processing
+                        </p>
                       </div>
                     </div>
-                    <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300">
-                      Fast One Tap Checkout
+                    <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-creamy-100 dark:bg-creamy-900/40 text-creamy-700 dark:text-creamy-300">
+                      PayPal SDK
                     </span>
                   </div>
 
                   {paymentMethod === 'PAYPAL' && (
-                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 text-xs text-gray-500 dark:text-gray-400">
-                      <p className="flex items-center gap-2">
-                        <CheckCircle className="w-4 h-4 text-emerald-500" />
-                        You will be routed securely through PayPal's official portal to authorize this purchase in USD.
-                      </p>
+                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3">
+                      {paypalCardFieldsEligible ? (
+                        <div className="space-y-3">
+                          <p className="text-[11px] text-gray-500 dark:text-gray-400 font-semibold">
+                            Enter your card in PayPal Hosted Card Fields below or click the PayPal button above:
+                          </p>
+                          <div>
+                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Cardholder Name</label>
+                            <div id="paypal-card-name-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Card Number</label>
+                            <div id="paypal-card-number-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Expiration Date</label>
+                              <div id="paypal-card-expiry-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">CVV</label>
+                              <div id="paypal-card-cvv-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-2">
+                          <CheckCircle className="w-4 h-4 text-emerald-500 flex-shrink-0" />
+                          <span>
+                            Use the interactive <strong>Pay with PayPal</strong> button above for instant in-page checkout, or click <strong>Confirm & Pay with PayPal</strong> on the right to complete via PayPal's portal.
+                          </span>
+                        </p>
+                      )}
                     </div>
                   )}
-                </label>
+                </div>
               </div>
             </div>
           </div>
@@ -777,7 +1159,7 @@ const CheckoutForm: React.FC = () => {
                       </p>
                     </div>
                     <div className="text-right">
-                      <p className="font-black text-xs text-gray-900 dark:text-amber-400">
+                      <p className="font-black text-xs text-gray-900 dark:text-creamy-400">
                         {formatPrice(item.quantity * item.product.price)}
                       </p>
                     </div>
@@ -791,7 +1173,7 @@ const CheckoutForm: React.FC = () => {
                   <span className="font-bold text-gray-900 dark:text-white">{formatPrice(totalPrice)}</span>
                 </div>
                 <div className="flex justify-between text-gray-600 dark:text-neutral-400 font-medium">
-                  <span>China Warehouse Express Shipping</span>
+                  <span>Express Crate Shipping</span>
                   <span className="font-bold text-emerald-600 dark:text-emerald-400">
                     FREE ($0.00)
                   </span>
@@ -802,7 +1184,7 @@ const CheckoutForm: React.FC = () => {
                 </div>
                 <div className="pt-3 border-t border-gray-200 dark:border-neutral-800 flex justify-between items-baseline">
                   <span className="text-sm font-black uppercase text-gray-900 dark:text-white">Total USD</span>
-                  <span className="text-2xl font-black text-amber-500 font-anton">
+                  <span className="text-2xl font-black text-creamy-500 font-anton">
                     {formatPrice(grandTotal)}
                   </span>
                 </div>
@@ -818,7 +1200,7 @@ const CheckoutForm: React.FC = () => {
               <button
                 onClick={handlePayment}
                 disabled={isProcessing}
-                className="w-full mt-6 bg-amber-500 hover:bg-amber-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-4 px-4 rounded-xl shadow-lg shadow-amber-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
+                className="w-full mt-6 bg-creamy-500 hover:bg-creamy-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-4 px-4 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
               >
                 {isProcessing ? (
                   <>
@@ -833,9 +1215,9 @@ const CheckoutForm: React.FC = () => {
               </button>
 
               <div className="mt-4 p-3 bg-gray-50 dark:bg-[#1a1d24] rounded-xl border border-gray-200 dark:border-neutral-800 text-[10px] text-gray-500 dark:text-gray-400 space-y-1">
-                <p className="font-bold text-gray-700 dark:text-gray-300"> China Warehouse Dispatch</p>
-                <p>1189 Fenghuang Road, Daliang, Shunde District, Foshan, Guangdong 528315, China</p>
-                <p>Orders are backed by 30-day ride warranty & money back guarantee.</p>
+                <p className="font-bold text-gray-700 dark:text-gray-300">DriveFlyElectric Express Dispatch</p>
+                <p>Nanshan, Shenzhen, Guangdong Province, China Warehouse • North America HQ: Austin, TX</p>
+                <p>Orders include an official PDF Purchase Receipt & 12-month factory warranty.</p>
               </div>
             </div>
           </div>

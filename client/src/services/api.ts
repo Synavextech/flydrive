@@ -1,4 +1,4 @@
-import { ApiResponse, Product, Cart, Order, User, Address } from '../types'
+import { ApiResponse, Product, ProductReview, Cart, Order, TrackedOrderDetails, User, Address, SupportSession, SupportSelectedProduct } from '../types'
 
 // API base URL
 const API_URL = (import.meta as any).env?.VITE_API_URL || '/api'
@@ -112,6 +112,46 @@ export const productApi = {
       method: 'DELETE',
     })
   },
+
+  // Get all product reviews grouped by productId
+  getAllReviews: async (): Promise<ApiResponse<ProductReview[]> & { grouped?: Record<string, ProductReview[]> }> => {
+    return apiRequest('/products/reviews/all')
+  },
+
+  // Get reviews for a single product
+  getProductReviews: async (productId: string): Promise<ApiResponse<ProductReview[]>> => {
+    return apiRequest(`/products/${encodeURIComponent(productId)}/reviews`)
+  },
+
+  // Submit a customer review for a product (with optional uploaded images)
+  createProductReview: async (
+    productId: string,
+    payload: {
+      reviewerName: string
+      reviewerEmail?: string
+      rating: number
+      title?: string
+      comment: string
+      images?: string[]
+    }
+  ): Promise<ApiResponse<ProductReview>> => {
+    return apiRequest(`/products/${encodeURIComponent(productId)}/reviews`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  // Upload customer review photo(s)
+  uploadReviewImages: async (
+    files: File[]
+  ): Promise<ApiResponse<{ url: string; urls: string[]; count: number }>> => {
+    const formData = new FormData()
+    files.forEach((f) => formData.append('images', f))
+    return apiRequest('/products/reviews/upload', {
+      method: 'POST',
+      body: formData,
+    })
+  },
 }
 
 // Cart API functions
@@ -187,6 +227,11 @@ export const orderApi = {
       method: 'PUT',
       body: JSON.stringify({ status }),
     })
+  },
+
+  // Track order by Tracking Number (TRK-...) or Order Number (DFE-...)
+  trackOrder: async (identifier: string): Promise<ApiResponse<TrackedOrderDetails>> => {
+    return apiRequest(`/orders/track/${encodeURIComponent(identifier.trim())}`)
   },
 }
 
@@ -395,18 +440,101 @@ export const adminApi = {
   getNotifications: async (): Promise<ApiResponse<any[]>> => {
     return apiRequest('/admin/notifications')
   },
+
+  // LiveChat & Support session management (admin)
+  getSupportSessions: async (): Promise<ApiResponse<SupportSession[]>> => {
+    return apiRequest('/admin/support/sessions')
+  },
+
+  replySupportSession: async (sessionId: string, content: string): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest(`/admin/support/sessions/${sessionId}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    })
+  },
+
+  updateSupportSessionStatus: async (
+    sessionId: string,
+    payload: { status?: 'OPEN' | 'RESOLVED'; markRead?: boolean }
+  ): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest(`/admin/support/sessions/${sessionId}/status`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
 }
 
-// Payment API functions (Stripe Card & PayPal only)
+// Public Client LiveChat & Support API functions
+export const supportApi = {
+  initSession: async (payload: {
+    sessionId?: string
+    visitorId?: string
+    userId?: string
+    visitorName?: string
+    visitorEmail?: string
+    visitorPhone?: string
+    topic?: string
+    selectedProducts?: SupportSelectedProduct[]
+  }): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest('/support/session', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  getSession: async (sessionId: string, isOpen?: boolean): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}${isOpen ? '?open=true' : ''}`)
+  },
+
+  sendMessage: async (
+    sessionId: string,
+    payload: {
+      content: string
+      topic?: string
+      selectedProducts?: SupportSelectedProduct[]
+      visitorName?: string
+      visitorEmail?: string
+      visitorPhone?: string
+    }
+  ): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}/messages`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  sendHeartbeat: async (
+    sessionId: string,
+    payload: { isOnline: boolean; visitorName?: string; visitorEmail?: string }
+  ): Promise<ApiResponse<SupportSession>> => {
+    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}/heartbeat`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+}
+
+// Payment API functions (Stripe Card & PayPal JS SDK / Expanded Checkout)
 export const paymentApi = {
+  // Fetch runtime gateway keys and PayPal Client Token for Hosted Card Fields
+  getConfig: async (): Promise<ApiResponse<{
+    stripePublishableKey: string
+    paypalClientId: string
+    paypalMerchantId: string
+    paypalMode: string
+    paypalClientToken?: string | null
+  }>> => {
+    return apiRequest('/payments/config')
+  },
+
   // Create Stripe payment intent (USD)
-  createStripePaymentIntent: async (amount: number): Promise<ApiResponse<{
+  createStripePaymentIntent: async (amount: number, customerEmail?: string): Promise<ApiResponse<{
     clientSecret: string
     paymentIntentId: string
   }>> => {
     return apiRequest('/payments/stripe/create-intent', {
       method: 'POST',
-      body: JSON.stringify({ amount }),
+      body: JSON.stringify({ amount, customerEmail }),
     })
   },
 
@@ -422,13 +550,13 @@ export const paymentApi = {
   },
 
   // Create PayPal order (USD)
-  createPayPalOrder: async (amount: number): Promise<ApiResponse<{
+  createPayPalOrder: async (amount: number, customerEmail?: string): Promise<ApiResponse<{
     orderId: string
     approveUrl: string
   }>> => {
     return apiRequest('/payments/paypal/create-order', {
       method: 'POST',
-      body: JSON.stringify({ amount }),
+      body: JSON.stringify({ amount, customerEmail }),
     })
   },
 
@@ -436,6 +564,8 @@ export const paymentApi = {
   capturePayPalPayment: async (orderId: string): Promise<ApiResponse<{
     status: string
     paymentId: string
+    orderId?: string
+    payer?: any
   }>> => {
     return apiRequest('/payments/paypal/capture', {
       method: 'POST',

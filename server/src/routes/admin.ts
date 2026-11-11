@@ -16,7 +16,10 @@ import {
   getAnalytics,
   getNotifications,
   streamNotifications,
-  downloadAdminOrderReceiptPdf
+  downloadAdminOrderReceiptPdf,
+  getSupportSessions,
+  replySupportSession,
+  updateSupportSessionStatus
 } from '../controllers/adminController.js'
 import { protect, authorize } from '../middleware/auth.js'
 
@@ -116,5 +119,10 @@ router.get('/notifications/stream', streamNotifications)
 // User management
 router.get('/users', getUsers)
 router.put('/users/:id/status', updateUserStatus)
+
+// LiveChat & Support session management
+router.get('/support/sessions', getSupportSessions)
+router.post('/support/sessions/:id/reply', replySupportSession)
+router.put('/support/sessions/:id/status', updateSupportSessionStatus)
 
 export default router
