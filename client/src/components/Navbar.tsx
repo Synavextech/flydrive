@@ -294,6 +294,9 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
             <Link to="/?category=trikes#store-catalog" className="hover:text-creamy-500 dark:hover:text-creamy-400 transition-colors">
               Trikes
             </Link>
+            <Link to="/?category=coming-soon#store-catalog" className="hover:text-creamy-500 dark:hover:text-creamy-400 transition-colors">
+              Coming Soon
+            </Link>
           </div>
 
           {/* Desktop Right Action Icons */}
@@ -589,6 +592,14 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                     <ChevronRight className="w-4 h-4 text-gray-400" />
                   </Link>
                   <Link
+                    to="/?category=go%20karts#store-catalog"
+                    onClick={() => setMobileMenuOpen(false)}
+                    className="flex items-center justify-between h-12 text-gray-900 dark:text-white font-anton text-xl uppercase border-b border-gray-100 dark:border-white/5 hover:text-creamy-500 dark:hover:text-creamy-400"
+                  >
+                    Go Karts & Electric
+                    <ChevronRight className="w-4 h-4 text-gray-400" />
+                  </Link>
+                  <Link
                     to="/?category=trikes#store-catalog"
                     onClick={() => setMobileMenuOpen(false)}
                     className="flex items-center justify-between h-12 text-gray-900 dark:text-white font-anton text-xl uppercase border-b border-gray-100 dark:border-white/5 hover:text-creamy-500 dark:hover:text-creamy-400"
@@ -605,11 +616,11 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                     <ChevronRight className="w-4 h-4 text-gray-400" />
                   </Link>
                   <Link
-                    to="/?category=go%20karts#store-catalog"
+                    to="/?category=coming-soon#store-catalog"
                     onClick={() => setMobileMenuOpen(false)}
                     className="flex items-center justify-between h-12 text-gray-900 dark:text-white font-anton text-xl uppercase border-b border-gray-100 dark:border-white/5 hover:text-creamy-500 dark:hover:text-creamy-400"
                   >
-                    Go Karts & Electric
+                    Coming Soon
                     <ChevronRight className="w-4 h-4 text-gray-400" />
                   </Link>
                 </nav>

@@ -35,12 +35,12 @@ import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPd
 
 const CATEGORIES = [
   { id: 'all', label: 'All Rigs' },
-  { id: 'coming-soon', label: 'Coming Soon' },
   { id: 'mini-helicopter', label: 'MiniHeliCopters' },
   { id: 'microcars', label: 'Microcars' },
   { id: 'go karts', label: 'Go Karts' },
   { id: 'trikes', label: 'Trikes' },
   { id: 'dirtbikes', label: 'Dirtbikes' },
+  { id: 'coming-soon', label: 'Coming Soon' },
 ]
 
 // Safe URL encoder for filenames with spaces and special characters
@@ -176,6 +176,7 @@ export const HomePage: React.FC = () => {
   useEffect(() => {
     const params = new URLSearchParams(location.search)
     const catParam = params.get('category')
+    const isComingSoonHash = location.hash === '#coming-soon' || location.hash === '#coming-soon-section'
     if (catParam) {
       const normalized = catParam.toLowerCase()
       if (normalized.includes('heli')) {
@@ -183,8 +184,10 @@ export const HomePage: React.FC = () => {
       } else {
         setSelectedCategory(normalized)
       }
+    } else if (isComingSoonHash) {
+      setSelectedCategory('coming-soon')
     }
-    if (location.hash === '#store-catalog' || catParam) {
+    if (location.hash === '#store-catalog' || isComingSoonHash || catParam) {
       setTimeout(() => {
         const el = document.getElementById('store-catalog')
         if (el) {
@@ -193,6 +196,15 @@ export const HomePage: React.FC = () => {
       }, 150)
     }
   }, [location.search, location.hash])
+
+  const handleGoToComingSoon = (e?: React.MouseEvent) => {
+    if (e) e.preventDefault()
+    setSelectedCategory('coming-soon')
+    const el = document.getElementById('store-catalog')
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth' })
+    }
+  }
 
   const formatPrice = (price: number) => {
     return `$${(price || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -226,6 +238,10 @@ export const HomePage: React.FC = () => {
       'dirtbikes': {
         title: 'Electric Dirt Bikes & Off-Road Trail Moto Rigs | DriveFlyElectric',
         desc: 'Conquer any trail with high-discharge lithium Electric Dirt Bikes and inverted-fork off-road motorcycles from DriveFlyElectric.'
+      },
+      'coming-soon': {
+        title: 'Coming Soon Electric Fleet & Priority Pre-Booking | DriveFlyElectric',
+        desc: 'Reserve upcoming DriveFlyElectric MiniHeliCopters, Electric Microcars, Drift Trikes, Go Karts, and Dirt Bikes for priority batch delivery.'
       }
     }
 
@@ -466,10 +482,14 @@ export const HomePage: React.FC = () => {
               <div className="rounded-2xl border border-creamy-500/35 bg-black/70 backdrop-blur-md p-2.5 sm:p-3 shadow-2xl overflow-hidden">
                 <div className="flex items-center justify-between gap-2 px-1 pb-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-creamy-500 text-black text-[9px] font-black uppercase tracking-widest shrink-0">
+                    <a
+                      href="#store-catalog"
+                      onClick={handleGoToComingSoon}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-creamy-500 hover:bg-creamy-400 text-black text-[9px] font-black uppercase tracking-widest shrink-0 transition-colors cursor-pointer"
+                    >
                       <Sparkles className="w-2.5 h-2.5" />
                       Coming Soon
-                    </span>
+                    </a>
                     <span className="text-[11px] font-bold text-gray-200 truncate">
                       {comingSoonProducts.length > 0
                         ? 'Next-Gen Electric Releases — Priority Pre-Booking Open'
@@ -478,10 +498,10 @@ export const HomePage: React.FC = () => {
                   </div>
                   <a
                     href="#store-catalog"
-                    onClick={() => setSelectedCategory(comingSoonProducts.length > 0 ? 'coming-soon' : 'all')}
+                    onClick={handleGoToComingSoon}
                     className="text-[10px] font-black uppercase tracking-wider text-creamy-400 hover:text-creamy-300 whitespace-nowrap shrink-0 flex items-center gap-1"
                   >
-                    <span>{comingSoonProducts.length > 0 ? `View All (${comingSoonProducts.length})` : 'Browse Catalog'}</span>
+                    <span>{comingSoonProducts.length > 0 ? `View All (${comingSoonProducts.length})` : 'Coming Soon'}</span>
                     <ArrowRight className="w-3 h-3" />
                   </a>
                 </div>
@@ -542,9 +562,10 @@ export const HomePage: React.FC = () => {
                     </span>
                     <a
                       href="#store-catalog"
+                      onClick={handleGoToComingSoon}
                       className="px-3 py-1 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black text-[10px] uppercase tracking-wider shrink-0"
                     >
-                      Explore Fleet
+                      Coming Soon
                     </a>
                   </div>
                 )}
@@ -607,10 +628,10 @@ export const HomePage: React.FC = () => {
           <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4 mb-8">
             <div>
               <span className="font-bold text-xs text-creamy-500 uppercase tracking-widest">
-                Shop Everything
+                {selectedCategory === 'coming-soon' ? 'Priority Pre-Booking' : 'Shop Everything'}
               </span>
               <h2 className="font-anton text-4xl sm:text-5xl uppercase tracking-tight text-gray-900 dark:text-white mt-1">
-                The Full Range
+                {selectedCategory === 'coming-soon' ? 'Coming Soon' : 'The Full Range'}
               </h2>
             </div>
 
@@ -1071,6 +1092,7 @@ export const HomePage: React.FC = () => {
                 <li><a href="#store-catalog" onClick={() => setSelectedCategory('trikes')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Electric Drift Trikes</a></li>
                 <li><a href="#store-catalog" onClick={() => setSelectedCategory('dirtbikes')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Dirtbikes & Enduro</a></li>
                 <li><a href="#store-catalog" onClick={() => setSelectedCategory('all')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">The Full Range Catalog</a></li>
+                <li><a href="#store-catalog" onClick={handleGoToComingSoon} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Coming Soon</a></li>
               </ul>
             </div>
 
