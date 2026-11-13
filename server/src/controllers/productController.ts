@@ -155,6 +155,19 @@ export const createProduct = async (req: Request, res: Response) => {
 
     const newProduct = await databaseService.createProduct(parsed.data)
 
+    emailService.recordActivity({
+      type: 'PRODUCT_CREATED',
+      title: `New Fleet Item Added • ${newProduct.name}`,
+      message: `Created ${newProduct.name} (SKU: ${newProduct.sku} | Category: ${newProduct.category}) at $${Number(newProduct.price).toLocaleString()} USD.`,
+      amount: Number(newProduct.price),
+      metadata: {
+        productId: newProduct.id,
+        sku: newProduct.sku
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(201).json({
       success: true,
       data: newProduct
@@ -184,6 +197,19 @@ export const updateProduct = async (req: Request, res: Response) => {
     const productId = req.params.id
     const updatedProduct = await databaseService.updateProduct(productId, parsed.data)
 
+    emailService.recordActivity({
+      type: 'PRODUCT_UPDATED',
+      title: `Fleet Item Updated • ${updatedProduct.name}`,
+      message: `Updated ${updatedProduct.name} (SKU: ${updatedProduct.sku} | Stock: ${updatedProduct.stock}).`,
+      amount: Number(updatedProduct.price),
+      metadata: {
+        productId: updatedProduct.id,
+        sku: updatedProduct.sku
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(200).json({
       success: true,
       data: updatedProduct
@@ -204,7 +230,20 @@ export const deleteProduct = async (req: Request, res: Response) => {
   try {
     const productId = req.params.id
 
-    await databaseService.deleteProduct(productId)
+    const deletedProduct = await databaseService.deleteProduct(productId)
+
+    emailService.recordActivity({
+      type: 'PRODUCT_DELETED',
+      title: `Fleet Item Removed • ${deletedProduct.name}`,
+      message: `Deleted ${deletedProduct.name} (SKU: ${deletedProduct.sku}) from the store catalog.`,
+      amount: Number(deletedProduct.price),
+      metadata: {
+        productId: deletedProduct.id,
+        sku: deletedProduct.sku
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
 
     res.status(200).json({
       success: true,
@@ -306,6 +345,10 @@ export const createProductReview = async (req: Request, res: Response) => {
       comment,
       images: sanitizeReviewImages(images)
     })
+
+    emailService
+      .sendReviewSubmittedNotification(created, product)
+      .catch((err) => console.error('Review notification error:', err))
 
     res.status(201).json({
       success: true,

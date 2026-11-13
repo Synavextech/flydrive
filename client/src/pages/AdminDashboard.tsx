@@ -20,12 +20,19 @@ import {
   MessageSquare,
   Send,
   CalendarClock,
-  Sparkles
+  Sparkles,
+  BarChart3,
+  Eye,
+  Globe,
+  Monitor,
+  Smartphone,
+  Tablet,
+  Clock
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useProducts } from '../contexts/ProductContext'
 import { adminApi } from '../services/api'
-import { Product, Order, User, SupportSession, ProductBooking } from '../types'
+import { Product, Order, User, SupportSession, ProductBooking, AdminAnalyticsData, ProductViewSource } from '../types'
 import {
   OrderReceiptData,
   generateReceiptText,
@@ -49,7 +56,7 @@ const isVideoMedia = (url?: string) => {
 export const AdminDashboard: React.FC = () => {
   const { user } = useAuth()
   const { fetchProducts: fetchGlobalProducts } = useProducts()
-  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'bookings' | 'users' | 'support'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'bookings' | 'users' | 'support' | 'analytics'>('overview')
 
   // Dashboard Stats
   const [stats, setStats] = useState<{
@@ -109,6 +116,12 @@ export const AdminDashboard: React.FC = () => {
   const [selectedReceiptOrder, setSelectedReceiptOrder] = useState<any | null>(null)
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null)
   const [notificationsList, setNotificationsList] = useState<any[]>([])
+  const [sseConnected, setSseConnected] = useState<boolean>(false)
+  const activeTabRef = useRef(activeTab)
+  activeTabRef.current = activeTab
+  const orderFilterRef = useRef(orderFilter)
+  orderFilterRef.current = orderFilter
+  const sseConnectedRef = useRef(false)
 
   // Support & LiveChat Management state
   const [supportSessions, setSupportSessions] = useState<SupportSession[]>([])
@@ -119,6 +132,29 @@ export const AdminDashboard: React.FC = () => {
   const [adminReplyText, setAdminReplyText] = useState<string>('')
   const [isSendingReply, setIsSendingReply] = useState<boolean>(false)
   const adminChatEndRef = useRef<HTMLDivElement>(null)
+  const markingReadSessionRef = useRef<string | null>(null)
+
+  // Storefront Traffic & Product Analytics state
+  const [analyticsData, setAnalyticsData] = useState<AdminAnalyticsData | null>(null)
+  const [analyticsDays, setAnalyticsDays] = useState<1 | 7 | 30 | 90>(30)
+  const [analyticsLoading, setAnalyticsLoading] = useState<boolean>(false)
+  const analyticsDaysRef = useRef<number>(analyticsDays)
+  analyticsDaysRef.current = analyticsDays
+  const analyticsRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const fetchAnalytics = async (days: number = analyticsDaysRef.current) => {
+    try {
+      setAnalyticsLoading(true)
+      const res = await adminApi.getAnalytics(days)
+      if (res.success && res.data) {
+        setAnalyticsData(res.data)
+      }
+    } catch {
+      // Silent fallback
+    } finally {
+      setAnalyticsLoading(false)
+    }
+  }
 
   const fetchSupportSessions = async () => {
     try {
@@ -159,11 +195,102 @@ export const AdminDashboard: React.FC = () => {
     fetchNotifications()
     fetchSupportSessions()
     fetchBookings()
+    fetchAnalytics(analyticsDaysRef.current)
+
+    const unsubscribeStream = adminApi.subscribeNotificationsStream(
+      (incomingEvent) => {
+        setNotificationsList((prev) => [
+          incomingEvent,
+          ...prev.filter((item) => item.id !== incomingEvent.id)
+        ].slice(0, 60))
+
+        const evtType = String(incomingEvent?.type || '')
+        if (
+          evtType === 'ORDER_PURCHASED' ||
+          evtType === 'PAYMENT_CAPTURED' ||
+          evtType === 'ORDER_STATUS_UPDATED' ||
+          evtType === 'ORDER_CANCELLED' ||
+          evtType === 'ORDER_REFUNDED' ||
+          evtType === 'USER_REGISTERED'
+        ) {
+          fetchDashboardStats()
+          if (activeTabRef.current === 'orders') fetchOrders()
+          if (activeTabRef.current === 'users') fetchUsers()
+        } else if (evtType === 'PRODUCT_BOOKING_CREATED' || evtType === 'PRODUCT_BOOKING_UPDATED') {
+          fetchBookings()
+        } else if (
+          evtType === 'SUPPORT_INQUIRY' ||
+          evtType === 'SUPPORT_REPLY' ||
+          evtType === 'SUPPORT_STATUS_UPDATED'
+        ) {
+          fetchSupportSessions()
+        } else if (
+          (evtType === 'PRODUCT_CREATED' || evtType === 'PRODUCT_UPDATED' || evtType === 'PRODUCT_DELETED') &&
+          activeTabRef.current === 'products'
+        ) {
+          fetchProducts()
+        }
+      },
+      (connected) => {
+        const wasDisconnected = !sseConnectedRef.current
+        sseConnectedRef.current = connected
+        setSseConnected(connected)
+        if (connected && wasDisconnected) {
+          fetchNotifications()
+          fetchSupportSessions()
+          if (activeTabRef.current === 'analytics') {
+            fetchAnalytics(analyticsDaysRef.current)
+          }
+        }
+      },
+      (syncPayload) => {
+        const synced = syncPayload?.session
+        if (synced?.id) {
+          setSupportSessions(prev => {
+            const exists = prev.some(s => s.id === synced.id)
+            const next = exists
+              ? prev.map(s => (s.id === synced.id ? synced : s))
+              : [synced, ...prev]
+            return [...next].sort(
+              (a, b) =>
+                new Date(b.updatedAt || b.lastSeenAt).getTime() -
+                new Date(a.updatedAt || a.lastSeenAt).getTime()
+            )
+          })
+          setSelectedSessionId(prev => prev || synced.id)
+        } else {
+          fetchSupportSessions()
+        }
+      },
+      (_analyticsPayload) => {
+        if (analyticsRefreshTimerRef.current) return
+        analyticsRefreshTimerRef.current = setTimeout(() => {
+          analyticsRefreshTimerRef.current = null
+          fetchAnalytics(analyticsDaysRef.current)
+        }, 1200)
+      }
+    )
+
+    // Backup reconciliation poll (notifications polled only if SSE is disconnected; keep support presence timestamps fresh on Support tab)
     const interval = setInterval(() => {
-      fetchNotifications()
-      fetchSupportSessions()
-    }, 5000)
-    return () => clearInterval(interval)
+      if (!sseConnectedRef.current) {
+        fetchNotifications()
+        fetchSupportSessions()
+        if (activeTabRef.current === 'analytics') {
+          fetchAnalytics(analyticsDaysRef.current)
+        }
+      } else if (activeTabRef.current === 'support') {
+        fetchSupportSessions()
+      }
+    }, 20000)
+
+    return () => {
+      unsubscribeStream()
+      clearInterval(interval)
+      if (analyticsRefreshTimerRef.current) {
+        clearTimeout(analyticsRefreshTimerRef.current)
+      }
+    }
   }, [])
 
   // Auto-scroll Admin Support chat thread when messages update or active session changes
@@ -174,13 +301,39 @@ export const AdminDashboard: React.FC = () => {
     }
   }, [activeTab, selectedSessionId, activeSupportSessionForScroll?.messages?.length])
 
+  // Automatically clear unreadAdminCount whenever Admin is actively viewing an open conversation
+  useEffect(() => {
+    if (activeTab !== 'support' || !activeSupportSessionForScroll) return
+    if ((activeSupportSessionForScroll.unreadAdminCount || 0) <= 0) {
+      if (markingReadSessionRef.current === activeSupportSessionForScroll.id) {
+        markingReadSessionRef.current = null
+      }
+      return
+    }
+    const targetId = activeSupportSessionForScroll.id
+    if (markingReadSessionRef.current === targetId) return
+    markingReadSessionRef.current = targetId
+
+    adminApi.updateSupportSessionStatus(targetId, { markRead: true })
+      .then(res => {
+        if (res.success && res.data) {
+          setSupportSessions(prev => prev.map(s => (s.id === targetId ? res.data! : s)))
+        }
+      })
+      .catch(() => { })
+      .finally(() => {
+        markingReadSessionRef.current = null
+      })
+  }, [activeTab, activeSupportSessionForScroll?.id, activeSupportSessionForScroll?.unreadAdminCount])
+
   useEffect(() => {
     if (activeTab === 'products') fetchProducts()
     if (activeTab === 'orders') fetchOrders()
     if (activeTab === 'bookings') fetchBookings()
     if (activeTab === 'users') fetchUsers()
     if (activeTab === 'support') fetchSupportSessions()
-  }, [activeTab, orderFilter])
+    if (activeTab === 'analytics') fetchAnalytics(analyticsDays)
+  }, [activeTab, orderFilter, analyticsDays])
 
   const notify = (type: 'success' | 'error', text: string) => {
     setActionMessage({ type, text })
@@ -229,7 +382,8 @@ export const AdminDashboard: React.FC = () => {
   const fetchOrders = async () => {
     try {
       setIsLoading(true)
-      const res = await adminApi.getAllOrders(orderFilter === 'ALL' ? undefined : { status: orderFilter as any })
+      const currentFilter = orderFilterRef.current
+      const res = await adminApi.getAllOrders(currentFilter === 'ALL' ? undefined : { status: currentFilter as any })
       if (res.success && res.data) {
         setOrdersList(res.data)
       }
@@ -469,18 +623,26 @@ export const AdminDashboard: React.FC = () => {
     }
   }
 
-  // Handle selecting a support chat session & marking unread admin messages as read
-  const handleSelectSupportSession = async (session: SupportSession) => {
+  // Handle selecting a support chat session (auto-read effect clears unread count when active)
+  const handleSelectSupportSession = (session: SupportSession) => {
     setSelectedSessionId(session.id)
-    if (session.unreadAdminCount > 0) {
-      try {
-        const res = await adminApi.updateSupportSessionStatus(session.id, { markRead: true })
-        if (res.success && res.data) {
-          setSupportSessions(prev => prev.map(s => (s.id === session.id ? res.data! : s)))
-        }
-      } catch {
-        // Ignore
+  }
+
+  // Handle toggling AI Concierge auto-reply pause state on a support session
+  const handleToggleAiPaused = async (sessionId: string, currentlyPaused: boolean) => {
+    try {
+      const res = await adminApi.updateSupportSessionStatus(sessionId, { aiPaused: !currentlyPaused })
+      if (res.success && res.data) {
+        setSupportSessions(prev => prev.map(s => (s.id === sessionId ? res.data! : s)))
+        notify(
+          'success',
+          !currentlyPaused
+            ? 'AI Concierge paused for live agent takeover'
+            : 'AI Concierge resumed on this support session'
+        )
       }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to update AI Concierge mode')
     }
   }
 
@@ -639,6 +801,7 @@ export const AdminDashboard: React.FC = () => {
                 if (activeTab === 'orders') fetchOrders()
                 if (activeTab === 'users') fetchUsers()
                 if (activeTab === 'support') fetchSupportSessions()
+                if (activeTab === 'analytics') fetchAnalytics(analyticsDays)
               }}
               className="p-2.5 bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-xl text-gray-600 dark:text-gray-300 hover:text-creamy-500 shadow-sm transition-colors"
               title="Refresh Data"
@@ -692,6 +855,7 @@ export const AdminDashboard: React.FC = () => {
               icon: MessageSquare,
               badge: supportSessions.reduce((acc, s) => acc + (s.unreadAdminCount || 0), 0)
             },
+            { id: 'analytics', label: 'Traffic & Analytics', icon: BarChart3 },
           ].map((tab: any) => {
             const Icon = tab.icon
             const isActive = activeTab === tab.id
@@ -786,13 +950,20 @@ export const AdminDashboard: React.FC = () => {
               <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className={`w-2.5 h-2.5 rounded-full ${sseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'}`} />
                     <h3 className="font-anton text-lg uppercase text-gray-900 dark:text-white">
                       Live Store Activity &amp; Email Dispatch Feed
                     </h3>
+                    <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${
+                      sseConnected
+                        ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30'
+                        : 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
+                    }`}>
+                      {sseConnected ? 'SSE Live' : 'Polling Fallback'}
+                    </span>
                   </div>
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                    Real-time updates for confirmed purchases, PDF receipts, customer registrations, and dispatch alerts.
+                    Real-time stream for purchases, refunds, payment alerts, reviews, bookings, support inquiries, catalog updates, and customer accounts.
                   </p>
                 </div>
                 <button
@@ -806,24 +977,31 @@ export const AdminDashboard: React.FC = () => {
               <div className="divide-y divide-gray-100 dark:divide-neutral-800 max-h-80 overflow-y-auto">
                 {notificationsList.length === 0 && stats.recentOrders.length === 0 ? (
                   <div className="p-6 text-center text-xs text-gray-400">
-                    Monitoring live store activity. Purchase notifications, payment authorizations, support inquiries, and account creation alerts will appear here in real time.
+                    Monitoring live store activity. Purchase notifications, payment authorizations, support inquiries, reviews, and account alerts will appear here in real time.
                   </div>
                 ) : (
                   <>
                     {notificationsList.map((act: any) => {
                       const typeStr = String(act.type || 'ACTIVITY')
                       const badgeClass =
-                        typeStr === 'ORDER_PURCHASED' || typeStr === 'PAYMENT_CAPTURED'
+                        typeStr === 'ORDER_PURCHASED' || typeStr === 'PAYMENT_CAPTURED' || typeStr === 'PRODUCT_REVIEW_SUBMITTED'
                           ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30'
                           : typeStr === 'PAYMENT_AUTHORIZED'
                           ? 'bg-blue-500/15 text-blue-500 border border-blue-500/30'
-                          : typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY'
+                          : typeStr === 'PAYMENT_FAILED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED' || typeStr === 'PRODUCT_DELETED'
+                          ? 'bg-red-500/15 text-red-500 border border-red-500/30'
+                          : typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY' || typeStr === 'SUPPORT_STATUS_UPDATED'
                           ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
-                          : typeStr === 'PRODUCT_BOOKING'
+                          : typeStr === 'PRODUCT_BOOKING_CREATED' || typeStr === 'PRODUCT_BOOKING_UPDATED' || typeStr === 'PRODUCT_BOOKING' || typeStr === 'CART_REMINDER_SENT'
                           ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
-                          : typeStr === 'USER_REGISTERED' || typeStr === 'USER_LOGIN'
+                          : typeStr === 'USER_REGISTERED' || typeStr === 'USER_LOGIN' || typeStr === 'USER_STATUS_UPDATED'
                           ? 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/30'
                           : 'bg-creamy-500/15 text-creamy-500 border border-creamy-500/30'
+
+                      const isBookingEvent =
+                        typeStr === 'PRODUCT_BOOKING_CREATED' ||
+                        typeStr === 'PRODUCT_BOOKING_UPDATED' ||
+                        typeStr === 'PRODUCT_BOOKING'
 
                       return (
                         <div key={act.id} className="px-6 py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 hover:bg-gray-50/50 dark:hover:bg-[#191b22]">
@@ -837,7 +1015,7 @@ export const AdminDashboard: React.FC = () => {
                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{act.message}</p>
                           </div>
                           <div className="flex items-center gap-3 self-end sm:self-center flex-shrink-0">
-                            {typeStr === 'SUPPORT_INQUIRY' && act.metadata?.sessionId && (
+                            {(typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY' || typeStr === 'SUPPORT_STATUS_UPDATED') && act.metadata?.sessionId && (
                               <button
                                 type="button"
                                 onClick={() => {
@@ -849,7 +1027,7 @@ export const AdminDashboard: React.FC = () => {
                                 Reply in Support
                               </button>
                             )}
-                            {typeStr === 'PRODUCT_BOOKING' && (
+                            {isBookingEvent && (
                               <button
                                 type="button"
                                 onClick={() => setActiveTab('bookings')}
@@ -858,12 +1036,33 @@ export const AdminDashboard: React.FC = () => {
                                 View Booking
                               </button>
                             )}
+                            {(typeStr === 'ORDER_PURCHASED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED') && (
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab('orders')}
+                                className="px-2.5 py-1 rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-gray-800 dark:text-gray-200 font-black text-[10px] uppercase tracking-wider"
+                              >
+                                View Orders
+                              </button>
+                            )}
                             <div className="text-right">
                               <span className="text-[10px] font-mono text-gray-400 block">
                                 {new Date(act.timestamp).toLocaleTimeString()}
                               </span>
-                              <span className="text-[10px] font-bold text-emerald-500">
-                                {act.emailDispatched || act.systemMailDispatched ? 'Email Sent' : 'Recorded'}
+                              <span className={`text-[10px] font-bold ${
+                                typeStr === 'PAYMENT_FAILED'
+                                  ? 'text-red-400'
+                                  : act.emailDispatched || act.systemMailDispatched
+                                  ? 'text-emerald-500'
+                                  : 'text-gray-400'
+                              }`}>
+                                {act.emailDispatched && act.systemMailDispatched
+                                  ? 'User + System Emailed'
+                                  : act.emailDispatched
+                                  ? 'Customer Emailed'
+                                  : act.systemMailDispatched
+                                  ? 'Alert Emailed'
+                                  : 'Recorded'}
                               </span>
                             </div>
                           </div>
@@ -1101,6 +1300,7 @@ export const AdminDashboard: React.FC = () => {
                   <option value="SHIPPED">Shipped</option>
                   <option value="DELIVERED">Delivered</option>
                   <option value="CANCELLED">Cancelled</option>
+                  <option value="REFUNDED">Refunded</option>
                 </select>
               </div>
             </div>
@@ -1165,6 +1365,7 @@ export const AdminDashboard: React.FC = () => {
                             <option value="SHIPPED">SHIPPED</option>
                             <option value="DELIVERED">DELIVERED</option>
                             <option value="CANCELLED">CANCELLED</option>
+                            <option value="REFUNDED">REFUNDED</option>
                           </select>
                         </td>
 
@@ -1460,7 +1661,7 @@ export const AdminDashboard: React.FC = () => {
                 <div className="lg:col-span-4 border-r border-gray-200 dark:border-neutral-800 divide-y divide-gray-100 dark:divide-neutral-800 max-h-[620px] overflow-y-auto">
                   {filteredSessions.length === 0 ? (
                     <div className="p-8 text-center text-xs text-gray-400">
-                      No visitor support sessions recorded yet. Visitors opening the site or starting a LiveChat will appear here automatically.
+                      No visitor support conversations recorded yet. Visitors who open LiveChat or submit an inquiry will appear here automatically.
                     </div>
                   ) : (
                     filteredSessions.map((sess) => {
@@ -1494,6 +1695,11 @@ export const AdminDashboard: React.FC = () => {
                                 <p className="font-bold text-xs text-gray-900 dark:text-white truncate">
                                   {sess.visitorName || 'Store Visitor'}
                                 </p>
+                                {(sess.userId || sess.isRegisteredUser) && (
+                                  <span className="text-[8px] font-black uppercase px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-400 border border-indigo-500/30 shrink-0">
+                                    Registered
+                                  </span>
+                                )}
                               </div>
                               <p className="text-[10px] text-gray-500 dark:text-gray-400 truncate mt-0.5">
                                 {sess.visitorEmail || sess.visitorPhone || `ID: ${sess.id.slice(0, 16)}`}
@@ -1575,6 +1781,11 @@ export const AdminDashboard: React.FC = () => {
                             <h4 className="font-bold text-sm text-gray-900 dark:text-white">
                               {activeSession.visitorName || 'Store Visitor'}
                             </h4>
+                            {(activeSession.userId || activeSession.isRegisteredUser) && (
+                              <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/30">
+                                Registered Account
+                              </span>
+                            )}
                             <span
                               className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
                                 activeSession.isOnline
@@ -1592,12 +1803,34 @@ export const AdminDashboard: React.FC = () => {
                             Email: <span className="font-mono font-semibold text-gray-800 dark:text-gray-200">{activeSession.visitorEmail || 'Not provided yet'}</span>
                             {' • '}
                             Phone: <span className="font-mono font-semibold text-gray-800 dark:text-gray-200">{activeSession.visitorPhone || 'Not provided'}</span>
+                            {activeSession.userId && (
+                              <>
+                                {' • '}
+                                Account ID: <span className="font-mono font-semibold text-gray-800 dark:text-gray-200">{activeSession.userId.slice(0, 12)}</span>
+                              </>
+                            )}
                             {' • '}
                             Last Activity: {new Date(activeSession.lastSeenAt).toLocaleString()}
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleAiPaused(activeSession.id, Boolean(activeSession.aiPaused))}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                              activeSession.aiPaused
+                                ? 'bg-amber-500/15 border-amber-500/40 text-amber-400 hover:bg-amber-500/25'
+                                : 'bg-white dark:bg-[#14161c] border-gray-300 dark:border-neutral-700 text-gray-600 dark:text-gray-300 hover:border-creamy-500'
+                            }`}
+                            title={
+                              activeSession.aiPaused
+                                ? 'AI Concierge auto-replies are paused while you handle this chat. Click to resume AI auto-replies.'
+                                : 'AI Concierge auto-replies are active until a specialist replies. Click to pause AI.'
+                            }
+                          >
+                            {activeSession.aiPaused ? 'AI Paused • Resume AI' : 'AI Auto • Pause AI'}
+                          </button>
                           <button
                             type="button"
                             onClick={() => handleToggleSupportStatus(activeSession.id, activeSession.status)}
@@ -1749,6 +1982,401 @@ export const AdminDashboard: React.FC = () => {
                   )}
                 </div>
               </div>
+            </div>
+          )
+        })()}
+
+        {/* Tab 7: TRAFFIC & PRODUCT ANALYTICS */}
+        {activeTab === 'analytics' && (() => {
+          const ta = analyticsData?.trafficAnalytics
+          const sourceBadgeMap: Record<ProductViewSource, { label: string; cls: string }> = {
+            PRODUCT_PAGE: {
+              label: 'Page View',
+              cls: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20'
+            },
+            CART_ADD: {
+              label: 'Cart Add',
+              cls: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+            },
+            BOOKING_MODAL: {
+              label: 'Booking Check',
+              cls: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
+            },
+            LIVECHAT_SELECT: {
+              label: 'Chat Pick',
+              cls: 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20'
+            },
+            SHARE: {
+              label: 'Share Click',
+              cls: 'bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 border border-cyan-500/20'
+            }
+          }
+
+          const totalDevices = ta
+            ? Math.max(1, ta.deviceBreakdown.desktop + ta.deviceBreakdown.mobile + ta.deviceBreakdown.tablet)
+            : 1
+
+          const maxSeriesValue = ta?.dailySeries?.length
+            ? Math.max(1, ...ta.dailySeries.map(d => Math.max(d.visits, d.productViews)))
+            : 1
+
+          return (
+            <div className="space-y-6">
+              {/* Filter & Live Sync Header */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white dark:bg-[#16181e] p-4 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                <div>
+                  <h2 className="text-lg font-black font-anton uppercase text-gray-900 dark:text-white flex items-center gap-2">
+                    <BarChart3 className="w-5 h-5 text-creamy-500" />
+                    <span>Storefront Visits & Checked Products</span>
+                  </h2>
+                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                    Real-time storefront navigation, visitor devices, referrers, and product inspection telemetry.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {([1, 7, 30, 90] as const).map(daysOption => (
+                    <button
+                      key={daysOption}
+                      type="button"
+                      onClick={() => setAnalyticsDays(daysOption)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-colors ${analyticsDays === daysOption
+                        ? 'bg-creamy-500 text-black shadow-sm'
+                        : 'bg-gray-100 dark:bg-neutral-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-neutral-700'
+                        }`}
+                    >
+                      {daysOption === 1 ? 'Today' : `${daysOption}D`}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => fetchAnalytics(analyticsDays)}
+                    disabled={analyticsLoading}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border border-gray-200 dark:border-neutral-700 text-gray-700 dark:text-gray-200 hover:border-creamy-500 transition-colors"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${analyticsLoading ? 'animate-spin text-creamy-500' : ''}`} />
+                    <span>Sync</span>
+                  </button>
+                </div>
+              </div>
+
+              {!ta ? (
+                <div className="bg-white dark:bg-[#16181e] p-12 rounded-2xl border border-gray-200 dark:border-neutral-800 text-center text-sm text-gray-400">
+                  {analyticsLoading ? 'Loading storefront traffic and product telemetry...' : 'No traffic telemetry recorded yet.'}
+                </div>
+              ) : (
+                <>
+                  {/* KPI Cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-bold text-gray-500 uppercase tracking-widest">Site Visits ({ta.periodDays}d)</span>
+                        <div className="w-9 h-9 rounded-xl bg-creamy-500/10 text-creamy-500 flex items-center justify-center">
+                          <Globe className="w-5 h-5" />
+                        </div>
+                      </div>
+                      <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{ta.totalVisits.toLocaleString()}</p>
+                      <p className="text-[11px] text-gray-400 mt-1">{ta.visitsToday.toLocaleString()} today • {ta.visitsLast7d.toLocaleString()} last 7d</p>
+                    </div>
+
+                    <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-bold text-gray-500 uppercase tracking-widest">Unique Visitors</span>
+                        <div className="w-9 h-9 rounded-xl bg-blue-500/10 text-blue-500 flex items-center justify-center">
+                          <Users className="w-5 h-5" />
+                        </div>
+                      </div>
+                      <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{ta.uniqueVisitors.toLocaleString()}</p>
+                      <p className="text-[11px] text-gray-400 mt-1">{ta.uniqueVisitorsToday.toLocaleString()} today • {ta.uniqueVisitorsLast7d.toLocaleString()} last 7d</p>
+                    </div>
+
+                    <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-bold text-gray-500 uppercase tracking-widest">Products Checked</span>
+                        <div className="w-9 h-9 rounded-xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center">
+                          <Eye className="w-5 h-5" />
+                        </div>
+                      </div>
+                      <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{ta.totalProductViews.toLocaleString()}</p>
+                      <p className="text-[11px] text-gray-400 mt-1">{ta.productViewsToday.toLocaleString()} today • {ta.uniqueProductsChecked.toLocaleString()} distinct rigs</p>
+                    </div>
+
+                    <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-bold text-gray-500 uppercase tracking-widest">Active Unpaid Carts</span>
+                        <div className="w-9 h-9 rounded-xl bg-amber-500/10 text-amber-500 flex items-center justify-center">
+                          <ShoppingBag className="w-5 h-5" />
+                        </div>
+                      </div>
+                      <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{(analyticsData?.activeCartRemindersCount ?? 0).toLocaleString()}</p>
+                      <p className="text-[11px] text-gray-400 mt-1">Scheduled for 1h–72h SMTP recovery reminders</p>
+                    </div>
+                  </div>
+
+                  {/* Daily Activity Trend + Devices & Referrers */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                    <div className="lg:col-span-8 bg-white dark:bg-[#16181e] p-6 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                      <div className="flex flex-wrap items-center justify-between gap-2 mb-5">
+                        <div>
+                          <h3 className="text-sm font-black uppercase tracking-wider text-gray-900 dark:text-white">
+                            14-Day Traffic & Product Inspection Velocity
+                          </h3>
+                          <p className="text-[11px] text-gray-400">Daily storefront visits compared with checked product events.</p>
+                        </div>
+                        <div className="flex items-center gap-4 text-[11px] font-bold">
+                          <span className="inline-flex items-center gap-1.5 text-gray-600 dark:text-gray-300">
+                            <span className="w-2.5 h-2.5 rounded-sm bg-creamy-500 inline-block" /> Visits
+                          </span>
+                          <span className="inline-flex items-center gap-1.5 text-gray-600 dark:text-gray-300">
+                            <span className="w-2.5 h-2.5 rounded-sm bg-emerald-500 inline-block" /> Checked Products
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className={`grid grid-cols-7 ${ta.dailySeries.length > 7 ? 'md:grid-cols-[repeat(14,minmax(0,1fr))]' : ''} gap-2 items-end h-44 pt-4`}>
+                        {ta.dailySeries.map(day => {
+                          const visitHeightPct = day.visits > 0 ? Math.max(8, Math.round((day.visits / maxSeriesValue) * 100)) : 2
+                          const viewHeightPct = day.productViews > 0 ? Math.max(8, Math.round((day.productViews / maxSeriesValue) * 100)) : 2
+                          return (
+                            <div
+                              key={day.date}
+                              className="flex flex-col items-center justify-end h-full group"
+                              title={`${day.label}: ${day.visits} visits (${day.uniqueVisitors} unique), ${day.productViews} product checks`}
+                            >
+                              <div className="w-full flex items-end justify-center gap-1 h-32">
+                                <div
+                                  className="w-2.5 rounded-t bg-creamy-500/85 group-hover:bg-creamy-400 transition-all"
+                                  style={{ height: `${visitHeightPct}%` }}
+                                />
+                                <div
+                                  className="w-2.5 rounded-t bg-emerald-500/80 group-hover:bg-emerald-400 transition-all"
+                                  style={{ height: `${viewHeightPct}%` }}
+                                />
+                              </div>
+                              <span className="mt-2 text-[9px] font-bold text-gray-400 truncate max-w-full">
+                                {day.label}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="lg:col-span-4 space-y-6">
+                      <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                        <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white mb-4">
+                          Visitor Devices
+                        </h3>
+                        <div className="space-y-3">
+                          {[
+                            { label: 'Desktop', count: ta.deviceBreakdown.desktop, icon: Monitor, color: 'bg-creamy-500' },
+                            { label: 'Mobile', count: ta.deviceBreakdown.mobile, icon: Smartphone, color: 'bg-emerald-500' },
+                            { label: 'Tablet', count: ta.deviceBreakdown.tablet, icon: Tablet, color: 'bg-blue-500' }
+                          ].map(dev => {
+                            const DevIcon = dev.icon
+                            const pct = ta.totalVisits > 0 ? Math.round((dev.count / totalDevices) * 100) : 0
+                            return (
+                              <div key={dev.label} className="space-y-1">
+                                <div className="flex items-center justify-between text-xs">
+                                  <span className="flex items-center gap-1.5 font-bold text-gray-700 dark:text-gray-200">
+                                    <DevIcon className="w-3.5 h-3.5 text-gray-400" />
+                                    {dev.label}
+                                  </span>
+                                  <span className="text-gray-500 dark:text-gray-400 font-semibold">
+                                    {dev.count.toLocaleString()} ({pct}%)
+                                  </span>
+                                </div>
+                                <div className="w-full h-1.5 rounded-full bg-gray-100 dark:bg-neutral-800 overflow-hidden">
+                                  <div className={`h-full rounded-full ${dev.color}`} style={{ width: `${pct}%` }} />
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="bg-white dark:bg-[#16181e] p-5 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
+                        <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white mb-3">
+                          Top Referrers
+                        </h3>
+                        {ta.topReferrers.length === 0 ? (
+                          <p className="text-xs text-gray-400">No referrer records yet.</p>
+                        ) : (
+                          <div className="space-y-2">
+                            {ta.topReferrers.slice(0, 5).map(refItem => (
+                              <div key={refItem.referrer} className="flex items-center justify-between text-xs">
+                                <span className="text-gray-700 dark:text-gray-300 truncate pr-3">{refItem.referrer}</span>
+                                <span className="font-black text-gray-900 dark:text-white">{refItem.visits}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Most Checked Products Leaderboard */}
+                  <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+                    <div className="p-5 border-b border-gray-100 dark:border-neutral-800 flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-black uppercase tracking-wider text-gray-900 dark:text-white">
+                          Most Checked & Interacted Products
+                        </h3>
+                        <p className="text-[11px] text-gray-400">
+                          Ranked by combined detail page inspections, quick-cart additions, coming-soon bookings, live-chat picks, and shares.
+                        </p>
+                      </div>
+                    </div>
+
+                    {ta.topProductsChecked.length === 0 ? (
+                      <div className="p-8 text-center text-xs text-gray-400">
+                        No checked products recorded in this timeframe yet.
+                      </div>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-gray-100 dark:border-neutral-800 text-[10px] font-black uppercase tracking-wider text-gray-400">
+                              <th className="py-3 px-5">Product</th>
+                              <th className="py-3 px-3 text-right">Price</th>
+                              <th className="py-3 px-3 text-right">Total Checks</th>
+                              <th className="py-3 px-3 text-right">Page Views</th>
+                              <th className="py-3 px-3 text-right">Cart Adds</th>
+                              <th className="py-3 px-3 text-right">Bookings</th>
+                              <th className="py-3 px-3 text-right">Chat Picks</th>
+                              <th className="py-3 px-3 text-right">Unique Visitors</th>
+                              <th className="py-3 px-5 text-right">Last Checked</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100 dark:divide-neutral-800 text-xs">
+                            {ta.topProductsChecked.map(item => (
+                              <tr key={item.productId} className="hover:bg-gray-50 dark:hover:bg-white/[0.02] transition-colors">
+                                <td className="py-3 px-5">
+                                  <div className="flex items-center gap-3">
+                                    <img
+                                      src={getSafeMediaUrl(item.imageUrl || undefined)}
+                                      alt={item.productName}
+                                      className="w-10 h-10 rounded-lg object-cover bg-gray-100 dark:bg-neutral-800 flex-shrink-0"
+                                    />
+                                    <div className="min-w-0">
+                                      <p className="font-bold text-gray-900 dark:text-white truncate max-w-[210px]">{item.productName}</p>
+                                      <p className="text-[10px] text-gray-400 uppercase">{item.productSku || item.category || item.productId}</p>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="py-3 px-3 text-right font-semibold text-gray-700 dark:text-gray-300">
+                                  {formatPrice(item.price)}
+                                </td>
+                                <td className="py-3 px-3 text-right font-black text-creamy-500">
+                                  {item.totalViews}
+                                </td>
+                                <td className="py-3 px-3 text-right text-gray-600 dark:text-gray-300">{item.pageViews}</td>
+                                <td className="py-3 px-3 text-right text-emerald-600 dark:text-emerald-400 font-bold">{item.cartAdds}</td>
+                                <td className="py-3 px-3 text-right text-amber-600 dark:text-amber-400 font-bold">{item.bookingChecks}</td>
+                                <td className="py-3 px-3 text-right text-purple-600 dark:text-purple-400 font-bold">{item.chatSelections}</td>
+                                <td className="py-3 px-3 text-right text-gray-600 dark:text-gray-300">{item.uniqueVisitors}</td>
+                                <td className="py-3 px-5 text-right text-[11px] text-gray-400 whitespace-nowrap">
+                                  {new Date(item.lastViewedAt).toLocaleString()}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Top Pages + Live Recent Activity Streams */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+                    <div className="lg:col-span-4 bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+                      <div className="p-5 border-b border-gray-100 dark:border-neutral-800">
+                        <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white">
+                          Top Storefront Routes
+                        </h3>
+                      </div>
+                      <div className="divide-y divide-gray-100 dark:divide-neutral-800 max-h-96 overflow-y-auto">
+                        {ta.topPages.length === 0 ? (
+                          <p className="p-6 text-xs text-gray-400 text-center">No page paths recorded yet.</p>
+                        ) : (
+                          ta.topPages.map(pg => (
+                            <div key={pg.path} className="p-4 flex items-center justify-between gap-3 text-xs">
+                              <div className="min-w-0">
+                                <p className="font-mono font-bold text-gray-900 dark:text-white truncate">{pg.path}</p>
+                                <p className="text-[10px] text-gray-400 mt-0.5">{pg.uniqueVisitors} unique • {new Date(pg.lastVisitedAt).toLocaleDateString()}</p>
+                              </div>
+                              <span className="px-2 py-0.5 rounded-lg bg-creamy-500/10 text-creamy-500 font-black whitespace-nowrap">
+                                {pg.visits}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="lg:col-span-4 bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+                      <div className="p-5 border-b border-gray-100 dark:border-neutral-800">
+                        <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white">
+                          Recent Site Visits
+                        </h3>
+                      </div>
+                      <div className="divide-y divide-gray-100 dark:divide-neutral-800 max-h-96 overflow-y-auto">
+                        {ta.recentVisits.length === 0 ? (
+                          <p className="p-6 text-xs text-gray-400 text-center">No recent visits yet.</p>
+                        ) : (
+                          ta.recentVisits.map(v => (
+                            <div key={v.id} className="p-3.5 text-xs space-y-1">
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-mono font-bold text-gray-900 dark:text-white truncate">{v.path}</span>
+                                <span className="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-neutral-800 text-[10px] font-bold uppercase text-gray-500 dark:text-gray-300">
+                                  {v.deviceType}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between text-[10px] text-gray-400">
+                                <span className="truncate pr-2">{v.userEmail || v.visitorId}</span>
+                                <span className="inline-flex items-center gap-1 whitespace-nowrap">
+                                  <Clock className="w-3 h-3" />
+                                  {new Date(v.createdAt).toLocaleTimeString()}
+                                </span>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="lg:col-span-4 bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+                      <div className="p-5 border-b border-gray-100 dark:border-neutral-800">
+                        <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white">
+                          Recent Checked Products
+                        </h3>
+                      </div>
+                      <div className="divide-y divide-gray-100 dark:divide-neutral-800 max-h-96 overflow-y-auto">
+                        {ta.recentProductViews.length === 0 ? (
+                          <p className="p-6 text-xs text-gray-400 text-center">No checked product events yet.</p>
+                        ) : (
+                          ta.recentProductViews.map(pv => {
+                            const badge = sourceBadgeMap[pv.source] || sourceBadgeMap.PRODUCT_PAGE
+                            return (
+                              <div key={pv.id} className="p-3.5 text-xs space-y-1">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-bold text-gray-900 dark:text-white truncate">{pv.productName}</span>
+                                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold whitespace-nowrap ${badge.cls}`}>
+                                    {badge.label}
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-between text-[10px] text-gray-400">
+                                  <span className="truncate pr-2">{pv.userEmail || pv.visitorId}</span>
+                                  <span className="whitespace-nowrap">{new Date(pv.createdAt).toLocaleTimeString()}</span>
+                                </div>
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           )
         })()}

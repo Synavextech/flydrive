@@ -7,6 +7,7 @@ import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
 import { buildReceiptDataFromOrder, generateReceiptPdfBuffer } from '../utils/receiptPdf.js'
 import {
+  extractGuestMetadataFromNotes,
   getJwtSecret,
   signReceiptAccessToken,
   verifyReceiptAccessToken
@@ -66,27 +67,6 @@ const createOrderSchema = z.object({
 const orderStatusUpdateSchema = z.object({
   status: z.enum(['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED'])
 })
-
-function extractGuestMetadataFromNotes(notes?: string | null): {
-  emails: string[]
-  zips: string[]
-} {
-  if (!notes) return { emails: [], zips: [] }
-  const emails: string[] = []
-  const zips: string[] = []
-
-  const emailMatches = notes.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)
-  if (emailMatches) {
-    emails.push(...emailMatches.map((e) => e.toLowerCase()))
-  }
-
-  const postalMatch = notes.match(/Postal:\s*([A-Za-z0-9 -]{2,20})/i)
-  if (postalMatch?.[1]) {
-    zips.push(postalMatch[1].trim().toLowerCase())
-  }
-
-  return { emails, zips }
-}
 
 // @desc    Create new order
 // @route   POST /api/orders
@@ -238,6 +218,17 @@ export const createOrder = async (req: Request, res: Response) => {
         : await verifyPayPalPayment(paymentId, pricing.total, paypalOrderId)
 
     if (!verification.verified) {
+      emailService
+        .recordPaymentFailure({
+          gateway: paymentMethod,
+          stage: 'Order Verification',
+          amount: pricing.total,
+          userEmail: customerEmail || req.user?.email || undefined,
+          referenceId: paymentId,
+          reason: verification.reason || 'Payment verification failed with the processor.'
+        })
+        .catch(() => {})
+
       return res.status(402).json({
         success: false,
         error:
@@ -329,6 +320,21 @@ export const createOrder = async (req: Request, res: Response) => {
     if (userId) {
       databaseService.clearCart(userId).catch(() => {})
     }
+
+    databaseService
+      .markCartRemindersInactive({
+        userId: userId || authUserToReturn?.id || null,
+        emails: [
+          authUserToReturn?.email,
+          req.user?.email,
+          customerEmail,
+          shippingAddressInput?.email,
+          customer?.email
+        ],
+        status: 'COMPLETED',
+        orderNumber: order.orderNumber
+      })
+      .catch(() => {})
 
     emailService
       .sendPurchaseNotifications(order, {

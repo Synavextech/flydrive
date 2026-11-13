@@ -1,6 +1,58 @@
-import React, { createContext, useContext, useReducer, useEffect, ReactNode } from 'react'
+import React, { createContext, useContext, useReducer, useEffect, useRef, useCallback, ReactNode } from 'react'
 import { Cart, CartItem, Product, CartState } from '../types'
 import { useAuth } from './AuthContext'
+
+const CART_VISITOR_ID_KEY = 'dfe_cart_visitor_id'
+const CHECKOUT_EMAIL_KEY = 'dfe_checkout_email'
+const CHECKOUT_NAME_KEY = 'dfe_checkout_name'
+
+function getOrCreateCartVisitorId(): string {
+  try {
+    const existing = localStorage.getItem(CART_VISITOR_ID_KEY)
+    if (existing) return existing
+    const created =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `vis_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+    localStorage.setItem(CART_VISITOR_ID_KEY, created)
+    return created
+  } catch {
+    return ''
+  }
+}
+
+function getStoredGuestCheckoutEmail(): string {
+  try {
+    const email = (localStorage.getItem(CHECKOUT_EMAIL_KEY) || '').trim().toLowerCase()
+    return email && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) ? email : ''
+  } catch {
+    return ''
+  }
+}
+
+function getStoredGuestCheckoutName(): string {
+  try {
+    return (localStorage.getItem(CHECKOUT_NAME_KEY) || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function buildOptionalAuthHeaders(includeJsonContentType = false): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (includeJsonContentType) {
+    headers['Content-Type'] = 'application/json'
+  }
+  try {
+    const token = localStorage.getItem('token')
+    if (token && token !== 'null' && token !== 'undefined') {
+      headers['Authorization'] = `Bearer ${token}`
+    }
+  } catch {
+    // Cookie authentication handles session seamlessly
+  }
+  return headers
+}
 
 // Cart actions
 type CartAction =
@@ -47,9 +99,13 @@ const cartReducer = (state: CartState, action: CartAction): CartState => {
       const existingItemIndex = state.items.findIndex(item => item.productId === product.id)
 
       if (existingItemIndex >= 0) {
-        // Update existing item quantity
+        // Update existing item quantity immutably
+        const currentExisting = state.items[existingItemIndex]
         const updatedItems = [...state.items]
-        updatedItems[existingItemIndex].quantity += quantity
+        updatedItems[existingItemIndex] = {
+          ...currentExisting,
+          quantity: currentExisting.quantity + quantity,
+        }
 
         const newTotalItems = state.totalItems + quantity
         const newTotalPrice = state.totalPrice + (product.price * quantity)
@@ -97,7 +153,10 @@ const cartReducer = (state: CartState, action: CartAction): CartState => {
       if (itemIndex >= 0) {
         const oldQuantity = state.items[itemIndex].quantity
         const updatedItems = [...state.items]
-        updatedItems[itemIndex].quantity = newQuantity
+        updatedItems[itemIndex] = {
+          ...state.items[itemIndex],
+          quantity: newQuantity,
+        }
 
         const quantityDiff = newQuantity - oldQuantity
         const newTotalItems = state.totalItems + quantityDiff
@@ -166,10 +225,10 @@ const initialState: CartState = getInitialCart()
 
 // Create context
 interface CartContextType extends CartState {
-  addToCart: (product: Product, quantity?: number) => void
-  removeFromCart: (itemId: string) => void
-  updateQuantity: (itemId: string, quantity: number) => void
-  clearCart: () => void
+  addToCart: (product: Product, quantity?: number) => Promise<void> | void
+  removeFromCart: (itemId: string) => Promise<void> | void
+  updateQuantity: (itemId: string, quantity: number) => Promise<void> | void
+  clearCart: () => Promise<void>
   clearError: () => void
   syncCart: () => Promise<void>
 }
@@ -188,69 +247,66 @@ const API_URL = (import.meta as any).env?.VITE_API_URL || '/api'
 export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
   const [state, dispatch] = useReducer(cartReducer, initialState)
   const { isAuthenticated, user } = useAuth()
+  const itemsRef = useRef<CartItem[]>(state.items)
+  const wasAuthenticatedRef = useRef<boolean>(isAuthenticated)
+  const syncingRef = useRef<boolean>(false)
 
-  // Save guest cart to localStorage
+  // Keep latest items ref & save local cart copy for page reload resilience
   useEffect(() => {
+    itemsRef.current = state.items
     try {
       localStorage.setItem('driveflyelectric_cart', JSON.stringify(state.items))
       localStorage.removeItem('trendstore_cart')
-    } catch (e) {
+    } catch {
       // ignore storage error
     }
   }, [state.items])
 
-  // Load cart when user logs in & sync guest items
-  useEffect(() => {
-    if (isAuthenticated && user) {
-      syncGuestCartAndLoad()
-    }
-  }, [isAuthenticated, user?.id])
-
-  // Sync guest cart items to backend then load user's cart
-  const syncGuestCartAndLoad = async () => {
-    const token = localStorage.getItem('token')
-    if (!token) return
-
-    // If there were guest items, sync them to backend first
-    if (state.items.length > 0) {
-      for (const item of state.items) {
-        if (item.productId) {
-          try {
-            await fetch(`${API_URL}/cart/items`, {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({
-                productId: item.productId,
-                quantity: item.quantity,
-              }),
-            })
-          } catch (e) {
-            // continue syncing others
-          }
-        }
+  const syncGuestReminderSnapshot = useCallback(
+    async (itemsSnapshot: CartItem[]) => {
+      if (isAuthenticated) return
+      const guestEmail = getStoredGuestCheckoutEmail()
+      const visitorId = getOrCreateCartVisitorId()
+      if (!guestEmail && itemsSnapshot.length === 0 && visitorId) {
+        await fetch(`${API_URL}/cart/reminder-snapshot`, {
+          method: 'DELETE',
+          credentials: 'include',
+          headers: buildOptionalAuthHeaders(true),
+          body: JSON.stringify({ visitorId }),
+        }).catch(() => {})
+        return
       }
-    }
+      if (!guestEmail) return
 
-    await loadCart()
-  }
+      const payloadItems = itemsSnapshot
+        .filter((it) => it.productId && it.quantity > 0)
+        .map((it) => ({ productId: it.productId, quantity: it.quantity }))
+
+      await fetch(`${API_URL}/cart/reminder-snapshot`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: buildOptionalAuthHeaders(true),
+        body: JSON.stringify({
+          email: guestEmail,
+          customerName: getStoredGuestCheckoutName() || undefined,
+          visitorId: visitorId || undefined,
+          items: payloadItems,
+        }),
+      }).catch(() => {})
+    },
+    [isAuthenticated]
+  )
 
   // Load cart from backend
-  const loadCart = async () => {
+  const loadCart = useCallback(async () => {
     if (!isAuthenticated) return
 
     dispatch({ type: 'CART_LOADING' })
 
     try {
-      const token = localStorage.getItem('token')
       const response = await fetch(`${API_URL}/cart`, {
         credentials: 'include',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: buildOptionalAuthHeaders(false),
       })
 
       const contentType = response.headers.get('content-type') || ''
@@ -270,9 +326,63 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
         throw new Error(errMessage)
       }
     } catch (error) {
-      dispatch({ type: 'CART_ERROR', payload: error instanceof Error ? error.message : 'Unable to load cart right now.' })
+      dispatch({
+        type: 'CART_ERROR',
+        payload: error instanceof Error ? error.message : 'Unable to load cart right now.',
+      })
     }
-  }
+  }, [isAuthenticated])
+
+  // Sync unpersisted guest (temp_*) items to backend and reload authoritative DB cart
+  const syncCart = useCallback(async () => {
+    if (!isAuthenticated) {
+      await syncGuestReminderSnapshot(itemsRef.current)
+      return
+    }
+    if (syncingRef.current) return
+    syncingRef.current = true
+
+    try {
+      const unsyncedGuestItems = itemsRef.current.filter(
+        (item) => item.productId && String(item.id || '').startsWith('temp_')
+      )
+      for (const item of unsyncedGuestItems) {
+        try {
+          await fetch(`${API_URL}/cart/items`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: buildOptionalAuthHeaders(true),
+            body: JSON.stringify({
+              productId: item.productId,
+              quantity: item.quantity,
+            }),
+          })
+        } catch {
+          // continue syncing remaining items
+        }
+      }
+      await loadCart()
+    } finally {
+      syncingRef.current = false
+    }
+  }, [isAuthenticated, loadCart, syncGuestReminderSnapshot])
+
+  // Load & merge cart on sign-in, and clear account cart cleanly on logout
+  useEffect(() => {
+    if (isAuthenticated && user) {
+      wasAuthenticatedRef.current = true
+      syncCart()
+    } else if (wasAuthenticatedRef.current && !isAuthenticated) {
+      wasAuthenticatedRef.current = false
+      try {
+        localStorage.removeItem('driveflyelectric_cart')
+        localStorage.removeItem('trendstore_cart')
+      } catch {
+        // ignore storage error
+      }
+      dispatch({ type: 'CLEAR_CART' })
+    }
+  }, [isAuthenticated, user?.id, syncCart])
 
   // Add item to cart
   const addToCart = async (product: Product, quantity = 1) => {
@@ -282,17 +392,12 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
     }
     dispatch({ type: 'ADD_ITEM', payload: { product, quantity } })
 
-    // Sync with backend if user is authenticated
     if (isAuthenticated) {
       try {
-        const token = localStorage.getItem('token')
         const response = await fetch(`${API_URL}/cart/items`, {
           method: 'POST',
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: buildOptionalAuthHeaders(true),
           body: JSON.stringify({
             productId: product.id,
             quantity,
@@ -300,84 +405,156 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
         })
 
         if (response.ok) {
-          loadCart()
+          await loadCart()
         }
-      } catch (error) {
+      } catch {
         // optimistic update is retained locally
       }
+    } else {
+      const existing = itemsRef.current.find((i) => i.productId === product.id)
+      const nextItems = existing
+        ? itemsRef.current.map((i) =>
+            i.productId === product.id ? { ...i, quantity: i.quantity + quantity } : i
+          )
+        : [
+            ...itemsRef.current,
+            {
+              id: `temp_${Date.now()}`,
+              cartId: '',
+              productId: product.id,
+              quantity,
+              product,
+            },
+          ]
+      syncGuestReminderSnapshot(nextItems).catch(() => {})
     }
   }
 
   // Remove item from cart
   const removeFromCart = async (itemId: string) => {
+    const targetItem = itemsRef.current.find((i) => i.id === itemId)
+    const remainingItems = itemsRef.current.filter((i) => i.id !== itemId)
     dispatch({ type: 'REMOVE_ITEM', payload: itemId })
 
     if (isAuthenticated) {
       try {
-        const token = localStorage.getItem('token')
-        await fetch(`${API_URL}/cart/items/${itemId}`, {
+        let backendItemId = itemId
+        if (itemId.startsWith('temp_') && targetItem?.productId) {
+          const cartRes = await fetch(`${API_URL}/cart`, {
+            credentials: 'include',
+            headers: buildOptionalAuthHeaders(false),
+          })
+          const cartJson = await cartRes.json().catch(() => null)
+          const matched = cartJson?.data?.items?.find((ci: any) => ci.productId === targetItem.productId)
+          if (matched?.id) {
+            backendItemId = matched.id
+          } else {
+            await loadCart()
+            return
+          }
+        }
+
+        await fetch(`${API_URL}/cart/items/${encodeURIComponent(backendItemId)}`, {
           method: 'DELETE',
           credentials: 'include',
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
+          headers: buildOptionalAuthHeaders(false),
         })
-      } catch (error) {
-        // Reload cart on error to restore correct state
-        loadCart()
+      } catch {
+        await loadCart()
       }
+    } else {
+      syncGuestReminderSnapshot(remainingItems).catch(() => {})
     }
   }
 
   // Update item quantity
   const updateQuantity = async (itemId: string, quantity: number) => {
     if (quantity <= 0) {
-      removeFromCart(itemId)
+      await removeFromCart(itemId)
       return
     }
 
+    const targetItem = itemsRef.current.find((i) => i.id === itemId)
+    const nextItems = itemsRef.current.map((i) =>
+      i.id === itemId ? { ...i, quantity } : i
+    )
     dispatch({ type: 'UPDATE_QUANTITY', payload: { itemId, quantity } })
 
     if (isAuthenticated) {
       try {
-        const token = localStorage.getItem('token')
-        await fetch(`${API_URL}/cart/items/${itemId}`, {
+        let backendItemId = itemId
+        if (itemId.startsWith('temp_') && targetItem?.productId) {
+          const cartRes = await fetch(`${API_URL}/cart`, {
+            credentials: 'include',
+            headers: buildOptionalAuthHeaders(false),
+          })
+          const cartJson = await cartRes.json().catch(() => null)
+          const matched = cartJson?.data?.items?.find((ci: any) => ci.productId === targetItem.productId)
+          if (matched?.id) {
+            backendItemId = matched.id
+          } else {
+            await loadCart()
+            return
+          }
+        }
+
+        await fetch(`${API_URL}/cart/items/${encodeURIComponent(backendItemId)}`, {
           method: 'PUT',
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          headers: buildOptionalAuthHeaders(true),
           body: JSON.stringify({ quantity }),
         })
-      } catch (error) {
-        // Reload cart on error to restore correct state
-        loadCart()
+      } catch {
+        await loadCart()
       }
+    } else {
+      syncGuestReminderSnapshot(nextItems).catch(() => {})
     }
   }
 
-  // Clear cart
-  const clearCart = () => {
+  // Clear cart locally, in backend database, and cancel unpaid cart reminders
+  const clearCart = async () => {
+    itemsRef.current = []
     try {
       localStorage.removeItem('driveflyelectric_cart')
       localStorage.removeItem('trendstore_cart')
-    } catch (e) {}
+    } catch {
+      // ignore storage error
+    }
     dispatch({ type: 'CLEAR_CART' })
+
+    const visitorId = getOrCreateCartVisitorId()
+    const guestEmail = getStoredGuestCheckoutEmail()
+
+    if (isAuthenticated) {
+      try {
+        await fetch(`${API_URL}/cart`, {
+          method: 'DELETE',
+          credentials: 'include',
+          headers: buildOptionalAuthHeaders(true),
+          body: JSON.stringify({ visitorId }),
+        })
+      } catch {
+        // local cart remains cleared
+      }
+    }
+
+    if (guestEmail || (!isAuthenticated && visitorId)) {
+      await fetch(`${API_URL}/cart/reminder-snapshot`, {
+        method: 'DELETE',
+        credentials: 'include',
+        headers: buildOptionalAuthHeaders(true),
+        body: JSON.stringify({
+          ...(guestEmail ? { email: guestEmail } : {}),
+          visitorId,
+        }),
+      }).catch(() => {})
+    }
   }
 
   // Clear error
   const clearError = () => {
     dispatch({ type: 'CLEAR_ERROR' })
-  }
-
-  // Sync cart with backend (for guest users who log in)
-  const syncCart = async () => {
-    if (state.items.length > 0 && isAuthenticated) {
-      // Here you would sync local cart items to backend
-      // For now, just reload from backend
-      loadCart()
-    }
   }
 
   const value: CartContextType = {

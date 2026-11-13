@@ -191,10 +191,14 @@ export const createProduct = async (req: Request, res: Response) => {
     const newProduct = await databaseService.createProduct(parsed.data)
 
     emailService.recordActivity({
-      type: 'PRODUCT_UPDATED',
+      type: 'PRODUCT_CREATED',
       title: `New Fleet Item Added • ${newProduct.name}`,
       message: `Created ${newProduct.name} (SKU: ${newProduct.sku} | Category: ${newProduct.category}) at $${Number(newProduct.price).toLocaleString()} USD.`,
       amount: Number(newProduct.price),
+      metadata: {
+        productId: newProduct.id,
+        sku: newProduct.sku
+      },
       emailDispatched: false,
       systemMailDispatched: false
     })
@@ -241,6 +245,10 @@ export const updateProduct = async (req: Request, res: Response) => {
       title: `Fleet Item Updated • ${updatedProduct.name}`,
       message: `Updated ${updatedProduct.name} (SKU: ${updatedProduct.sku} | Stock: ${updatedProduct.stock}).`,
       amount: Number(updatedProduct.price),
+      metadata: {
+        productId: updatedProduct.id,
+        sku: updatedProduct.sku
+      },
       emailDispatched: false,
       systemMailDispatched: false
     })
@@ -273,7 +281,20 @@ export const deleteProduct = async (req: Request, res: Response) => {
 
     const productId = req.params.id
 
-    await databaseService.deleteProduct(productId)
+    const deletedProduct = await databaseService.deleteProduct(productId)
+
+    emailService.recordActivity({
+      type: 'PRODUCT_DELETED',
+      title: `Fleet Item Removed • ${deletedProduct.name}`,
+      message: `Deleted ${deletedProduct.name} (SKU: ${deletedProduct.sku}) from the store catalog.`,
+      amount: Number(deletedProduct.price),
+      metadata: {
+        productId: deletedProduct.id,
+        sku: deletedProduct.sku
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
 
     res.status(200).json({
       success: true,
@@ -455,6 +476,19 @@ export const updateUserStatus = async (req: Request, res: Response) => {
 
     const updatedUser = await databaseService.updateUser(userId, { isActive: parsed.data.isActive })
 
+    emailService.recordActivity({
+      type: 'USER_STATUS_UPDATED',
+      title: `Account ${parsed.data.isActive ? 'Activated' : 'Deactivated'} • ${updatedUser.email}`,
+      message: `Administrator marked ${updatedUser.email} as ${parsed.data.isActive ? 'ACTIVE' : 'DEACTIVATED'}.`,
+      userEmail: updatedUser.email,
+      metadata: {
+        userId: updatedUser.id,
+        isActive: parsed.data.isActive
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(200).json({
       success: true,
       message: `User ${parsed.data.isActive ? 'activated' : 'deactivated'} successfully`,
@@ -481,14 +515,21 @@ export const getAnalytics = async (req: Request, res: Response) => {
       })
     }
 
+    const rawDays = Number(req.query.days)
+    const periodDays = Number.isFinite(rawDays) && rawDays >= 1 ? Math.min(365, Math.floor(rawDays)) : 30
+
     const [
       ordersByStatusList,
       topProducts,
-      recentActivity
+      recentActivity,
+      activeCartReminders,
+      trafficAnalytics
     ] = await Promise.all([
       databaseService.findOrders({ limit: 100 }),
       databaseService.findProducts({ limit: 10 }),
-      databaseService.findOrders({ limit: 10 })
+      databaseService.findOrders({ limit: 10 }),
+      databaseService.listActiveCartReminders(200),
+      databaseService.getTrafficAnalytics(periodDays)
     ])
 
     const ordersByStatus = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'].map(s => ({
@@ -506,7 +547,9 @@ export const getAnalytics = async (req: Request, res: Response) => {
         revenueByMonth,
         ordersByStatus,
         topProducts,
-        recentActivity
+        recentActivity,
+        activeCartRemindersCount: activeCartReminders.length,
+        trafficAnalytics
       }
     })
   } catch (error) {
@@ -522,10 +565,19 @@ export const getAnalytics = async (req: Request, res: Response) => {
 // @route   GET /api/admin/notifications
 // @access  Private/Admin
 export const getNotifications = async (_req: Request, res: Response) => {
-  res.status(200).json({
-    success: true,
-    data: emailService.getRecentActivities(30)
-  })
+  try {
+    const activities = await emailService.loadRecentActivities(50)
+    res.status(200).json({
+      success: true,
+      data: activities
+    })
+  } catch (error) {
+    console.error('Error fetching notifications:', error)
+    res.status(200).json({
+      success: true,
+      data: emailService.getRecentActivities(50)
+    })
+  }
 }
 
 // @desc    Stream real-time system activity notifications via SSE (Admin)
@@ -533,15 +585,26 @@ export const getNotifications = async (_req: Request, res: Response) => {
 // @access  Private/Admin
 export const streamNotifications = (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
   res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
   res.flushHeaders?.()
+
+  res.write(`event: connected\ndata: ${JSON.stringify({ connected: true, timestamp: new Date().toISOString() })}\n\n`)
 
   const onActivity = (event: any) => {
     res.write(`data: ${JSON.stringify(event)}\n\n`)
   }
+  const onSupportSync = (payload: any) => {
+    res.write(`event: support_sync\ndata: ${JSON.stringify(payload)}\n\n`)
+  }
+  const onAnalyticsSync = (payload: any) => {
+    res.write(`event: analytics_sync\ndata: ${JSON.stringify(payload)}\n\n`)
+  }
 
   emailService.activityEmitter.on('activity', onActivity)
+  emailService.activityEmitter.on('support_sync', onSupportSync)
+  emailService.activityEmitter.on('analytics_sync', onAnalyticsSync)
 
   const heartbeat = setInterval(() => {
     res.write(`: heartbeat\n\n`)
@@ -550,6 +613,8 @@ export const streamNotifications = (req: Request, res: Response) => {
   req.on('close', () => {
     clearInterval(heartbeat)
     emailService.activityEmitter.off('activity', onActivity)
+    emailService.activityEmitter.off('support_sync', onSupportSync)
+    emailService.activityEmitter.off('analytics_sync', onAnalyticsSync)
   })
 }
 
@@ -641,6 +706,8 @@ export const replySupportSession = async (req: Request, res: Response) => {
       content: cleanContent
     })
 
+    emailService.emitSupportSync(result.session, 'admin_reply')
+
     // Dispatch SMTP email copy to client (if visitorEmail is provided) and log to Real-Time System Activity stream
     emailService
       .sendSupportReplyNotification(result.session, cleanContent, senderName)
@@ -672,17 +739,40 @@ export const updateSupportSessionStatus = async (req: Request, res: Response) =>
     }
 
     const sessionId = req.params.id
-    const { status, markRead } = req.body
+    const { status, markRead, aiPaused } = req.body
 
     let session = null
+    let changed = false
     if (markRead) {
       session = await databaseService.markSupportSessionRead(sessionId, 'ADMIN')
+      if (session) changed = true
+    }
+    if (typeof aiPaused === 'boolean') {
+      session = await databaseService.setSupportSessionAiMode(sessionId, aiPaused)
+      if (session) changed = true
     }
     if (status === 'OPEN' || status === 'RESOLVED') {
       session = await databaseService.updateSupportSessionStatus(sessionId, status)
+      if (session) {
+        changed = true
+        emailService.recordActivity({
+          type: 'SUPPORT_STATUS_UPDATED',
+          title: `Support Ticket ${status} • ${session.visitorName || 'Visitor'}`,
+          message: `Support conversation (${session.topic || 'General Inquiry'}) marked as ${status}.`,
+          userEmail: session.visitorEmail || undefined,
+          metadata: {
+            sessionId: session.id,
+            status
+          },
+          emailDispatched: false,
+          systemMailDispatched: false
+        })
+      }
     }
     if (!session) {
       session = await databaseService.getSupportSession(sessionId)
+    } else if (changed) {
+      emailService.emitSupportSync(session, 'admin_updated')
     }
 
     res.status(200).json({
@@ -745,6 +835,17 @@ export const updateProductBookingStatus = async (req: Request, res: Response) =>
     }
 
     const updated = await databaseService.updateProductBookingStatus(req.params.id, parsed.data.status)
+    if (!updated) {
+      return res.status(404).json({
+        success: false,
+        error: 'Booking not found'
+      })
+    }
+
+    emailService
+      .sendBookingStatusNotification(updated)
+      .catch((err) => console.error('Booking status notification error:', err))
+
     res.status(200).json({
       success: true,
       message: 'Booking status updated successfully',

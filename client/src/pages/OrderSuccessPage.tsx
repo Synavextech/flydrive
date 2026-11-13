@@ -21,6 +21,7 @@ import {
   generateReceiptText,
   downloadReceiptPdf,
   formatSupportPhone,
+  getSupportContactEmail,
   getSupportWhatsAppDigits
 } from '../utils/receiptPdf'
 import { resolveClientCountryIso2 } from '../data/countries'
@@ -114,7 +115,7 @@ const OrderSuccessPage = () => {
               productId: i.productId || i.id,
               quantity: i.quantity || 1
             })),
-            paymentMethod: 'PAYPAL',
+            paymentMethod: 'PAYPAL' as const,
             shippingAddress: {
               firstName: parsed.shippingData?.firstName || 'Valued',
               lastName: parsed.shippingData?.lastName || 'Customer',
@@ -128,15 +129,19 @@ const OrderSuccessPage = () => {
               country: parsed.shippingData?.country || 'United States',
               countryCode: resolveClientCountryIso2(parsed.shippingData?.country)
             },
-            createAccount: parsed.createAccount,
-            password: parsed.accountPassword,
+            createAccount: Boolean(parsed.createAccount),
+            password: parsed.createAccount ? (parsed.accountPassword || '') : '',
             notes: `Dispatch to ${parsed.shippingData?.city || 'Destination'}, ${parsed.shippingData?.country || 'United States'} (${captureRes.data.paymentId})`
           }
 
           // 2. Finalize and settle order in database
           const createRes = await orderApi.createOrder({
             ...orderPayload,
+            paymentMethod: 'PAYPAL',
             paymentId: captureRes.data.paymentId,
+            paypalOrderId:
+              captureRes.data.orderId ||
+              (typeof payPalToken === 'string' ? payPalToken : parsed.ppOrderId),
             paymentStatus: 'COMPLETED'
           })
 
@@ -203,8 +208,8 @@ const OrderSuccessPage = () => {
             }
 
             // Auto-login if guest account was registered
-            if ((createRes as any).token && (createRes as any).user) {
-              setAuthenticatedUser((createRes as any).user, (createRes as any).token)
+            if (createRes.token && createRes.user) {
+              setAuthenticatedUser(createRes.user, createRes.token)
             }
 
             // Clear cart & cleanup pending state
@@ -621,7 +626,7 @@ const OrderSuccessPage = () => {
                 If you&apos;ve purchased this item, it means you have reviewed the selected model specifications and agreed with our terms and conditions applying to order settlement.
               </p>
               <p>
-                Feel free to contact our Customer Service via email (<span className="text-creamy-500 font-semibold underline">info-eurotopmobility@driveflyelectric.shop</span>) or WhatsApp (<a href={`https://wa.me/${whatsAppDigits}`} target="_blank" rel="noopener noreferrer" className="text-creamy-500 font-semibold underline">{supportPhone}</a>) if you have any questions or concerns. We&apos;re available 24/7.
+                Feel free to contact our Customer Service via email (<a href={`mailto:${getSupportContactEmail()}`} className="text-creamy-500 font-semibold underline">{getSupportContactEmail()}</a>) or WhatsApp (<a href={`https://wa.me/${whatsAppDigits}`} target="_blank" rel="noopener noreferrer" className="text-creamy-500 font-semibold underline">{supportPhone}</a>) if you have any questions or concerns. We&apos;re available 24/7.
               </p>
               <p className="pt-1">Regards,<br />DriveFlyElectric Team<br /><a href="https://driveflyelectric.shop/" target="_blank" rel="noreferrer" className="text-creamy-500 font-semibold hover:underline">https://driveflyelectric.shop/</a></p>
             </div>

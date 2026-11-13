@@ -9,8 +9,11 @@ import {
   User,
   Address,
   SupportSession,
-  SupportSelectedProduct
+  SupportSelectedProduct,
+  AdminAnalyticsData,
+  ProductViewSource
 } from '../types'
+import { setSupportContactEmail } from '../utils/receiptPdf'
 
 // API base URL
 const API_URL = (import.meta as any).env?.VITE_API_URL || '/api'
@@ -246,9 +249,33 @@ export const cartApi = {
   },
 
   // Clear cart
-  clearCart: async (): Promise<ApiResponse<Cart>> => {
+  clearCart: async (visitorId?: string): Promise<ApiResponse<Cart>> => {
     return apiRequest('/cart', {
       method: 'DELETE',
+      body: visitorId ? JSON.stringify({ visitorId }) : undefined,
+    })
+  },
+
+  // Sync guest or authenticated unpaid-cart snapshot for progressive reminders (1h, 6h, 12h, 24h, 48h, 72h)
+  syncReminderSnapshot: async (payload: {
+    email?: string
+    customerName?: string
+    visitorId?: string
+    items?: Array<{ productId: string; quantity: number }>
+  }): Promise<ApiResponse<{ id?: string; itemCount?: number; subtotal?: number }>> => {
+    return apiRequest('/cart/reminder-snapshot', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  clearReminderSnapshot: async (payload: {
+    email?: string
+    visitorId?: string
+  }): Promise<ApiResponse<unknown>> => {
+    return apiRequest('/cart/reminder-snapshot', {
+      method: 'DELETE',
+      body: JSON.stringify(payload),
     })
   },
 }
@@ -267,12 +294,43 @@ export const orderApi = {
 
   // Create order
   createOrder: async (orderData: {
-    items: Array<{ productId: string; quantity: number }>
-    shippingAddressId?: string
-    billingAddressId?: string
+    items?: Array<{ productId: string; quantity: number }>
+    shippingAddressId?: string | null
+    billingAddressId?: string | null
+    shippingAddress?: {
+      email?: string
+      firstName?: string
+      lastName?: string
+      phone?: string
+      company?: string
+      address1?: string
+      address2?: string
+      city?: string
+      state?: string
+      zipCode?: string
+      postalCode?: string
+      country?: string
+      countryCode?: string
+    }
+    customer?: {
+      email?: string
+      firstName?: string
+      lastName?: string
+      phone?: string
+    }
     paymentMethod: 'STRIPE' | 'PAYPAL'
+    paymentId?: string
+    paymentStatus?: string
+    paypalOrderId?: string
+    createAccount?: boolean
+    password?: string
     notes?: string
-  }): Promise<ApiResponse<Order>> => {
+  }): Promise<
+    ApiResponse<Order & { receiptToken?: string }> & {
+      token?: string | null
+      user?: User
+    }
+  > => {
     return apiRequest('/orders', {
       method: 'POST',
       body: JSON.stringify(orderData),
@@ -390,6 +448,11 @@ export const adminApi = {
     lowStockProducts?: any[]
   }>> => {
     return apiRequest('/admin/dashboard')
+  },
+
+  // Get storefront traffic, product checks, and order analytics
+  getAnalytics: async (days: number = 30): Promise<ApiResponse<AdminAnalyticsData>> => {
+    return apiRequest(`/admin/analytics?days=${encodeURIComponent(String(days))}`)
   },
 
   // Products management (Admin)
@@ -513,6 +576,104 @@ export const adminApi = {
     return apiRequest('/admin/notifications')
   },
 
+  // Subscribe to real-time system activity notifications & live support sync over SSE (supports Bearer token & HttpOnly cookies)
+  subscribeNotificationsStream: (
+    onActivity: (event: any) => void,
+    onConnectionChange?: (connected: boolean) => void,
+    onSupportSync?: (payload: { sessionId: string; type?: string; session?: SupportSession }) => void,
+    onAnalyticsSync?: (payload: { kind: string; data?: any; timestamp?: string }) => void
+  ): (() => void) => {
+    let closed = false
+    let controller: AbortController | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let attempt = 0
+
+    const connect = async () => {
+      if (closed) return
+      controller = new AbortController()
+      const token = localStorage.getItem('token')
+      const headers: Record<string, string> = {
+        Accept: 'text/event-stream'
+      }
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
+      try {
+        const response = await fetch(`${API_URL}/admin/notifications/stream`, {
+          method: 'GET',
+          headers,
+          credentials: 'include',
+          signal: controller.signal
+        })
+
+        if (!response.ok || !response.body) {
+          throw new Error(`SSE stream failed with status ${response.status}`)
+        }
+
+        onConnectionChange?.(true)
+        attempt = 0
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (!closed) {
+          const { value, done } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const frames = buffer.split(/\r?\n\r?\n/)
+          buffer = frames.pop() || ''
+
+          for (const frame of frames) {
+            if (!frame.trim() || frame.trim().startsWith(':')) continue
+            let eventName = 'message'
+            const dataLines: string[] = []
+            for (const line of frame.split(/\r?\n/)) {
+              if (line.startsWith('event:')) {
+                eventName = line.slice(6).trim()
+              } else if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trim())
+              }
+            }
+            if (dataLines.length === 0 || eventName === 'connected') continue
+            try {
+              const parsed = JSON.parse(dataLines.join('\n'))
+              if (eventName === 'support_sync') {
+                onSupportSync?.(parsed)
+              } else if (eventName === 'analytics_sync') {
+                onAnalyticsSync?.(parsed)
+              } else if (parsed && parsed.id) {
+                onActivity(parsed)
+              }
+            } catch {
+              // Ignore non-JSON SSE frames
+            }
+          }
+        }
+      } catch (err: any) {
+        if (closed || err?.name === 'AbortError') return
+      }
+
+      if (!closed) {
+        onConnectionChange?.(false)
+        const delayMs = Math.min(15000, 2000 * Math.pow(1.5, attempt))
+        attempt += 1
+        retryTimer = setTimeout(connect, delayMs)
+      }
+    }
+
+    connect()
+
+    return () => {
+      closed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      controller?.abort()
+      onConnectionChange?.(false)
+    }
+  },
+
   // LiveChat & Support session management (admin)
   getSupportSessions: async (): Promise<ApiResponse<SupportSession[]>> => {
     return apiRequest('/admin/support/sessions')
@@ -527,7 +688,7 @@ export const adminApi = {
 
   updateSupportSessionStatus: async (
     sessionId: string,
-    payload: { status?: 'OPEN' | 'RESOLVED'; markRead?: boolean }
+    payload: { status?: 'OPEN' | 'RESOLVED'; markRead?: boolean; aiPaused?: boolean }
   ): Promise<ApiResponse<SupportSession>> => {
     return apiRequest(`/admin/support/sessions/${sessionId}/status`, {
       method: 'PUT',
@@ -553,6 +714,22 @@ export const adminApi = {
 
 // Public Client LiveChat & Support API functions
 export const supportApi = {
+  hasStoredToken: (sessionId: string): boolean => {
+    return Boolean(sessionId && localStorage.getItem(getSupportTokenKey(sessionId)))
+  },
+
+  clearStoredToken: (sessionId: string): void => {
+    if (sessionId) {
+      localStorage.removeItem(getSupportTokenKey(sessionId))
+    }
+  },
+
+  getBeaconHeartbeatUrl: (sessionId: string): string => {
+    const storedToken = sessionId ? localStorage.getItem(getSupportTokenKey(sessionId)) : null
+    const base = `${API_URL}/support/session/${encodeURIComponent(sessionId)}/heartbeat`
+    return storedToken ? `${base}?token=${encodeURIComponent(storedToken)}` : base
+  },
+
   initSession: async (payload: {
     sessionId?: string
     visitorId?: string
@@ -562,10 +739,11 @@ export const supportApi = {
     visitorPhone?: string
     topic?: string
     selectedProducts?: SupportSelectedProduct[]
-  }): Promise<ApiResponse<SupportSession>> => {
+    resumeOnly?: boolean
+  }): Promise<ApiResponse<SupportSession | null>> => {
     const existingId = payload.sessionId
     const storedToken = existingId ? localStorage.getItem(getSupportTokenKey(existingId)) : null
-    const res = await apiRequest<SupportSession>('/support/session', {
+    const res = await apiRequest<SupportSession | null>('/support/session', {
       method: 'POST',
       headers: storedToken ? { 'x-support-token': storedToken } : undefined,
       body: JSON.stringify(payload),
@@ -581,6 +759,105 @@ export const supportApi = {
     return apiRequest(`/support/session/${encodeURIComponent(sessionId)}${isOpen ? '?open=true' : ''}`, {
       headers: storedToken ? { 'x-support-token': storedToken } : undefined,
     })
+  },
+
+  subscribeSessionStream: (
+    sessionId: string,
+    onSessionUpdate: (session: SupportSession) => void,
+    onConnectionChange?: (connected: boolean) => void
+  ): (() => void) => {
+    let closed = false
+    let controller: AbortController | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    let attempt = 0
+
+    const connect = async () => {
+      if (closed || !sessionId) return
+      controller = new AbortController()
+      const authToken = localStorage.getItem('token')
+      const storedSupportToken = localStorage.getItem(getSupportTokenKey(sessionId))
+      const headers: Record<string, string> = {
+        Accept: 'text/event-stream'
+      }
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`
+      }
+      if (storedSupportToken) {
+        headers['x-support-token'] = storedSupportToken
+      }
+
+      try {
+        const response = await fetch(
+          `${API_URL}/support/session/${encodeURIComponent(sessionId)}/stream`,
+          {
+            method: 'GET',
+            headers,
+            credentials: 'include',
+            signal: controller.signal
+          }
+        )
+
+        if (!response.ok || !response.body) {
+          throw new Error(`Support SSE stream failed with status ${response.status}`)
+        }
+
+        onConnectionChange?.(true)
+        attempt = 0
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (!closed) {
+          const { value, done } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const frames = buffer.split(/\r?\n\r?\n/)
+          buffer = frames.pop() || ''
+
+          for (const frame of frames) {
+            if (!frame.trim() || frame.trim().startsWith(':')) continue
+            let eventName = 'message'
+            const dataLines: string[] = []
+            for (const line of frame.split(/\r?\n/)) {
+              if (line.startsWith('event:')) {
+                eventName = line.slice(6).trim()
+              } else if (line.startsWith('data:')) {
+                dataLines.push(line.slice(5).trim())
+              }
+            }
+            if (dataLines.length === 0 || eventName === 'connected') continue
+            try {
+              const parsed = JSON.parse(dataLines.join('\n'))
+              if (eventName === 'session_update' && parsed?.id) {
+                onSessionUpdate(parsed)
+              }
+            } catch {
+              // Ignore non-JSON SSE frames
+            }
+          }
+        }
+      } catch (err: any) {
+        if (closed || err?.name === 'AbortError') return
+      }
+
+      if (!closed) {
+        onConnectionChange?.(false)
+        const delayMs = Math.min(15000, 2500 * Math.pow(1.5, attempt))
+        attempt += 1
+        retryTimer = setTimeout(connect, delayMs)
+      }
+    }
+
+    connect()
+
+    return () => {
+      closed = true
+      if (retryTimer) clearTimeout(retryTimer)
+      controller?.abort()
+      onConnectionChange?.(false)
+    }
   },
 
   sendMessage: async (
@@ -619,17 +896,46 @@ export const supportApi = {
   },
 }
 
+type PaymentConfigPayload = {
+  stripePublishableKey: string
+  paypalClientId: string
+  paypalMerchantId: string
+  paypalMode: string
+  paypalClientToken?: string | null
+  supportEmail?: string
+}
+
+let cachedPaymentConfigPromise: Promise<ApiResponse<PaymentConfigPayload>> | null = null
+let cachedPaymentConfigTimestamp = 0
+
 // Payment API functions (Stripe Card & PayPal JS SDK / Expanded Checkout)
 export const paymentApi = {
-  // Fetch runtime gateway keys and PayPal Client Token for Hosted Card Fields
-  getConfig: async (): Promise<ApiResponse<{
-    stripePublishableKey: string
-    paypalClientId: string
-    paypalMerchantId: string
-    paypalMode: string
-    paypalClientToken?: string | null
-  }>> => {
-    return apiRequest('/payments/config')
+  // Fetch runtime gateway keys, PayPal Client Token, and support contact email
+  // Deduplicates simultaneous mount requests (e.g., Stripe wrapper + PayPal loader)
+  getConfig: async (): Promise<ApiResponse<PaymentConfigPayload>> => {
+    const now = Date.now()
+    if (cachedPaymentConfigPromise && now - cachedPaymentConfigTimestamp < 5000) {
+      return cachedPaymentConfigPromise
+    }
+
+    cachedPaymentConfigTimestamp = now
+    const pending = apiRequest<PaymentConfigPayload>('/payments/config')
+      .then((res) => {
+        if (res.success && res.data?.supportEmail) {
+          setSupportContactEmail(res.data.supportEmail)
+        }
+        if (!res.success) {
+          cachedPaymentConfigPromise = null
+        }
+        return res
+      })
+      .catch((err) => {
+        cachedPaymentConfigPromise = null
+        throw err
+      })
+
+    cachedPaymentConfigPromise = pending
+    return pending
   },
 
   // Create Stripe payment intent (USD) with server-authoritative pricing
@@ -707,4 +1013,66 @@ export const paymentApi = {
       body: JSON.stringify({ orderId }),
     })
   },
+}
+
+function getOrCreateStorageId(storage: Storage, key: string, prefix: string): string {
+  try {
+    const existing = storage.getItem(key)
+    if (existing && existing.trim()) return existing
+    const generated =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `${prefix}_${crypto.randomUUID()}`
+        : `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+    storage.setItem(key, generated)
+    return generated
+  } catch {
+    return `${prefix}_${Date.now()}`
+  }
+}
+
+export const analyticsApi = {
+  getVisitorIds: (): { visitorId: string; sessionKey: string } => {
+    const visitorId = getOrCreateStorageId(localStorage, 'dfe_cart_visitor_id', 'vis')
+    const sessionKey = getOrCreateStorageId(sessionStorage, 'dfe_visit_session_id', 'sess')
+    return { visitorId, sessionKey }
+  },
+
+  trackSiteVisit: async (path: string, referrer?: string): Promise<void> => {
+    if (!path || path.startsWith('/admin')) return
+    const { visitorId, sessionKey } = analyticsApi.getVisitorIds()
+    await apiRequest('/analytics/visit', {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify({
+        visitorId,
+        sessionKey,
+        path,
+        referrer: referrer ?? (typeof document !== 'undefined' ? document.referrer || undefined : undefined)
+      })
+    }).catch(() => undefined)
+  },
+
+  trackProductView: async (input: {
+    productId: string
+    productName?: string
+    productSku?: string | null
+    category?: string | null
+    price?: number
+    imageUrl?: string | null
+    source: ProductViewSource
+    path?: string
+  }): Promise<void> => {
+    if (!input.productId) return
+    const { visitorId, sessionKey } = analyticsApi.getVisitorIds()
+    await apiRequest('/analytics/product-view', {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify({
+        ...input,
+        visitorId,
+        sessionKey,
+        path: input.path || (typeof window !== 'undefined' ? window.location.pathname : undefined)
+      })
+    }).catch(() => undefined)
+  }
 }

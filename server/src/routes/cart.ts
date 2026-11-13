@@ -4,13 +4,27 @@ import {
   addToCart,
   updateCartItem,
   removeFromCart,
-  clearCart
+  clearCart,
+  syncCartReminderSnapshot,
+  clearCartReminderSnapshot
 } from '../controllers/cartController.js'
-import { protect } from '../middleware/auth.js'
+import { optionalAuth, protect } from '../middleware/auth.js'
+import { createRateLimiter } from '../middleware/security.js'
 
 const router = express.Router()
 
-// All cart routes require authentication
+const reminderSnapshotLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyPrefix: 'cart-reminder-snapshot',
+  message: 'Too many cart sync requests. Please wait a moment.'
+})
+
+// Guest & authenticated abandoned-cart reminder snapshot sync
+router.post('/reminder-snapshot', reminderSnapshotLimiter, optionalAuth, syncCartReminderSnapshot)
+router.delete('/reminder-snapshot', reminderSnapshotLimiter, optionalAuth, clearCartReminderSnapshot)
+
+// All cart mutation & read routes below require authentication
 router.use(protect)
 
 // Cart operations

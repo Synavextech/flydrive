@@ -9,11 +9,24 @@ import type {
   Cart,
   CartItem,
   Order,
-  OrderItem,
-  Address
+  Address,
+  SystemActivityRecord,
+  CartReminderItem,
+  CartReminderRecord,
+  CartReminderStatus,
+  DeviceCategory,
+  ProductViewRecord,
+  ProductViewSource,
+  SiteVisitRecord,
+  TrafficAnalyticsSummary
 } from '../types/database.js'
 import crypto from 'crypto'
-import { sanitizePostgrestSearch, getFormattedSupportWhatsApp } from '../middleware/security.js'
+import {
+  sanitizePostgrestSearch,
+  getAdminContactEmail,
+  getFormattedSupportWhatsApp,
+  isValidEmailAddress
+} from '../middleware/security.js'
 
 const { Pool } = pg
 
@@ -21,6 +34,10 @@ export class DatabaseService {
   public supabase: SupabaseClient
   public pool: pg.Pool | null = null
   private reviewsMemoryCache: Map<string, ProductReview[]> = new Map()
+  private cartRemindersMemoryCache: Map<string, CartReminderRecord> = new Map()
+  private siteVisitsMemoryCache: SiteVisitRecord[] = []
+  private productViewsMemoryCache: ProductViewRecord[] = []
+  private analyticsDedupeCache: Map<string, number> = new Map()
 
   constructor(client: SupabaseClient = supabase) {
     this.supabase = client
@@ -1114,12 +1131,42 @@ export class DatabaseService {
   }
 
   async updateOrderStatus(id: string, status: string): Promise<Order> {
+    return this.updateOrderPaymentAndStatus(id, { status: status as Order['status'] })
+  }
+
+  async updateOrderPaymentAndStatus(
+    id: string,
+    updates: {
+      status?: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
+      paymentStatus?: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
+      paymentVerified?: boolean
+    }
+  ): Promise<Order> {
+    const payload: Record<string, any> = {
+      updated_at: new Date().toISOString()
+    }
+    if (updates.status !== undefined) payload.status = updates.status
+    if (updates.paymentStatus !== undefined) payload.payment_status = updates.paymentStatus
+    if (updates.paymentVerified !== undefined) payload.payment_verified = updates.paymentVerified
+
     const { data, error } = await this.supabase
       .from('orders')
-      .update({ status, updated_at: new Date().toISOString() })
+      .update(payload)
       .eq('id', id)
       .select('*, order_items(*, products(*)), users(*), shipping_address:addresses!orders_shipping_address_id_fkey(*)')
       .single()
+
+    if (error && updates.paymentVerified !== undefined) {
+      delete payload.payment_verified
+      const retry = await this.supabase
+        .from('orders')
+        .update(payload)
+        .eq('id', id)
+        .select('*, order_items(*, products(*)), users(*), shipping_address:addresses!orders_shipping_address_id_fkey(*)')
+        .single()
+      if (retry.error) throw retry.error
+      return this.mapOrder(retry.data)
+    }
 
     if (error) throw error
     return this.mapOrder(data)
@@ -1187,6 +1234,10 @@ export class DatabaseService {
       .select('*')
       .eq('user_id', userId)
       .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error('Error fetching user addresses:', error.message)
+    }
 
     return (data || []).map(a => this.mapAddress(a))
   }
@@ -1272,15 +1323,159 @@ export class DatabaseService {
     return { isOnline: false, lastSeenText: `Last online ~${diffDays}d ago` }
   }
 
+  private formatRegisteredFullName(userRecord: any): string {
+    if (!userRecord) return ''
+    return `${userRecord.firstName || userRecord.first_name || ''} ${userRecord.lastName || userRecord.last_name || ''}`.trim()
+  }
+
+  private isGenericVisitorName(name?: string | null): boolean {
+    const clean = String(name || '').trim().toLowerCase()
+    return !clean || clean === 'store visitor' || clean === 'visitor' || clean === 'guest'
+  }
+
+  private applyRegisteredUserToSession(
+    session: any,
+    userRecord: any,
+    explicitOverrides?: { visitorName?: string; visitorEmail?: string; visitorPhone?: string }
+  ): void {
+    if (!session || !userRecord?.id) return
+    session.userId = userRecord.id
+
+    const regName = this.formatRegisteredFullName(userRecord)
+    const regEmail = String(userRecord.email || '').trim()
+    const regPhone = String(userRecord.phone || '').trim()
+
+    if (regName && (this.isGenericVisitorName(session.visitorName) || !explicitOverrides?.visitorName)) {
+      session.visitorName = regName
+    } else if (explicitOverrides?.visitorName) {
+      session.visitorName = explicitOverrides.visitorName
+    }
+
+    if (regEmail) {
+      session.visitorEmail = regEmail
+    } else if (explicitOverrides?.visitorEmail) {
+      session.visitorEmail = explicitOverrides.visitorEmail
+    }
+
+    if (explicitOverrides?.visitorPhone) {
+      session.visitorPhone = explicitOverrides.visitorPhone
+    } else if (regPhone && !session.visitorPhone) {
+      session.visitorPhone = regPhone
+    }
+  }
+
   private enrichSupportSession(session: any): any {
     const presence = this.formatRelativePresence(session.lastSeenAt, session.isOnline)
+    const messages = Array.isArray(session.messages) ? session.messages : []
+    const aiMode = session.aiMode || messages[0]?.metadata?.aiMode || 'AUTO'
+    const recentAdminMsg = messages
+      .slice()
+      .reverse()
+      .find((m: any) => m.senderRole === 'ADMIN')
+    const adminWithinCooldown =
+      Boolean(recentAdminMsg) &&
+      Date.now() - new Date(recentAdminMsg.createdAt).getTime() < 30 * 60 * 1000
+
+    const aiPaused =
+      session.status === 'RESOLVED'
+        ? false
+        : aiMode === 'PAUSED'
+        ? true
+        : aiMode === 'ACTIVE'
+        ? false
+        : adminWithinCooldown
+
     return {
       ...session,
       isOnline: presence.isOnline,
       lastSeenText: presence.lastSeenText,
+      isRegisteredUser: Boolean(session.userId),
+      aiPaused,
       selectedProducts: Array.isArray(session.selectedProducts) ? session.selectedProducts : [],
-      messages: Array.isArray(session.messages) ? session.messages : []
+      messages
     }
+  }
+
+  async findSupportSessionByUserId(userId: string, email?: string): Promise<any | null> {
+    if (!userId && !email) return null
+    const normalizedEmail = email ? email.trim().toLowerCase() : ''
+
+    // 1. Check dedicated support_sessions table by user_id, then email
+    try {
+      if (userId) {
+        const { data: byUser } = await this.supabase
+          .from('support_sessions')
+          .select('id')
+          .eq('user_id', userId)
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+
+        if (byUser?.id) {
+          const loaded = await this.getSupportSession(byUser.id)
+          if (loaded) return loaded
+        }
+      }
+
+      if (normalizedEmail) {
+        const { data: byEmail } = await this.supabase
+          .from('support_sessions')
+          .select('id')
+          .ilike('visitor_email', normalizedEmail)
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+
+        if (byEmail?.id) {
+          const loaded = await this.getSupportSession(byEmail.id)
+          if (loaded) return loaded
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    // 2. Check memory cache
+    const cacheCandidates = Array.from(this.supportMemoryCache.values())
+      .filter((s: any) =>
+        (userId && s.userId === userId) ||
+        (normalizedEmail && String(s.visitorEmail || '').trim().toLowerCase() === normalizedEmail)
+      )
+      .sort((a: any, b: any) =>
+        new Date(b.updatedAt || b.lastSeenAt || 0).getTime() - new Date(a.updatedAt || a.lastSeenAt || 0).getTime()
+      )
+    if (cacheCandidates.length > 0) {
+      return this.enrichSupportSession(cacheCandidates[0])
+    }
+
+    // 3. Check events fallback
+    try {
+      const { data: evRows } = await this.supabase
+        .from('events')
+        .select('*')
+        .eq('category', 'LIVECHAT_SESSION')
+        .order('updated_at', { ascending: false })
+        .limit(100)
+
+      for (const ev of evRows || []) {
+        if (!ev.description) continue
+        try {
+          const parsed = JSON.parse(ev.description)
+          const emailMatch =
+            normalizedEmail && String(parsed.visitorEmail || '').trim().toLowerCase() === normalizedEmail
+          if ((userId && parsed.userId === userId) || emailMatch) {
+            this.supportMemoryCache.set(parsed.id, parsed)
+            return this.enrichSupportSession(parsed)
+          }
+        } catch {
+          // Ignore malformed JSON
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return null
   }
 
   private async persistSupportSessionToDb(session: any): Promise<void> {
@@ -1308,28 +1503,38 @@ export class DatabaseService {
           updated_at: session.updatedAt || new Date().toISOString()
         }, { onConflict: 'id' })
 
-      if (!sessionErr && Array.isArray(session.messages) && session.messages.length > 0) {
-        const lastMsg = session.messages[session.messages.length - 1]
-        if (lastMsg && lastMsg.id) {
-          await this.supabase
-            .from('support_messages')
-            .upsert({
-              id: lastMsg.id,
-              session_id: session.id,
-              sender_role: lastMsg.senderRole || 'CLIENT',
-              sender_name: lastMsg.senderName || 'Visitor',
-              content: lastMsg.content || '',
-              metadata: lastMsg.metadata || {},
-              created_at: lastMsg.createdAt || new Date().toISOString()
-            }, { onConflict: 'id' })
+      if (!sessionErr) {
+        const validMessages = Array.isArray(session.messages)
+          ? session.messages.filter((m: any) => m && m.id)
+          : []
+
+        if (validMessages.length === 0) {
+          return
         }
-        return
+
+        const messageRows = validMessages.map((m: any) => ({
+          id: m.id,
+          session_id: session.id,
+          sender_role: m.senderRole || 'CLIENT',
+          sender_name: m.senderName || session.visitorName || 'Store Visitor',
+          content: m.content || '',
+          metadata: m.metadata || {},
+          created_at: m.createdAt || new Date().toISOString()
+        }))
+
+        const { error: msgErr } = await this.supabase
+          .from('support_messages')
+          .upsert(messageRows, { onConflict: 'id' })
+
+        if (!msgErr) {
+          return
+        }
       }
     } catch {
       // Fallback to public.events below
     }
 
-    // 2. Fallback persistence in public.events (category = 'LIVECHAT_SESSION') so database persistence works even before running SQL migration
+    // 2. Fallback persistence in public.events (category = 'LIVECHAT_SESSION') so full history persists cleanly
     try {
       const todayDate = new Date().toISOString().slice(0, 10)
       await this.supabase
@@ -1340,7 +1545,7 @@ export class DatabaseService {
           description: JSON.stringify(session),
           date: todayDate,
           time: session.lastSeenAt || new Date().toISOString(),
-          location: session.visitorEmail || session.visitorId || session.id,
+          location: session.userId || session.visitorEmail || session.visitorId || session.id,
           category: 'LIVECHAT_SESSION',
           status: session.status === 'RESOLVED' ? 'past' : 'upcoming',
           updated_at: new Date().toISOString()
@@ -1393,6 +1598,12 @@ export class DatabaseService {
             metadata: m.metadata || {},
             createdAt: m.created_at
           }))
+        }
+        if (built.userId && (this.isGenericVisitorName(built.visitorName) || !built.visitorEmail)) {
+          const matchedUser = await this.findUserById(built.userId).catch(() => null)
+          if (matchedUser) {
+            this.applyRegisteredUserToSession(built, matchedUser)
+          }
         }
         this.supportMemoryCache.set(sessionId, built)
         return this.enrichSupportSession(built)
@@ -1513,7 +1724,22 @@ export class DatabaseService {
       // Ignore
     }
 
-    return Array.from(sessionMap.values())
+    const hydrated = Array.from(sessionMap.values())
+    const userCache = new Map<string, any>()
+    for (const sess of hydrated) {
+      if (sess.userId && (this.isGenericVisitorName(sess.visitorName) || !sess.visitorEmail)) {
+        let matchedUser = userCache.get(sess.userId)
+        if (matchedUser === undefined) {
+          matchedUser = await this.findUserById(sess.userId).catch(() => null)
+          userCache.set(sess.userId, matchedUser)
+        }
+        if (matchedUser) {
+          this.applyRegisteredUserToSession(sess, matchedUser)
+        }
+      }
+    }
+
+    return hydrated
       .map(s => this.enrichSupportSession(s))
       .sort((a, b) => new Date(b.updatedAt || b.lastSeenAt).getTime() - new Date(a.updatedAt || a.lastSeenAt).getTime())
   }
@@ -1522,26 +1748,77 @@ export class DatabaseService {
     sessionId?: string
     visitorId?: string
     userId?: string
+    registeredUser?: any
     visitorName?: string
     visitorEmail?: string
     visitorPhone?: string
     topic?: string
     selectedProducts?: any[]
-  }): Promise<any> {
-    const sessionId = payload.sessionId || payload.visitorId || `chat_${crypto.randomUUID()}`
+    resumeOnly?: boolean
+  }): Promise<any | null> {
+    const requestedSessionId = payload.sessionId || payload.visitorId || `chat_${crypto.randomUUID()}`
     const nowIso = new Date().toISOString()
-    const existing = await this.getSupportSession(sessionId)
 
-    const mergedProducts = payload.selectedProducts !== undefined
+    const authUser =
+      payload.registeredUser?.id
+        ? payload.registeredUser
+        : payload.userId
+        ? await this.findUserById(payload.userId).catch(() => null)
+        : null
+
+    let existing = await this.getSupportSession(requestedSessionId)
+
+    // For registered users, link/resume their canonical account-owned session so history & admin replies follow them across logins/devices
+    let canonicalSessionId = requestedSessionId
+    if (authUser?.id) {
+      const accountSession = await this.findSupportSessionByUserId(authUser.id, authUser.email)
+      if (accountSession) {
+        if (existing && existing.id !== accountSession.id) {
+          const transferableMessages = (existing.messages || []).filter(
+            (m: any) => !(m.senderRole === 'AI_ASSISTANT' && m.metadata?.type === 'welcome')
+          )
+          const existingMsgIds = new Set((accountSession.messages || []).map((m: any) => m.id))
+          const mergedMessages = [
+            ...(accountSession.messages || []),
+            ...transferableMessages
+              .filter((m: any) => m.id && !existingMsgIds.has(m.id))
+              .map((m: any) => ({ ...m, sessionId: accountSession.id }))
+          ].sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+
+          const existingProdIds = new Set((accountSession.selectedProducts || []).map((p: any) => p.id))
+          const mergedGuestProducts = [
+            ...(accountSession.selectedProducts || []),
+            ...((existing.selectedProducts || []).filter((p: any) => p?.id && !existingProdIds.has(p.id)))
+          ]
+          accountSession.messages = mergedMessages
+          accountSession.selectedProducts = mergedGuestProducts
+          if (existing.unreadAdminCount) {
+            accountSession.unreadAdminCount = Number(accountSession.unreadAdminCount || 0) + Number(existing.unreadAdminCount || 0)
+          }
+        }
+        existing = accountSession
+        canonicalSessionId = accountSession.id
+      }
+    }
+
+    if (payload.resumeOnly && !existing) {
+      return null
+    }
+
+    const mergedProducts = payload.resumeOnly
+      ? (existing?.selectedProducts || payload.selectedProducts || [])
+      : payload.selectedProducts !== undefined
       ? payload.selectedProducts
       : (existing?.selectedProducts || [])
 
-    const nextTopic = payload.topic || existing?.topic || 'General Inquiry'
+    const nextTopic = payload.resumeOnly
+      ? (existing?.topic || payload.topic || 'General Inquiry')
+      : (payload.topic || existing?.topic || 'General Inquiry')
 
     const session: any = {
-      id: sessionId,
-      visitorId: payload.visitorId || existing?.visitorId || sessionId,
-      userId: payload.userId || existing?.userId,
+      id: canonicalSessionId,
+      visitorId: existing?.visitorId || payload.visitorId || canonicalSessionId,
+      userId: authUser?.id || payload.userId || existing?.userId,
       visitorName: payload.visitorName || existing?.visitorName || 'Store Visitor',
       visitorEmail: payload.visitorEmail || existing?.visitorEmail || '',
       visitorPhone: payload.visitorPhone || existing?.visitorPhone || '',
@@ -1557,11 +1834,19 @@ export class DatabaseService {
       messages: existing?.messages || []
     }
 
+    if (authUser) {
+      this.applyRegisteredUserToSession(session, authUser, {
+        visitorName: payload.visitorName,
+        visitorEmail: payload.visitorEmail,
+        visitorPhone: payload.visitorPhone
+      })
+    }
+
     // Seed welcome message if new session
     if (session.messages.length === 0) {
       const welcomeMsg = {
         id: `msg_${crypto.randomUUID()}`,
-        sessionId,
+        sessionId: canonicalSessionId,
         senderRole: 'AI_ASSISTANT',
         senderName: 'DriveFlyElectric Concierge',
         content: `Welcome to DriveFlyElectric Support! Select an inquiry topic above (Payment Issue, Item Purchase, General Inquiry, or Shipping Issue) or pick the rigs you're looking to buy today from our catalogue, and I'll assist you immediately or connect you with a live specialist.`,
@@ -1582,8 +1867,12 @@ export class DatabaseService {
     const nowIso = new Date().toISOString()
     existing.isOnline = Boolean(isOnline)
     existing.lastSeenAt = nowIso
-    if (visitorMeta?.visitorName) existing.visitorName = visitorMeta.visitorName
-    if (visitorMeta?.visitorEmail) existing.visitorEmail = visitorMeta.visitorEmail
+    if (visitorMeta?.visitorName && !this.isGenericVisitorName(visitorMeta.visitorName)) {
+      existing.visitorName = visitorMeta.visitorName
+    }
+    if (visitorMeta?.visitorEmail && !existing.userId) {
+      existing.visitorEmail = visitorMeta.visitorEmail
+    }
 
     await this.persistSupportSessionToDb(existing)
     return this.enrichSupportSession(existing)
@@ -1602,11 +1891,44 @@ export class DatabaseService {
     return this.enrichSupportSession(existing)
   }
 
+  async setSupportSessionAiMode(sessionId: string, aiPaused: boolean): Promise<any | null> {
+    const existing = await this.getSupportSession(sessionId)
+    if (!existing) return null
+
+    const nextMode = aiPaused ? 'PAUSED' : 'ACTIVE'
+    existing.aiMode = nextMode
+    if (Array.isArray(existing.messages) && existing.messages.length > 0) {
+      existing.messages[0] = {
+        ...existing.messages[0],
+        metadata: {
+          ...(existing.messages[0].metadata || {}),
+          aiMode: nextMode
+        }
+      }
+    }
+    existing.updatedAt = new Date().toISOString()
+    await this.persistSupportSessionToDb(existing)
+    return this.enrichSupportSession(existing)
+  }
+
   async updateSupportSessionStatus(sessionId: string, status: 'OPEN' | 'RESOLVED'): Promise<any | null> {
     const existing = await this.getSupportSession(sessionId)
     if (!existing) return null
 
     existing.status = status
+    if (status === 'RESOLVED') {
+      existing.unreadAdminCount = 0
+      existing.aiMode = 'AUTO'
+      if (Array.isArray(existing.messages) && existing.messages.length > 0 && existing.messages[0]?.metadata?.aiMode) {
+        existing.messages[0] = {
+          ...existing.messages[0],
+          metadata: {
+            ...existing.messages[0].metadata,
+            aiMode: 'AUTO'
+          }
+        }
+      }
+    }
     existing.updatedAt = new Date().toISOString()
     await this.persistSupportSessionToDb(existing)
     return this.enrichSupportSession(existing)
@@ -1698,7 +2020,7 @@ export class DatabaseService {
     }
 
     // 4. General Inquiry & Store Details Acquisition
-    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA\n• **Official Support Email**: info-eurotopmobility@driveflyelectric.shop\n• **WhatsApp Support Line**: ${getFormattedSupportWhatsApp()}\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your fleet selection today?${contactPrompt}`
+    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA\n• **Official Support Email**: ${getAdminContactEmail()}\n• **WhatsApp Support Line**: ${getFormattedSupportWhatsApp()}\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your fleet selection today?${contactPrompt}`
   }
 
   async appendSupportMessage(
@@ -1709,15 +2031,26 @@ export class DatabaseService {
       content: string
       topic?: string
       selectedProducts?: any[]
+      userId?: string
+      registeredUser?: any
       visitorName?: string
       visitorEmail?: string
       visitorPhone?: string
     }
   ): Promise<{ session: any; newMessages: any[] }> {
+    const authUser =
+      messageInput.registeredUser?.id
+        ? messageInput.registeredUser
+        : messageInput.userId
+        ? await this.findUserById(messageInput.userId).catch(() => null)
+        : null
+
     let session = await this.getSupportSession(sessionId)
     if (!session) {
       session = await this.upsertSupportSession({
         sessionId,
+        userId: authUser?.id || messageInput.userId,
+        registeredUser: authUser,
         visitorName: messageInput.visitorName,
         visitorEmail: messageInput.visitorEmail,
         visitorPhone: messageInput.visitorPhone,
@@ -1732,6 +2065,17 @@ export class DatabaseService {
     if (messageInput.visitorName) session.visitorName = messageInput.visitorName
     if (messageInput.visitorEmail) session.visitorEmail = messageInput.visitorEmail
     if (messageInput.visitorPhone) session.visitorPhone = messageInput.visitorPhone
+
+    // Bind & backfill registered customer account profile onto session before writing the message
+    const effectiveUser =
+      authUser || (session.userId ? await this.findUserById(session.userId).catch(() => null) : null)
+    if (effectiveUser) {
+      this.applyRegisteredUserToSession(session, effectiveUser, {
+        visitorName: messageInput.visitorName,
+        visitorEmail: messageInput.visitorEmail,
+        visitorPhone: messageInput.visitorPhone
+      })
+    }
 
     const primaryMsg = {
       id: `msg_${crypto.randomUUID()}`,
@@ -1763,22 +2107,28 @@ export class DatabaseService {
     } else if (messageInput.senderRole === 'ADMIN') {
       session.unreadClientCount = Number(session.unreadClientCount || 0) + 1
       session.unreadAdminCount = 0
+      if (session.aiMode === 'ACTIVE' || session.messages?.[0]?.metadata?.aiMode === 'ACTIVE') {
+        session.aiMode = 'AUTO'
+        if (session.messages?.[0]) {
+          session.messages[0] = {
+            ...session.messages[0],
+            metadata: {
+              ...(session.messages[0].metadata || {}),
+              aiMode: 'AUTO'
+            }
+          }
+        }
+      }
     }
 
     await this.persistSupportSessionToDb(session)
     const createdList: any[] = [primaryMsg]
 
-    // If message is from CLIENT, generate an immediate intelligent assistant reply unless an ADMIN just replied within the last 2 minutes
+    // Generate immediate AI Concierge reply for CLIENT messages unless Admin is actively handling the ticket or explicitly paused AI
     if (messageInput.senderRole === 'CLIENT') {
-      const recentAdminMsg = (session.messages || [])
-        .slice()
-        .reverse()
-        .find((m: any) => m.senderRole === 'ADMIN')
-      const adminRecentlyActive =
-        recentAdminMsg &&
-        Date.now() - new Date(recentAdminMsg.createdAt).getTime() < 2 * 60 * 1000
+      const enrichedBeforeAi = this.enrichSupportSession(session)
 
-      if (!adminRecentlyActive) {
+      if (!enrichedBeforeAi.aiPaused) {
         const aiReplyContent = await this.generateIntelligentSupportReply(session, messageInput.content)
         const aiMsg = {
           id: `msg_${crypto.randomUUID()}`,
@@ -1992,6 +2342,1379 @@ export class DatabaseService {
     return existing
   }
 
+  // ==================== REAL-TIME SYSTEM ACTIVITY PERSISTENCE ====================
+  public mapSystemActivity(raw: any): SystemActivityRecord {
+    return {
+      id: raw.id,
+      type: raw.type || 'ORDER_STATUS_UPDATED',
+      title: raw.title || '',
+      message: raw.message || '',
+      userEmail: raw.user_email ?? raw.userEmail ?? undefined,
+      orderNumber: raw.order_number ?? raw.orderNumber ?? undefined,
+      amount: raw.amount !== null && raw.amount !== undefined ? Number(raw.amount) : undefined,
+      metadata: raw.metadata && typeof raw.metadata === 'object' ? raw.metadata : undefined,
+      emailDispatched: Boolean(raw.email_dispatched ?? raw.emailDispatched ?? false),
+      systemMailDispatched: Boolean(raw.system_mail_dispatched ?? raw.systemMailDispatched ?? false),
+      timestamp: raw.created_at || raw.timestamp || new Date().toISOString()
+    }
+  }
+
+  async recordSystemActivity(activity: SystemActivityRecord): Promise<void> {
+    const createdAt = activity.timestamp || new Date().toISOString()
+
+    // 1. Primary persistence in dedicated public.system_activities table
+    try {
+      const { error } = await this.supabase
+        .from('system_activities')
+        .upsert({
+          id: activity.id,
+          type: activity.type,
+          title: activity.title,
+          message: activity.message,
+          user_email: activity.userEmail || null,
+          order_number: activity.orderNumber || null,
+          amount: activity.amount !== undefined && activity.amount !== null ? Number(activity.amount) : null,
+          metadata: activity.metadata || {},
+          email_dispatched: Boolean(activity.emailDispatched),
+          system_mail_dispatched: Boolean(activity.systemMailDispatched),
+          created_at: createdAt
+        }, { onConflict: 'id' })
+
+      if (!error) return
+    } catch {
+      // Fallback below
+    }
+
+    // 2. PostgreSQL pool fallback for system_activities
+    if (this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.system_activities
+           (id, type, title, message, user_email, order_number, amount, metadata, email_dispatched, system_mail_dispatched, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            activity.id,
+            activity.type,
+            activity.title,
+            activity.message,
+            activity.userEmail || null,
+            activity.orderNumber || null,
+            activity.amount !== undefined && activity.amount !== null ? Number(activity.amount) : null,
+            JSON.stringify(activity.metadata || {}),
+            Boolean(activity.emailDispatched),
+            Boolean(activity.systemMailDispatched),
+            createdAt
+          ]
+        )
+        return
+      } catch {
+        // Fallback to public.events below
+      }
+    }
+
+    // 3. Zero-downtime fallback in public.events (category = 'SYSTEM_ACTIVITY')
+    try {
+      await this.supabase
+        .from('events')
+        .upsert({
+          id: activity.id,
+          title: `ACTIVITY:${activity.type}:${activity.title.slice(0, 80)}`,
+          description: JSON.stringify(activity),
+          date: createdAt.slice(0, 10),
+          time: createdAt,
+          location: activity.orderNumber || activity.userEmail || activity.type,
+          category: 'SYSTEM_ACTIVITY',
+          status: 'past',
+          updated_at: createdAt
+        }, { onConflict: 'id' })
+    } catch {
+      // Non-fatal: in-memory buffer + SSE still live
+    }
+  }
+
+  async listSystemActivities(limit: number = 50): Promise<SystemActivityRecord[]> {
+    const activityMap = new Map<string, SystemActivityRecord>()
+    const safeLimit = Math.min(200, Math.max(1, limit))
+
+    // 1. Read from dedicated public.system_activities table
+    try {
+      const { data, error } = await this.supabase
+        .from('system_activities')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(safeLimit)
+
+      if (!error && Array.isArray(data)) {
+        for (const row of data) {
+          const mapped = this.mapSystemActivity(row)
+          activityMap.set(mapped.id, mapped)
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    // 2. Fallback via PostgreSQL pool if empty
+    if (activityMap.size === 0 && this.pool) {
+      try {
+        const res = await this.pool.query(
+          'SELECT * FROM public.system_activities ORDER BY created_at DESC LIMIT $1',
+          [safeLimit]
+        )
+        for (const row of res.rows) {
+          const mapped = this.mapSystemActivity(row)
+          activityMap.set(mapped.id, mapped)
+        }
+      } catch {
+        // Fallback to events below
+      }
+    }
+
+    // 3. Fallback / historical records from public.events (category = 'SYSTEM_ACTIVITY')
+    if (activityMap.size < safeLimit) {
+      try {
+        const { data: evRows } = await this.supabase
+          .from('events')
+          .select('*')
+          .eq('category', 'SYSTEM_ACTIVITY')
+          .order('time', { ascending: false })
+          .limit(safeLimit)
+
+        for (const ev of evRows || []) {
+          if (ev.description && !activityMap.has(ev.id)) {
+            try {
+              const parsed = this.mapSystemActivity(JSON.parse(ev.description))
+              activityMap.set(parsed.id, parsed)
+            } catch {
+              // Skip malformed record
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    return Array.from(activityMap.values())
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, safeLimit)
+  }
+
+  // ==================== UNPAID CART REMINDER SNAPSHOTS ====================
+  private deriveCartReminderId(reminderKey: string): string {
+    return `cartrem_${crypto.createHash('sha256').update(reminderKey).digest('hex').slice(0, 24)}`
+  }
+
+  private buildCartSignature(items: CartReminderItem[]): string {
+    return items
+      .map((item) => ({ productId: String(item.productId), quantity: Number(item.quantity || 1) }))
+      .sort((a, b) => a.productId.localeCompare(b.productId))
+      .map((item) => `${item.productId}:${item.quantity}`)
+      .join('|')
+  }
+
+  private mapCartReminder(raw: any): CartReminderRecord {
+    let parsedItems: CartReminderItem[] = []
+    const rawItems = raw.items
+    if (Array.isArray(rawItems)) {
+      parsedItems = rawItems
+    } else if (typeof rawItems === 'string') {
+      try {
+        const dec = JSON.parse(rawItems)
+        if (Array.isArray(dec)) parsedItems = dec
+      } catch {
+        parsedItems = []
+      }
+    }
+
+    const rawStages = raw.sent_stages ?? raw.sentStages
+    const sentStages = Array.isArray(rawStages)
+      ? Array.from(new Set(rawStages.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n)))).sort((a, b) => a - b)
+      : []
+
+    const nowIso = new Date().toISOString()
+    return {
+      id: String(raw.id),
+      reminderKey: String(raw.reminder_key || raw.reminderKey),
+      userId: raw.user_id ?? raw.userId ?? null,
+      visitorId: raw.visitor_id ?? raw.visitorId ?? null,
+      email: String(raw.email || '').trim().toLowerCase(),
+      customerName: raw.customer_name ?? raw.customerName ?? null,
+      items: parsedItems.map((it) => ({
+        productId: String(it.productId),
+        name: String(it.name || 'DriveFlyElectric Vehicle'),
+        price: Number(it.price || 0),
+        quantity: Math.max(1, Number(it.quantity || 1)),
+        image: it.image ? String(it.image) : undefined
+      })),
+      itemCount: Number(raw.item_count ?? raw.itemCount ?? parsedItems.reduce((s, it) => s + Number(it.quantity || 1), 0)),
+      subtotal: Number(raw.subtotal || 0),
+      cartSignature: String(raw.cart_signature ?? raw.cartSignature ?? ''),
+      status: (raw.status || 'ACTIVE') as CartReminderStatus,
+      sentStages,
+      lastSentStage: Number(raw.last_sent_stage ?? raw.lastSentStage ?? 0),
+      lastRemindedAt: raw.last_reminded_at || raw.lastRemindedAt || null,
+      completedOrderNumber: raw.completed_order_number || raw.completedOrderNumber || null,
+      cartUpdatedAt: raw.cart_updated_at || raw.cartUpdatedAt || nowIso,
+      createdAt: raw.created_at || raw.createdAt || nowIso,
+      updatedAt: raw.updated_at || raw.updatedAt || nowIso
+    }
+  }
+
+  private async persistCartReminderRecord(record: CartReminderRecord): Promise<void> {
+    this.cartRemindersMemoryCache.set(record.reminderKey, record)
+
+    let persisted = false
+    try {
+      const { error } = await this.supabase
+        .from('cart_reminders')
+        .upsert(
+          {
+            id: record.id,
+            reminder_key: record.reminderKey,
+            user_id: record.userId || null,
+            visitor_id: record.visitorId || null,
+            email: record.email,
+            customer_name: record.customerName || null,
+            items: record.items,
+            item_count: record.itemCount,
+            subtotal: record.subtotal,
+            cart_signature: record.cartSignature,
+            status: record.status,
+            sent_stages: record.sentStages,
+            last_sent_stage: record.lastSentStage,
+            last_reminded_at: record.lastRemindedAt || null,
+            completed_order_number: record.completedOrderNumber || null,
+            cart_updated_at: record.cartUpdatedAt,
+            created_at: record.createdAt,
+            updated_at: record.updatedAt
+          },
+          { onConflict: 'reminder_key' }
+        )
+      if (!error) persisted = true
+    } catch {
+      // Fallback below
+    }
+
+    if (!persisted && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.cart_reminders
+           (id, reminder_key, user_id, visitor_id, email, customer_name, items, item_count, subtotal, cart_signature, status, sent_stages, last_sent_stage, last_reminded_at, completed_order_number, cart_updated_at, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12::integer[], $13, $14, $15, $16, $17, $18)
+           ON CONFLICT (reminder_key) DO UPDATE SET
+             user_id = EXCLUDED.user_id,
+             visitor_id = EXCLUDED.visitor_id,
+             email = EXCLUDED.email,
+             customer_name = EXCLUDED.customer_name,
+             items = EXCLUDED.items,
+             item_count = EXCLUDED.item_count,
+             subtotal = EXCLUDED.subtotal,
+             cart_signature = EXCLUDED.cart_signature,
+             status = EXCLUDED.status,
+             sent_stages = EXCLUDED.sent_stages,
+             last_sent_stage = EXCLUDED.last_sent_stage,
+             last_reminded_at = EXCLUDED.last_reminded_at,
+             completed_order_number = EXCLUDED.completed_order_number,
+             cart_updated_at = EXCLUDED.cart_updated_at,
+             updated_at = EXCLUDED.updated_at`,
+          [
+            record.id,
+            record.reminderKey,
+            record.userId || null,
+            record.visitorId || null,
+            record.email,
+            record.customerName || null,
+            JSON.stringify(record.items),
+            record.itemCount,
+            record.subtotal,
+            record.cartSignature,
+            record.status,
+            record.sentStages,
+            record.lastSentStage,
+            record.lastRemindedAt || null,
+            record.completedOrderNumber || null,
+            record.cartUpdatedAt,
+            record.createdAt,
+            record.updatedAt
+          ]
+        )
+        persisted = true
+      } catch {
+        // Fallback to public.events below
+      }
+    }
+
+    if (!persisted) {
+      try {
+        await this.supabase
+          .from('events')
+          .upsert(
+            {
+              id: record.id,
+              title: `CART_REMINDER:${record.email}:${record.itemCount}`,
+              description: JSON.stringify(record),
+              date: record.cartUpdatedAt.slice(0, 10),
+              time: record.updatedAt,
+              location: record.email,
+              category: 'CART_REMINDER',
+              status: record.status,
+              updated_at: record.updatedAt
+            },
+            { onConflict: 'id' }
+          )
+      } catch {
+        // Non-fatal: retained in memory cache
+      }
+    }
+  }
+
+  async findCartReminderByKey(reminderKey: string): Promise<CartReminderRecord | null> {
+    const cached = this.cartRemindersMemoryCache.get(reminderKey)
+    if (cached) return cached
+
+    try {
+      const { data, error } = await this.supabase
+        .from('cart_reminders')
+        .select('*')
+        .eq('reminder_key', reminderKey)
+        .maybeSingle()
+      if (!error && data) {
+        const mapped = this.mapCartReminder(data)
+        this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+        return mapped
+      }
+    } catch {
+      // Fallback below
+    }
+
+    if (this.pool) {
+      try {
+        const res = await this.pool.query(
+          'SELECT * FROM public.cart_reminders WHERE reminder_key = $1 LIMIT 1',
+          [reminderKey]
+        )
+        if (res.rows[0]) {
+          const mapped = this.mapCartReminder(res.rows[0])
+          this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+          return mapped
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    try {
+      const { data: ev } = await this.supabase
+        .from('events')
+        .select('description')
+        .eq('id', this.deriveCartReminderId(reminderKey))
+        .eq('category', 'CART_REMINDER')
+        .maybeSingle()
+      if (ev?.description) {
+        const mapped = this.mapCartReminder(JSON.parse(ev.description))
+        this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+        return mapped
+      }
+    } catch {
+      // Ignore
+    }
+
+    return null
+  }
+
+  async upsertCartReminderSnapshot(input: {
+    userId?: string | null
+    visitorId?: string | null
+    email: string
+    customerName?: string | null
+    items: CartReminderItem[]
+    subtotal?: number
+  }): Promise<CartReminderRecord | null> {
+    const cleanEmail = (input.email || '').trim().toLowerCase()
+    if (!isValidEmailAddress(cleanEmail)) return null
+
+    if (!Array.isArray(input.items) || input.items.length === 0) {
+      await this.markCartRemindersInactive({
+        userId: input.userId || null,
+        visitorId: input.visitorId || null,
+        email: cleanEmail,
+        status: 'CLEARED'
+      })
+      return null
+    }
+
+    const reminderKey = input.userId ? `user:${input.userId}` : `email:${cleanEmail}`
+    const nextSignature = this.buildCartSignature(input.items)
+    const computedSubtotal =
+      input.subtotal !== undefined
+        ? Math.round(Number(input.subtotal) * 100) / 100
+        : Math.round(
+            input.items.reduce((sum, it) => sum + Number(it.price || 0) * Number(it.quantity || 1), 0) * 100
+          ) / 100
+    const itemCount = input.items.reduce((sum, it) => sum + Math.max(1, Number(it.quantity || 1)), 0)
+    const nowIso = new Date().toISOString()
+
+    let existing = await this.findCartReminderByKey(reminderKey)
+
+    // Deduplicate: if a logged-in user previously started a guest reminder with the same email, migrate/close guest row
+    if (input.userId) {
+      const guestKey = `email:${cleanEmail}`
+      const guestRecord = await this.findCartReminderByKey(guestKey)
+      if (guestRecord && guestRecord.status === 'ACTIVE') {
+        if (!existing && guestRecord.cartSignature === nextSignature) {
+          existing = {
+            ...guestRecord,
+            id: this.deriveCartReminderId(reminderKey),
+            reminderKey,
+            userId: input.userId
+          }
+        }
+        await this.persistCartReminderRecord({
+          ...guestRecord,
+          status: 'COMPLETED',
+          completedOrderNumber: 'MERGED_ACCOUNT_CART',
+          updatedAt: nowIso
+        })
+      }
+    }
+
+    const isUnchangedActiveCart =
+      Boolean(existing) &&
+      existing!.status === 'ACTIVE' &&
+      existing!.cartSignature === nextSignature
+
+    const record: CartReminderRecord = {
+      id: existing?.id || this.deriveCartReminderId(reminderKey),
+      reminderKey,
+      userId: input.userId || existing?.userId || null,
+      visitorId: input.visitorId || existing?.visitorId || null,
+      email: cleanEmail,
+      customerName: (input.customerName || existing?.customerName || '').trim() || null,
+      items: input.items,
+      itemCount,
+      subtotal: computedSubtotal,
+      cartSignature: nextSignature,
+      status: 'ACTIVE',
+      sentStages: isUnchangedActiveCart ? existing!.sentStages : [],
+      lastSentStage: isUnchangedActiveCart ? existing!.lastSentStage : 0,
+      lastRemindedAt: isUnchangedActiveCart ? existing!.lastRemindedAt || null : null,
+      completedOrderNumber: null,
+      cartUpdatedAt: isUnchangedActiveCart ? existing!.cartUpdatedAt : nowIso,
+      createdAt: existing?.createdAt || nowIso,
+      updatedAt: nowIso
+    }
+
+    await this.persistCartReminderRecord(record)
+    return record
+  }
+
+  async syncUserCartReminder(userId: string): Promise<void> {
+    if (!userId) return
+    const [user, cart] = await Promise.all([
+      this.findUserById(userId),
+      this.findOrCreateCart(userId)
+    ])
+    if (!user?.email || !isValidEmailAddress(user.email)) return
+
+    const items: CartReminderItem[] = (cart.items || [])
+      .filter((ci: any) => ci.product && ci.product.isActive !== false && !ci.product.isComingSoon)
+      .map((ci: any) => ({
+        productId: String(ci.productId),
+        name: String(ci.product?.name || 'DriveFlyElectric Vehicle'),
+        price: Number(ci.product?.price || 0),
+        quantity: Math.max(1, Number(ci.quantity || 1)),
+        image: Array.isArray(ci.product?.images) && ci.product.images[0] ? String(ci.product.images[0]) : undefined
+      }))
+
+    const fullName = `${user.firstName || ''} ${user.lastName || ''}`.trim() || null
+    await this.upsertCartReminderSnapshot({
+      userId,
+      email: user.email,
+      customerName: fullName,
+      items
+    })
+  }
+
+  async markCartRemindersInactive(criteria: {
+    userId?: string | null
+    visitorId?: string | null
+    email?: string | null
+    emails?: Array<string | undefined | null>
+    status: 'COMPLETED' | 'CLEARED' | 'EXPIRED'
+    orderNumber?: string
+  }): Promise<void> {
+    const emailList = Array.from(
+      new Set(
+        [criteria.email, ...(criteria.emails || [])]
+          .map((e) => (e || '').trim().toLowerCase())
+          .filter((e) => isValidEmailAddress(e))
+      )
+    )
+    const userId = criteria.userId ? String(criteria.userId).trim() : ''
+    const visitorId = criteria.visitorId ? String(criteria.visitorId).trim() : ''
+    if (!userId && !visitorId && emailList.length === 0) return
+
+    const nowIso = new Date().toISOString()
+    const keysToCheck = new Set<string>()
+    if (userId) keysToCheck.add(`user:${userId}`)
+    for (const em of emailList) keysToCheck.add(`email:${em}`)
+
+    for (const key of keysToCheck) {
+      const rec = await this.findCartReminderByKey(key)
+      if (rec && rec.status === 'ACTIVE') {
+        await this.persistCartReminderRecord({
+          ...rec,
+          status: criteria.status,
+          completedOrderNumber: criteria.orderNumber || rec.completedOrderNumber || null,
+          updatedAt: nowIso
+        })
+      }
+    }
+
+    for (const [key, rec] of this.cartRemindersMemoryCache.entries()) {
+      if (rec.status !== 'ACTIVE') continue
+      const matchesUser = Boolean(userId && rec.userId === userId)
+      const matchesVisitor = Boolean(visitorId && rec.visitorId === visitorId)
+      const matchesEmail = emailList.includes(rec.email.toLowerCase())
+      if (matchesUser || matchesVisitor || matchesEmail) {
+        await this.persistCartReminderRecord({
+          ...rec,
+          status: criteria.status,
+          completedOrderNumber: criteria.orderNumber || rec.completedOrderNumber || null,
+          updatedAt: nowIso
+        })
+        this.cartRemindersMemoryCache.set(key, {
+          ...rec,
+          status: criteria.status,
+          completedOrderNumber: criteria.orderNumber || rec.completedOrderNumber || null,
+          updatedAt: nowIso
+        })
+      }
+    }
+
+    // Also update any matching DB rows directly so server restarts don't miss visitor/email matches
+    const updatePayload: Record<string, any> = {
+      status: criteria.status,
+      updated_at: nowIso
+    }
+    if (criteria.orderNumber) {
+      updatePayload.completed_order_number = criteria.orderNumber
+    }
+
+    try {
+      if (userId) {
+        await this.supabase.from('cart_reminders').update(updatePayload).eq('user_id', userId).eq('status', 'ACTIVE')
+      }
+      if (visitorId) {
+        await this.supabase.from('cart_reminders').update(updatePayload).eq('visitor_id', visitorId).eq('status', 'ACTIVE')
+      }
+      if (emailList.length > 0) {
+        await this.supabase.from('cart_reminders').update(updatePayload).in('email', emailList).eq('status', 'ACTIVE')
+      }
+    } catch {
+      // Fallback handled below
+    }
+
+    // Clean any public.events CART_REMINDER fallback rows matching user/visitor/email
+    try {
+      const { data: evRows } = await this.supabase
+        .from('events')
+        .select('id, description')
+        .eq('category', 'CART_REMINDER')
+        .eq('status', 'ACTIVE')
+        .limit(200)
+
+      for (const ev of evRows || []) {
+        if (!ev.description) continue
+        try {
+          const parsed = this.mapCartReminder(JSON.parse(ev.description))
+          const matchesUser = Boolean(userId && parsed.userId === userId)
+          const matchesVisitor = Boolean(visitorId && parsed.visitorId === visitorId)
+          const matchesEmail = emailList.includes(parsed.email.toLowerCase())
+          if (matchesUser || matchesVisitor || matchesEmail) {
+            const updated: CartReminderRecord = {
+              ...parsed,
+              status: criteria.status,
+              completedOrderNumber: criteria.orderNumber || parsed.completedOrderNumber || null,
+              updatedAt: nowIso
+            }
+            this.cartRemindersMemoryCache.set(updated.reminderKey, updated)
+            await this.supabase
+              .from('events')
+              .update({
+                status: criteria.status,
+                description: JSON.stringify(updated),
+                updated_at: nowIso
+              })
+              .eq('id', ev.id)
+          }
+        } catch {
+          // Skip malformed record
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  async listActiveCartReminders(limit: number = 200): Promise<CartReminderRecord[]> {
+    const map = new Map<string, CartReminderRecord>()
+    for (const rec of this.cartRemindersMemoryCache.values()) {
+      if (rec.status === 'ACTIVE') map.set(rec.reminderKey, rec)
+    }
+
+    let readFromTable = false
+    try {
+      const { data, error } = await this.supabase
+        .from('cart_reminders')
+        .select('*')
+        .eq('status', 'ACTIVE')
+        .order('cart_updated_at', { ascending: true })
+        .limit(limit)
+
+      if (!error && Array.isArray(data)) {
+        readFromTable = true
+        for (const row of data) {
+          const mapped = this.mapCartReminder(row)
+          map.set(mapped.reminderKey, mapped)
+          this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    if (!readFromTable && this.pool) {
+      try {
+        const res = await this.pool.query(
+          `SELECT * FROM public.cart_reminders WHERE status = 'ACTIVE' ORDER BY cart_updated_at ASC LIMIT $1`,
+          [limit]
+        )
+        for (const row of res.rows) {
+          const mapped = this.mapCartReminder(row)
+          map.set(mapped.reminderKey, mapped)
+          this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    try {
+      const { data: evRows } = await this.supabase
+        .from('events')
+        .select('description')
+        .eq('category', 'CART_REMINDER')
+        .eq('status', 'ACTIVE')
+        .limit(limit)
+
+      for (const ev of evRows || []) {
+        if (!ev.description) continue
+        try {
+          const mapped = this.mapCartReminder(JSON.parse(ev.description))
+          if (mapped.status === 'ACTIVE' && !map.has(mapped.reminderKey)) {
+            map.set(mapped.reminderKey, mapped)
+            this.cartRemindersMemoryCache.set(mapped.reminderKey, mapped)
+          }
+        } catch {
+          // Skip malformed entry
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return Array.from(map.values()).filter((rec) => rec.status === 'ACTIVE' && rec.items.length > 0)
+  }
+
+  async updateCartReminderProgress(
+    reminderKey: string,
+    updates: {
+      sentStages: number[]
+      lastSentStage: number
+      lastRemindedAt: Date
+      status?: CartReminderStatus
+    }
+  ): Promise<void> {
+    const existing = await this.findCartReminderByKey(reminderKey)
+    if (!existing) return
+    const nextRecord: CartReminderRecord = {
+      ...existing,
+      sentStages: Array.from(new Set(updates.sentStages)).sort((a, b) => a - b),
+      lastSentStage: updates.lastSentStage,
+      lastRemindedAt: updates.lastRemindedAt.toISOString(),
+      status: updates.status || existing.status,
+      updatedAt: new Date().toISOString()
+    }
+    await this.persistCartReminderRecord(nextRecord)
+  }
+
+  // ==================== SITE VISITS & PRODUCT CHECKED ANALYTICS ====================
+  private detectDeviceType(userAgent?: string | null): DeviceCategory {
+    const ua = String(userAgent || '').toLowerCase()
+    if (/ipad|tablet|playbook|silk/.test(ua) || (/android/.test(ua) && !/mobile/.test(ua))) {
+      return 'tablet'
+    }
+    if (/mobi|iphone|ipod|blackberry|opera mini|iemobile/.test(ua)) {
+      return 'mobile'
+    }
+    return 'desktop'
+  }
+
+  private shouldRecordAnalyticsEvent(dedupeKey: string, ttlMs: number): boolean {
+    const now = Date.now()
+    const prev = this.analyticsDedupeCache.get(dedupeKey)
+    if (prev && now - prev < ttlMs) {
+      return false
+    }
+    if (this.analyticsDedupeCache.size > 2000) {
+      for (const [k, ts] of this.analyticsDedupeCache.entries()) {
+        if (now - ts > 120000) {
+          this.analyticsDedupeCache.delete(k)
+        }
+      }
+    }
+    this.analyticsDedupeCache.set(dedupeKey, now)
+    return true
+  }
+
+  private normalizeReferrerLabel(referrer?: string | null): string {
+    const raw = String(referrer || '').trim()
+    if (!raw) return 'Direct'
+    try {
+      const parsed = new URL(raw)
+      const host = parsed.hostname.toLowerCase().replace(/^www\./, '')
+      if (!host || host === 'driveflyelectric.shop' || host === 'localhost' || host === '127.0.0.1') {
+        return 'Direct'
+      }
+      return host
+    } catch {
+      return raw.slice(0, 80) || 'Direct'
+    }
+  }
+
+  private mapSiteVisit(raw: any): SiteVisitRecord {
+    const dev = String(raw.device_type || raw.deviceType || 'desktop').toLowerCase()
+    const deviceType: DeviceCategory = dev === 'mobile' || dev === 'tablet' ? dev : 'desktop'
+    return {
+      id: String(raw.id),
+      visitorId: String(raw.visitor_id || raw.visitorId || 'anon'),
+      sessionKey: String(raw.session_key || raw.sessionKey || raw.visitor_id || raw.visitorId || 'anon'),
+      userId: raw.user_id ?? raw.userId ?? null,
+      userEmail: raw.user_email ?? raw.userEmail ?? null,
+      path: String(raw.path || '/'),
+      referrer: raw.referrer || null,
+      userAgent: raw.user_agent ?? raw.userAgent ?? null,
+      deviceType,
+      country: raw.country || null,
+      ipHash: raw.ip_hash ?? raw.ipHash ?? null,
+      createdAt: raw.created_at || raw.createdAt || new Date().toISOString()
+    }
+  }
+
+  private mapProductView(raw: any): ProductViewRecord {
+    return {
+      id: String(raw.id),
+      productId: String(raw.product_id || raw.productId),
+      productName: String(raw.product_name || raw.productName || 'DriveFlyElectric Rig'),
+      productSku: raw.product_sku ?? raw.productSku ?? null,
+      category: raw.category ?? null,
+      price: Number(raw.price || 0),
+      imageUrl: raw.image_url ?? raw.imageUrl ?? null,
+      visitorId: String(raw.visitor_id || raw.visitorId || 'anon'),
+      sessionKey: raw.session_key ?? raw.sessionKey ?? null,
+      userId: raw.user_id ?? raw.userId ?? null,
+      userEmail: raw.user_email ?? raw.userEmail ?? null,
+      source: (raw.source || 'PRODUCT_PAGE') as ProductViewSource,
+      path: raw.path ?? null,
+      createdAt: raw.created_at || raw.createdAt || new Date().toISOString()
+    }
+  }
+
+  async recordSiteVisit(input: {
+    visitorId: string
+    sessionKey?: string
+    userId?: string | null
+    userEmail?: string | null
+    path: string
+    referrer?: string | null
+    userAgent?: string | null
+    country?: string | null
+    ip?: string | null
+  }): Promise<{ recorded: boolean; visit: SiteVisitRecord | null }> {
+    const cleanPath = (input.path || '/').trim().slice(0, 300) || '/'
+    if (cleanPath.startsWith('/admin')) {
+      return { recorded: false, visit: null }
+    }
+
+    const sessionKey = (input.sessionKey || input.visitorId || `sess_${crypto.randomUUID()}`).slice(0, 120)
+    const visitorId = (input.visitorId || sessionKey).slice(0, 120)
+    if (!this.shouldRecordAnalyticsEvent(`visit:${sessionKey}:${cleanPath}`, 60 * 1000)) {
+      return { recorded: false, visit: null }
+    }
+
+    const nowIso = new Date().toISOString()
+    const ipHash = input.ip
+      ? crypto.createHash('sha256').update(String(input.ip)).digest('hex').slice(0, 20)
+      : null
+
+    const visit: SiteVisitRecord = {
+      id: `vis_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      visitorId,
+      sessionKey,
+      userId: input.userId || null,
+      userEmail: input.userEmail || null,
+      path: cleanPath,
+      referrer: input.referrer ? String(input.referrer).trim().slice(0, 400) : null,
+      userAgent: input.userAgent ? String(input.userAgent).trim().slice(0, 300) : null,
+      deviceType: this.detectDeviceType(input.userAgent),
+      country: input.country ? String(input.country).trim().slice(0, 64) : null,
+      ipHash,
+      createdAt: nowIso
+    }
+
+    this.siteVisitsMemoryCache = [visit, ...this.siteVisitsMemoryCache].slice(0, 1000)
+
+    let persisted = false
+    try {
+      const { error } = await this.supabase.from('site_visits').insert({
+        id: visit.id,
+        visitor_id: visit.visitorId,
+        session_key: visit.sessionKey,
+        user_id: visit.userId,
+        user_email: visit.userEmail,
+        path: visit.path,
+        referrer: visit.referrer,
+        user_agent: visit.userAgent,
+        device_type: visit.deviceType,
+        country: visit.country,
+        ip_hash: visit.ipHash,
+        created_at: visit.createdAt
+      })
+      if (!error) persisted = true
+    } catch {
+      // Fallback below
+    }
+
+    if (!persisted && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.site_visits
+           (id, visitor_id, session_key, user_id, user_email, path, referrer, user_agent, device_type, country, ip_hash, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            visit.id,
+            visit.visitorId,
+            visit.sessionKey,
+            visit.userId,
+            visit.userEmail,
+            visit.path,
+            visit.referrer,
+            visit.userAgent,
+            visit.deviceType,
+            visit.country,
+            visit.ipHash,
+            visit.createdAt
+          ]
+        )
+        persisted = true
+      } catch {
+        // Fallback below
+      }
+    }
+
+    if (!persisted) {
+      try {
+        await this.supabase.from('events').upsert({
+          id: visit.id,
+          title: `VISIT:${visit.path.slice(0, 80)}`,
+          description: JSON.stringify(visit),
+          date: nowIso.slice(0, 10),
+          time: nowIso,
+          location: visit.userEmail || visit.visitorId,
+          category: 'SITE_VISIT',
+          status: 'past',
+          updated_at: nowIso
+        }, { onConflict: 'id' })
+      } catch {
+        // Memory cache retains live record
+      }
+    }
+
+    return { recorded: true, visit }
+  }
+
+  async recordProductView(input: {
+    productId: string
+    productName?: string
+    productSku?: string | null
+    category?: string | null
+    price?: number
+    imageUrl?: string | null
+    visitorId: string
+    sessionKey?: string | null
+    userId?: string | null
+    userEmail?: string | null
+    source?: ProductViewSource
+    path?: string | null
+  }): Promise<{ recorded: boolean; view: ProductViewRecord | null }> {
+    const productId = String(input.productId || '').trim()
+    if (!productId) return { recorded: false, view: null }
+
+    const source: ProductViewSource = input.source || 'PRODUCT_PAGE'
+    const sessionKey = (input.sessionKey || input.visitorId || 'anon').slice(0, 120)
+    const visitorId = (input.visitorId || sessionKey).slice(0, 120)
+    const dedupeTtl = source === 'PRODUCT_PAGE' ? 60 * 1000 : 8 * 1000
+    if (!this.shouldRecordAnalyticsEvent(`pview:${sessionKey}:${productId}:${source}`, dedupeTtl)) {
+      return { recorded: false, view: null }
+    }
+
+    let productName = (input.productName || '').trim()
+    let productSku = input.productSku || null
+    let category = input.category || null
+    let price = Number(input.price || 0)
+    let imageUrl = input.imageUrl || null
+
+    if (!productName || !productSku || !price) {
+      const dbProd = await this.findProductById(productId).catch(() => null)
+      if (dbProd) {
+        productName = productName || dbProd.name
+        productSku = productSku || dbProd.sku
+        category = category || dbProd.category
+        price = price || Number(dbProd.price || 0)
+        imageUrl = imageUrl || (Array.isArray(dbProd.images) ? dbProd.images[0] : null)
+      }
+    }
+
+    const nowIso = new Date().toISOString()
+    const view: ProductViewRecord = {
+      id: `pview_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+      productId,
+      productName: (productName || 'DriveFlyElectric Rig').slice(0, 200),
+      productSku: productSku ? String(productSku).slice(0, 100) : null,
+      category: category ? String(category).slice(0, 100) : null,
+      price: Number.isFinite(price) ? price : 0,
+      imageUrl: imageUrl ? String(imageUrl).slice(0, 500) : null,
+      visitorId,
+      sessionKey,
+      userId: input.userId || null,
+      userEmail: input.userEmail || null,
+      source,
+      path: input.path ? String(input.path).slice(0, 300) : `/product/${productId}`,
+      createdAt: nowIso
+    }
+
+    this.productViewsMemoryCache = [view, ...this.productViewsMemoryCache].slice(0, 1000)
+
+    let persisted = false
+    try {
+      const { error } = await this.supabase.from('product_views').insert({
+        id: view.id,
+        product_id: view.productId,
+        product_name: view.productName,
+        product_sku: view.productSku,
+        category: view.category,
+        price: view.price,
+        image_url: view.imageUrl,
+        visitor_id: view.visitorId,
+        session_key: view.sessionKey,
+        user_id: view.userId,
+        user_email: view.userEmail,
+        source: view.source,
+        path: view.path,
+        created_at: view.createdAt
+      })
+      if (!error) persisted = true
+    } catch {
+      // Fallback below
+    }
+
+    if (!persisted && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.product_views
+           (id, product_id, product_name, product_sku, category, price, image_url, visitor_id, session_key, user_id, user_email, source, path, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           ON CONFLICT (id) DO NOTHING`,
+          [
+            view.id,
+            view.productId,
+            view.productName,
+            view.productSku,
+            view.category,
+            view.price,
+            view.imageUrl,
+            view.visitorId,
+            view.sessionKey,
+            view.userId,
+            view.userEmail,
+            view.source,
+            view.path,
+            view.createdAt
+          ]
+        )
+        persisted = true
+      } catch {
+        // Fallback below
+      }
+    }
+
+    if (!persisted) {
+      try {
+        await this.supabase.from('events').upsert({
+          id: view.id,
+          title: `PVIEW:${view.productName.slice(0, 80)}`,
+          description: JSON.stringify(view),
+          date: nowIso.slice(0, 10),
+          time: nowIso,
+          location: view.productId,
+          category: 'PRODUCT_VIEW',
+          status: 'past',
+          updated_at: nowIso
+        }, { onConflict: 'id' })
+      } catch {
+        // Memory cache retains live record
+      }
+    }
+
+    return { recorded: true, view }
+  }
+
+  private async listSiteVisitsSince(sinceIso: string, limit: number = 2500): Promise<SiteVisitRecord[]> {
+    const map = new Map<string, SiteVisitRecord>()
+    for (const item of this.siteVisitsMemoryCache) {
+      if (item.createdAt >= sinceIso) {
+        map.set(item.id, item)
+      }
+    }
+
+    let readPrimary = false
+    try {
+      const { data, error } = await this.supabase
+        .from('site_visits')
+        .select('*')
+        .gte('created_at', sinceIso)
+        .order('created_at', { ascending: false })
+        .limit(limit)
+
+      if (!error && Array.isArray(data)) {
+        readPrimary = true
+        for (const row of data) {
+          const mapped = this.mapSiteVisit(row)
+          map.set(mapped.id, mapped)
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    if (!readPrimary && this.pool) {
+      try {
+        const res = await this.pool.query(
+          `SELECT * FROM public.site_visits WHERE created_at >= $1 ORDER BY created_at DESC LIMIT $2`,
+          [sinceIso, limit]
+        )
+        for (const row of res.rows) {
+          const mapped = this.mapSiteVisit(row)
+          map.set(mapped.id, mapped)
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    if (!readPrimary) {
+      try {
+        const { data: evRows } = await this.supabase
+          .from('events')
+          .select('description')
+          .eq('category', 'SITE_VISIT')
+          .gte('time', sinceIso)
+          .order('time', { ascending: false })
+          .limit(limit)
+
+        for (const ev of evRows || []) {
+          if (!ev.description) continue
+          try {
+            const parsed = this.mapSiteVisit(JSON.parse(ev.description))
+            if (!map.has(parsed.id)) map.set(parsed.id, parsed)
+          } catch {
+            // Skip malformed entry
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    return Array.from(map.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )
+  }
+
+  private async listProductViewsSince(sinceIso: string, limit: number = 2500): Promise<ProductViewRecord[]> {
+    const map = new Map<string, ProductViewRecord>()
+    for (const item of this.productViewsMemoryCache) {
+      if (item.createdAt >= sinceIso) {
+        map.set(item.id, item)
+      }
+    }
+
+    let readPrimary = false
+    try {
+      const { data, error } = await this.supabase
+        .from('product_views')
+        .select('*')
+        .gte('created_at', sinceIso)
+        .order('created_at', { ascending: false })
+        .limit(limit)
+
+      if (!error && Array.isArray(data)) {
+        readPrimary = true
+        for (const row of data) {
+          const mapped = this.mapProductView(row)
+          map.set(mapped.id, mapped)
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    if (!readPrimary && this.pool) {
+      try {
+        const res = await this.pool.query(
+          `SELECT * FROM public.product_views WHERE created_at >= $1 ORDER BY created_at DESC LIMIT $2`,
+          [sinceIso, limit]
+        )
+        for (const row of res.rows) {
+          const mapped = this.mapProductView(row)
+          map.set(mapped.id, mapped)
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    if (!readPrimary) {
+      try {
+        const { data: evRows } = await this.supabase
+          .from('events')
+          .select('description')
+          .eq('category', 'PRODUCT_VIEW')
+          .gte('time', sinceIso)
+          .order('time', { ascending: false })
+          .limit(limit)
+
+        for (const ev of evRows || []) {
+          if (!ev.description) continue
+          try {
+            const parsed = this.mapProductView(JSON.parse(ev.description))
+            if (!map.has(parsed.id)) map.set(parsed.id, parsed)
+          } catch {
+            // Skip malformed entry
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    return Array.from(map.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )
+  }
+
+  async getTrafficAnalytics(periodDays: number = 30): Promise<TrafficAnalyticsSummary> {
+    const safeDays = Math.min(365, Math.max(1, Math.round(periodDays || 30)))
+    const now = Date.now()
+    const sinceIso = new Date(now - safeDays * 24 * 60 * 60 * 1000).toISOString()
+    const todayPrefix = new Date().toISOString().slice(0, 10)
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000
+
+    const [visits, views] = await Promise.all([
+      this.listSiteVisitsSince(sinceIso, 2500),
+      this.listProductViewsSince(sinceIso, 2500)
+    ])
+
+    const allVisitorIds = new Set<string>()
+    const todayVisitorIds = new Set<string>()
+    const last7dVisitorIds = new Set<string>()
+    let visitsToday = 0
+    let visitsLast7d = 0
+
+    const deviceBreakdown = { desktop: 0, mobile: 0, tablet: 0 }
+    const pageMap = new Map<string, { path: string; visits: number; visitors: Set<string>; lastVisitedAt: string }>()
+    const referrerMap = new Map<string, number>()
+
+    for (const v of visits) {
+      allVisitorIds.add(v.visitorId)
+      const tsMs = new Date(v.createdAt).getTime()
+      const dateStr = v.createdAt.slice(0, 10)
+      if (dateStr === todayPrefix) {
+        visitsToday += 1
+        todayVisitorIds.add(v.visitorId)
+      }
+      if (now - tsMs <= sevenDaysMs) {
+        visitsLast7d += 1
+        last7dVisitorIds.add(v.visitorId)
+      }
+
+      if (v.deviceType === 'mobile') deviceBreakdown.mobile += 1
+      else if (v.deviceType === 'tablet') deviceBreakdown.tablet += 1
+      else deviceBreakdown.desktop += 1
+
+      const pEntry = pageMap.get(v.path) || {
+        path: v.path,
+        visits: 0,
+        visitors: new Set<string>(),
+        lastVisitedAt: v.createdAt
+      }
+      pEntry.visits += 1
+      pEntry.visitors.add(v.visitorId)
+      if (v.createdAt > pEntry.lastVisitedAt) pEntry.lastVisitedAt = v.createdAt
+      pageMap.set(v.path, pEntry)
+
+      const refLabel = this.normalizeReferrerLabel(v.referrer)
+      referrerMap.set(refLabel, (referrerMap.get(refLabel) || 0) + 1)
+    }
+
+    let productViewsToday = 0
+    const productStatsMap = new Map<
+      string,
+      {
+        productId: string
+        productName: string
+        productSku?: string | null
+        category?: string | null
+        price: number
+        imageUrl?: string | null
+        totalViews: number
+        pageViews: number
+        cartAdds: number
+        bookingChecks: number
+        chatSelections: number
+        visitors: Set<string>
+        lastViewedAt: string
+      }
+    >()
+
+    for (const pv of views) {
+      if (pv.createdAt.slice(0, 10) === todayPrefix) {
+        productViewsToday += 1
+      }
+      const existing = productStatsMap.get(pv.productId) || {
+        productId: pv.productId,
+        productName: pv.productName,
+        productSku: pv.productSku || null,
+        category: pv.category || null,
+        price: pv.price || 0,
+        imageUrl: pv.imageUrl || null,
+        totalViews: 0,
+        pageViews: 0,
+        cartAdds: 0,
+        bookingChecks: 0,
+        chatSelections: 0,
+        visitors: new Set<string>(),
+        lastViewedAt: pv.createdAt
+      }
+      existing.totalViews += 1
+      if (pv.source === 'CART_ADD') existing.cartAdds += 1
+      else if (pv.source === 'BOOKING_MODAL') existing.bookingChecks += 1
+      else if (pv.source === 'LIVECHAT_SELECT') existing.chatSelections += 1
+      else existing.pageViews += 1
+
+      if (!existing.imageUrl && pv.imageUrl) existing.imageUrl = pv.imageUrl
+      if (!existing.productSku && pv.productSku) existing.productSku = pv.productSku
+      existing.visitors.add(pv.visitorId)
+      if (pv.createdAt > existing.lastViewedAt) existing.lastViewedAt = pv.createdAt
+      productStatsMap.set(pv.productId, existing)
+    }
+
+    // Build 14-day daily time-series (or fewer if periodDays < 14, min 7 buckets for crisp visual chart)
+    const chartDays = Math.min(14, Math.max(7, safeDays))
+    const dailyBuckets = new Map<string, { visits: number; visitors: Set<string>; productViews: number }>()
+    for (let i = chartDays - 1; i >= 0; i -= 1) {
+      const dStr = new Date(now - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      dailyBuckets.set(dStr, { visits: 0, visitors: new Set<string>(), productViews: 0 })
+    }
+    for (const v of visits) {
+      const bucket = dailyBuckets.get(v.createdAt.slice(0, 10))
+      if (bucket) {
+        bucket.visits += 1
+        bucket.visitors.add(v.visitorId)
+      }
+    }
+    for (const pv of views) {
+      const bucket = dailyBuckets.get(pv.createdAt.slice(0, 10))
+      if (bucket) {
+        bucket.productViews += 1
+      }
+    }
+
+    const dailySeries = Array.from(dailyBuckets.entries()).map(([date, stats]) => ({
+      date,
+      label: new Date(`${date}T00:00:00Z`).toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        timeZone: 'UTC'
+      }),
+      visits: stats.visits,
+      uniqueVisitors: stats.visitors.size,
+      productViews: stats.productViews
+    }))
+
+    return {
+      periodDays: safeDays,
+      totalVisits: visits.length,
+      visitsToday,
+      visitsLast7d,
+      uniqueVisitors: allVisitorIds.size,
+      uniqueVisitorsToday: todayVisitorIds.size,
+      uniqueVisitorsLast7d: last7dVisitorIds.size,
+      totalProductViews: views.length,
+      productViewsToday,
+      uniqueProductsChecked: productStatsMap.size,
+      deviceBreakdown,
+      topPages: Array.from(pageMap.values())
+        .map((p) => ({
+          path: p.path,
+          visits: p.visits,
+          uniqueVisitors: p.visitors.size,
+          lastVisitedAt: p.lastVisitedAt
+        }))
+        .sort((a, b) => b.visits - a.visits)
+        .slice(0, 12),
+      topReferrers: Array.from(referrerMap.entries())
+        .map(([referrer, visitsCount]) => ({ referrer, visits: visitsCount }))
+        .sort((a, b) => b.visits - a.visits)
+        .slice(0, 10),
+      topProductsChecked: Array.from(productStatsMap.values())
+        .map((p) => ({
+          productId: p.productId,
+          productName: p.productName,
+          productSku: p.productSku,
+          category: p.category,
+          price: p.price,
+          imageUrl: p.imageUrl,
+          totalViews: p.totalViews,
+          pageViews: p.pageViews,
+          cartAdds: p.cartAdds,
+          bookingChecks: p.bookingChecks,
+          chatSelections: p.chatSelections,
+          uniqueVisitors: p.visitors.size,
+          lastViewedAt: p.lastViewedAt
+        }))
+        .sort((a, b) => b.totalViews - a.totalViews)
+        .slice(0, 15),
+      dailySeries,
+      recentVisits: visits.slice(0, 40),
+      recentProductViews: views.slice(0, 40)
+    }
+  }
+
   // ==================== CONTROLLER COMPATIBILITY LAYER ====================
   // Provides clean Prisma-like signatures to prevent breaking any existing controller code
   public prisma = {
@@ -2002,7 +3725,7 @@ export class DatabaseService {
         return null
       },
       findMany: async (args: any) => this.findUsers(args),
-      count: async (args?: any) => this.getUserCount(),
+      count: async (_args?: any) => this.getUserCount(),
       create: async (args: any) => this.createUser(args.data),
       update: async (args: any) => this.updateUser(args.where.id, args.data)
     },

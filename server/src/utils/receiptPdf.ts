@@ -1,4 +1,4 @@
-import { getFormattedSupportWhatsApp } from '../middleware/security.js'
+import { extractGuestMetadataFromNotes, getAdminContactEmail, getFormattedSupportWhatsApp } from '../middleware/security.js'
 
 export interface ServerOrderReceiptData {
   date: string
@@ -60,12 +60,18 @@ export const buildReceiptDataFromOrder = (
     }
   }
 
+  const noteEmails = extractGuestMetadataFromNotes(ord.notes).emails
+  const resolvedEmail =
+    ord.user?.email ||
+    fallbackCustomer?.email ||
+    addr?.email ||
+    noteEmails[0]
+
   const customerName =
     (addr && `${addr.firstName || ''} ${addr.lastName || ''}`.trim()) ||
     (ord.user && `${ord.user.firstName || ''} ${ord.user.lastName || ''}`.trim()) ||
     (fallbackCustomer && `${fallbackCustomer.firstName || ''} ${fallbackCustomer.lastName || ''}`.trim()) ||
-    ord.user?.email ||
-    fallbackCustomer?.email ||
+    resolvedEmail ||
     'Valued Customer'
 
   const txnMatch = ord.notes ? ord.notes.match(/\(([^)]+)\)\s*$/) : null
@@ -103,7 +109,7 @@ export const buildReceiptDataFromOrder = (
     refundTrans: 'N/A',
     shippingCost: Number(ord.shipping || 0) === 0 ? '$0.00 (Free Shipping)' : formatUsd(Number(ord.shipping || 0)),
     tax: formatUsd(Number(ord.tax || 0)),
-    customerEmail: ord.user?.email || fallbackCustomer?.email,
+    customerEmail: resolvedEmail,
     items: Array.isArray(ord.items)
       ? ord.items.map((item: any) => ({
           name: item.product?.name || item.name || 'High-Performance Vehicle',
@@ -153,7 +159,7 @@ export const generateReceiptText = (r: ServerOrderReceiptData): string => {
     `Full details for this order have been reviewed by user`,
     `Additional Transaction Details:`,
     `If you purchased this item, it means you know the item you purchased and have agreed with our terms and conditions regarding payment and delivery.`,
-    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (${getFormattedSupportWhatsApp()}) if you have any questions or concerns.`,
+    `Feel free to contact our Customer Service via email (${getAdminContactEmail()}) or WhatsApp (${getFormattedSupportWhatsApp()}) if you have any questions or concerns.`,
     `Regards,`,
     `DriveFlyElectric Team`,
     `https://driveflyelectric.shop/`
@@ -262,7 +268,7 @@ export const generateReceiptPdfBuffer = (r: ServerOrderReceiptData): Buffer => {
   commands.push('0.85 0.85 0.85 RG 0.75 w 50 54 m 562 54 l S')
   commands.push('0.45 0.45 0.48 rg')
   commands.push(
-    'BT /F1 8 Tf 50 42 Td (Verified Electronic Receipt  |  DriveFlyElectric  |  info-eurotopmobility@driveflyelectric.shop) Tj ET'
+    `BT /F1 8 Tf 50 42 Td (${escapePdfText(`Verified Electronic Receipt  |  DriveFlyElectric  |  ${getAdminContactEmail()}`)}) Tj ET`
   )
 
   const streamContent = commands.join('\n')

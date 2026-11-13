@@ -27,11 +27,12 @@ import { Product } from '../types'
 import { useProducts } from '../contexts/ProductContext'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
+import { analyticsApi } from '../services/api'
 import { AuthModal } from '../components/AuthModal'
 import { QuickCartDrawer } from '../components/QuickCartDrawer'
 import { ShareProductButton } from '../components/ShareProductButton'
 import { BookComingSoonModal } from '../components/BookComingSoonModal'
-import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
+import { formatSupportPhone, getSupportContactEmail, getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
 const CATEGORIES = [
   { id: 'all', label: 'All Rigs' },
@@ -365,10 +366,39 @@ export const HomePage: React.FC = () => {
     })
   }
 
+  const openBookingModal = (product: Product) => {
+    setBookingModalProduct(product)
+    if (user?.role !== 'ADMIN') {
+      analyticsApi.trackProductView({
+        productId: product.id,
+        productName: product.name,
+        productSku: product.sku,
+        category: product.category,
+        price: Number(product.price || 0),
+        imageUrl: product.images?.[0] || null,
+        source: 'BOOKING_MODAL',
+        path: location.pathname
+      })
+    }
+  }
+
   const handleAddToCart = (product: any, e?: React.MouseEvent) => {
     if (e) e.stopPropagation()
     const quantity = quantities[product.id] || 1
     addToCart(product, quantity)
+
+    if (user?.role !== 'ADMIN') {
+      analyticsApi.trackProductView({
+        productId: product.id,
+        productName: product.name,
+        productSku: product.sku,
+        category: product.category,
+        price: Number(product.price || 0),
+        imageUrl: product.images?.[0] || null,
+        source: 'CART_ADD',
+        path: location.pathname
+      })
+    }
 
     // Visual feedback
     setAddedProductIds(prev => ({ ...prev, [product.id]: true }))
@@ -545,7 +575,7 @@ export const HomePage: React.FC = () => {
                           </div>
                           <button
                             type="button"
-                            onClick={() => setBookingModalProduct(item)}
+                            onClick={() => openBookingModal(item)}
                             className="px-2.5 py-1.5 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[10px] whitespace-nowrap shrink-0 shadow transition-transform active:scale-95"
                           >
                             Book Now
@@ -773,7 +803,7 @@ export const HomePage: React.FC = () => {
                         <div className="mt-3 flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={() => setBookingModalProduct(product)}
+                            onClick={() => openBookingModal(product)}
                             className="flex-1 py-2 sm:py-2.5 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest rounded bg-creamy-500 hover:bg-creamy-400 text-black transition-all active:scale-95 flex items-center justify-center gap-1.5 shadow-sm"
                           >
                             <CalendarClock className="w-3.5 h-3.5" />
@@ -1479,7 +1509,7 @@ export const HomePage: React.FC = () => {
               {footerModalTopic === 'privacy' && (
                 <>
                   <p>We collect only the contact, shipping, and order details necessary to verify payments, prepare freight manifests, and send PDF purchase receipts.</p>
-                  <p>For account or data requests, email info-eurotopmobility@driveflyelectric.shop.</p>
+                  <p>For account or data requests, email <a href={`mailto:${getSupportContactEmail()}`} className="text-creamy-500 underline font-semibold">{getSupportContactEmail()}</a>.</p>
                 </>
               )}
               {footerModalTopic === 'terms' && (
@@ -1491,7 +1521,7 @@ export const HomePage: React.FC = () => {
                 <>
                   <p className="font-bold text-gray-900 dark:text-white">DriveFlyElectric Operations HQ</p>
                   <p>1000 DriveFly Electric Way, Suite 400, Austin, TX 78701, United States</p>
-                  <p>Email: info-eurotopmobility@driveflyelectric.shop</p>
+                  <p>Admin Support Email: <a href={`mailto:${getSupportContactEmail()}`} className="text-creamy-500 underline font-semibold">{getSupportContactEmail()}</a></p>
                   <p>WhatsApp / Phone: {supportPhone}</p>
                 </>
               )}

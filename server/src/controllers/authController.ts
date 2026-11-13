@@ -382,6 +382,19 @@ export const updateUserStatus = async (req: Request, res: Response) => {
       isActive: parsed.data.isActive
     })
 
+    emailService.recordActivity({
+      type: 'USER_STATUS_UPDATED',
+      title: `Account ${parsed.data.isActive ? 'Activated' : 'Deactivated'} • ${updatedUser.email}`,
+      message: `Administrator marked ${updatedUser.email} as ${parsed.data.isActive ? 'ACTIVE' : 'DEACTIVATED'}.`,
+      userEmail: updatedUser.email,
+      metadata: {
+        userId: updatedUser.id,
+        isActive: parsed.data.isActive
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
     res.status(200).json({
       success: true,
       message: `User ${parsed.data.isActive ? 'activated' : 'deactivated'} successfully`,

@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Share2, Copy, Check, Mail, ExternalLink, X, MessageCircle } from 'lucide-react'
 import { Product } from '../types'
+import { useAuth } from '../contexts/AuthContext'
+import { analyticsApi } from '../services/api'
 
 interface ShareProductButtonProps {
   product: Pick<Product, 'id' | 'name' | 'price'>
@@ -22,6 +24,7 @@ export const ShareProductButton: React.FC<ShareProductButtonProps> = ({
   variant = 'card',
   className = '',
 }) => {
+  const { user } = useAuth()
   const [isOpen, setIsOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [coords, setCoords] = useState<PopoverCoords>({ top: 0, left: 0 })
@@ -106,7 +109,16 @@ export const ShareProductButton: React.FC<ShareProductButtonProps> = ({
   const handleToggle = (e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
-    setIsOpen((prev) => !prev)
+    const nextOpen = !isOpen
+    setIsOpen(nextOpen)
+    if (nextOpen && user?.role !== 'ADMIN') {
+      analyticsApi.trackProductView({
+        productId: product.id,
+        productName: product.name,
+        price: Number(product.price || 0),
+        source: 'SHARE'
+      })
+    }
   }
 
   const handleCopyLink = async (e: React.MouseEvent) => {

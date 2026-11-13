@@ -17,7 +17,7 @@ import {
 } from 'lucide-react'
 import { useProducts } from '../contexts/ProductContext'
 import { useAuth } from '../contexts/AuthContext'
-import { supportApi } from '../services/api'
+import { supportApi, analyticsApi } from '../services/api'
 import { SupportSession, SupportSelectedProduct, SupportTopic } from '../types'
 import { getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
@@ -36,6 +36,9 @@ const getSafeMediaUrl = (url?: string) => {
   return parts.map((p, idx) => idx === 0 && p === '' ? '' : encodeURIComponent(decodeURIComponent(p))).join('/')
 }
 
+const createSupportSessionId = () =>
+  `dfe_chat_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+
 export const WhatsAppButton: React.FC = () => {
   const location = useLocation()
   const { products, currentProduct, fetchProducts } = useProducts()
@@ -47,16 +50,18 @@ export const WhatsAppButton: React.FC = () => {
   const [isContactOpen, setIsContactOpen] = useState(false)
   const [catalogSearch, setCatalogSearch] = useState('')
 
-  // Persistent visitor/session ID in localStorage
-  const [sessionId] = useState<string>(() => {
+  // Persistent visitor/session ID in localStorage (auto-migrated to registered account session ID upon sign-in)
+  const [sessionId, setSessionId] = useState<string>(() => {
     const saved = localStorage.getItem('driveflyelectric_support_session_id')
     if (saved) return saved
-    const created = `dfe_chat_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+    const created = createSupportSessionId()
     localStorage.setItem('driveflyelectric_support_session_id', created)
     return created
   })
 
   const [session, setSession] = useState<SupportSession | null>(null)
+  const [sessionReady, setSessionReady] = useState(false)
+  const [isInitializing, setIsInitializing] = useState(false)
   const [selectedTopic, setSelectedTopic] = useState<SupportTopic>('Item Purchase')
   const [selectedProducts, setSelectedProducts] = useState<SupportSelectedProduct[]>([])
   const [visitorName, setVisitorName] = useState<string>(() => localStorage.getItem('dfe_visitor_name') || '')
@@ -67,6 +72,14 @@ export const WhatsAppButton: React.FC = () => {
   const [chatError, setChatError] = useState<string | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const prevUserIdRef = useRef<string | undefined>(user?.id)
+  const isChatOpenRef = useRef(isChatOpen)
+  isChatOpenRef.current = isChatOpen
+  const sseConnectedRef = useRef(false)
+  const activeSessionIdRef = useRef(sessionId)
+  activeSessionIdRef.current = sessionId
+  const initPromiseRef = useRef<Promise<SupportSession | null> | null>(null)
+  const initForceRef = useRef(false)
 
   // Retrieve configured WhatsApp phone number
   const cleanNumber = getSupportWhatsAppDigits()
@@ -78,15 +91,39 @@ export const WhatsAppButton: React.FC = () => {
     }
   }, [])
 
-  // Sync authenticated user profile into visitor fields
-  useEffect(() => {
-    if (user) {
-      const fullName = `${user.firstName || ''} ${user.lastName || ''}`.trim()
-      if (fullName && !visitorName) setVisitorName(fullName)
-      if (user.email && !visitorEmail) setVisitorEmail(user.email)
-      if (user.phone && !visitorPhone) setVisitorPhone(user.phone)
+  const getResolvedVisitorMeta = () => {
+    const fullUserName = user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() : ''
+    return {
+      visitorName: fullUserName || localStorage.getItem('dfe_visitor_name') || visitorName || '',
+      visitorEmail: (user?.email || localStorage.getItem('dfe_visitor_email') || visitorEmail || '').trim(),
+      visitorPhone: (user?.phone || localStorage.getItem('dfe_visitor_phone') || visitorPhone || '').trim()
     }
-  }, [user])
+  }
+
+  const applySessionResponse = (nextSession: SupportSession) => {
+    if (nextSession.id && nextSession.id !== sessionId) {
+      localStorage.setItem('driveflyelectric_support_session_id', nextSession.id)
+      setSessionId(nextSession.id)
+    }
+    setSession(nextSession)
+    if (nextSession.topic) setSelectedTopic(nextSession.topic as SupportTopic)
+    if (Array.isArray(nextSession.selectedProducts) && nextSession.selectedProducts.length > 0) {
+      setSelectedProducts(nextSession.selectedProducts)
+    }
+    if (nextSession.visitorName && nextSession.visitorName !== 'Store Visitor') {
+      setVisitorName(nextSession.visitorName)
+      localStorage.setItem('dfe_visitor_name', nextSession.visitorName)
+    }
+    if (nextSession.visitorEmail) {
+      setVisitorEmail(nextSession.visitorEmail)
+      localStorage.setItem('dfe_visitor_email', nextSession.visitorEmail)
+    }
+    if (nextSession.visitorPhone) {
+      setVisitorPhone(nextSession.visitorPhone)
+      localStorage.setItem('dfe_visitor_phone', nextSession.visitorPhone)
+    }
+    setSessionReady(true)
+  }
 
   // Auto-select product when visitor views a product detail page (/product/:id or /products/:id)
   useEffect(() => {
@@ -107,77 +144,231 @@ export const WhatsAppButton: React.FC = () => {
     }
   }, [location.pathname, currentProduct])
 
-  // Initialize session & track online presence on site visit
-  useEffect(() => {
-    const init = async () => {
+  const ensureSessionInitialized = async (forceCreate: boolean = true): Promise<SupportSession | null> => {
+    if (initPromiseRef.current) {
+      const inFlight = await initPromiseRef.current
+      if (inFlight || !forceCreate || initForceRef.current) {
+        return inFlight
+      }
+    }
+
+    const resolved = getResolvedVisitorMeta()
+    const targetSessionId = activeSessionIdRef.current
+    initForceRef.current = forceCreate
+    const run = async (): Promise<SupportSession | null> => {
+      if (forceCreate) setIsInitializing(true)
       try {
         const res = await supportApi.initSession({
-          sessionId,
-          visitorId: sessionId,
+          sessionId: targetSessionId,
+          visitorId: targetSessionId,
           userId: user?.id,
-          visitorName: visitorName || undefined,
-          visitorEmail: visitorEmail || undefined,
-          visitorPhone: visitorPhone || undefined,
-          topic: selectedTopic,
-          selectedProducts: selectedProducts.length > 0 ? selectedProducts : undefined
+          visitorName: resolved.visitorName || undefined,
+          visitorEmail: resolved.visitorEmail || undefined,
+          visitorPhone: resolved.visitorPhone || undefined,
+          topic: sessionReady ? selectedTopic : undefined,
+          selectedProducts: forceCreate && selectedProducts.length > 0 ? selectedProducts : undefined,
+          resumeOnly: !forceCreate
         })
+        if (activeSessionIdRef.current !== targetSessionId) {
+          return null
+        }
         if (res.success && res.data) {
-          setSession(res.data)
-          if (res.data.topic) setSelectedTopic(res.data.topic as SupportTopic)
-          if (Array.isArray(res.data.selectedProducts) && res.data.selectedProducts.length > 0) {
-            setSelectedProducts(res.data.selectedProducts)
-          }
+          applySessionResponse(res.data)
+          return res.data
+        }
+        if (res.error && res.error.toLowerCase().includes('token mismatch')) {
+          supportApi.clearStoredToken(targetSessionId)
+          const freshId = createSupportSessionId()
+          localStorage.setItem('driveflyelectric_support_session_id', freshId)
+          setSessionReady(false)
+          setSessionId(freshId)
         }
       } catch {
         // Silent fallback
+      } finally {
+        if (forceCreate) setIsInitializing(false)
+        initForceRef.current = false
+        initPromiseRef.current = null
+      }
+      return null
+    }
+
+    const pending = run()
+    initPromiseRef.current = pending
+    return pending
+  }
+
+  // Sync registered user details & passively resume existing account/token session without spamming blank visitor records
+  useEffect(() => {
+    let cancelled = false
+
+    // If an authenticated user logs out, rotate to a fresh anonymous guest session ID
+    if (prevUserIdRef.current && !user?.id) {
+      prevUserIdRef.current = undefined
+      initPromiseRef.current = null
+      initForceRef.current = false
+      supportApi.clearStoredToken(sessionId)
+      const freshId = createSupportSessionId()
+      localStorage.setItem('driveflyelectric_support_session_id', freshId)
+      localStorage.removeItem('dfe_visitor_name')
+      localStorage.removeItem('dfe_visitor_email')
+      localStorage.removeItem('dfe_visitor_phone')
+      setVisitorName('')
+      setVisitorEmail('')
+      setVisitorPhone('')
+      setSession(null)
+      setSessionReady(false)
+      setSessionId(freshId)
+      return
+    }
+    prevUserIdRef.current = user?.id
+
+    const resolved = getResolvedVisitorMeta()
+
+    if (user) {
+      if (resolved.visitorName) {
+        setVisitorName(resolved.visitorName)
+        localStorage.setItem('dfe_visitor_name', resolved.visitorName)
+      }
+      if (resolved.visitorEmail) {
+        setVisitorEmail(resolved.visitorEmail)
+        localStorage.setItem('dfe_visitor_email', resolved.visitorEmail)
+      }
+      if (resolved.visitorPhone) {
+        setVisitorPhone(resolved.visitorPhone)
+        localStorage.setItem('dfe_visitor_phone', resolved.visitorPhone)
       }
     }
-    init()
 
-    const heartbeatInterval = setInterval(() => {
-      supportApi.sendHeartbeat(sessionId, {
-        isOnline: document.visibilityState === 'visible',
-        visitorName: visitorName || undefined,
-        visitorEmail: visitorEmail || undefined
+    const canResumeExisting = Boolean(user?.id) || supportApi.hasStoredToken(sessionId)
+    if (!canResumeExisting && !isChatOpenRef.current) {
+      return
+    }
+
+    const resumeOrInit = async () => {
+      const resumed = await ensureSessionInitialized(isChatOpenRef.current)
+      if (cancelled || !resumed) return
+    }
+    resumeOrInit()
+
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId, user?.id, user?.firstName, user?.lastName, user?.email, user?.phone])
+
+  // Lazily initialize chat session on first drawer open and clear client unread count when opened
+  useEffect(() => {
+    if (!isChatOpen) return
+    if (!sessionReady) {
+      ensureSessionInitialized(true)
+      return
+    }
+    supportApi.getSession(sessionId, true).then(res => {
+      if (res.success && res.data) {
+        setSession(res.data)
+      }
+    }).catch(() => { })
+  }, [isChatOpen, sessionReady, sessionId])
+
+  // Visibility-aware presence heartbeat + authenticated offline beacon on tab close
+  useEffect(() => {
+    if (!sessionReady) return
+
+    const sendPresenceHeartbeat = (isOnline: boolean) => {
+      const fullUserName = user ? `${user.firstName || ''} ${user.lastName || ''}`.trim() : ''
+      return supportApi.sendHeartbeat(sessionId, {
+        isOnline,
+        visitorName: fullUserName || visitorName || undefined,
+        visitorEmail: user?.email || visitorEmail || undefined
       }).then(res => {
         if (res.success && res.data) {
           setSession(res.data)
         }
       }).catch(() => { })
+    }
+
+    const heartbeatInterval = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        sendPresenceHeartbeat(true)
+      }
     }, 20000)
 
-    const handleOffline = () => {
-      const apiUrl = (import.meta as any).env?.VITE_API_URL || '/api'
-      const url = `${apiUrl}/support/session/${encodeURIComponent(sessionId)}/heartbeat`
+    const handleVisibilityChange = () => {
+      const isVisible = document.visibilityState === 'visible'
+      sendPresenceHeartbeat(isVisible)
+      if (isVisible && isChatOpenRef.current) {
+        supportApi.getSession(sessionId, true).then(res => {
+          if (res.success && res.data) setSession(res.data)
+        }).catch(() => { })
+      }
+    }
+
+    let offlineBeaconSent = false
+    const handleOfflineBeacon = () => {
+      if (offlineBeaconSent) return
+      offlineBeaconSent = true
+      const url = supportApi.getBeaconHeartbeatUrl(sessionId)
       if (navigator.sendBeacon) {
         const blob = new Blob([JSON.stringify({ isOnline: false })], { type: 'application/json' })
         navigator.sendBeacon(url, blob)
       }
     }
 
-    window.addEventListener('beforeunload', handleOffline)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('pagehide', handleOfflineBeacon)
+    window.addEventListener('beforeunload', handleOfflineBeacon)
     return () => {
       clearInterval(heartbeatInterval)
-      window.removeEventListener('beforeunload', handleOffline)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('pagehide', handleOfflineBeacon)
+      window.removeEventListener('beforeunload', handleOfflineBeacon)
     }
-  }, [sessionId, user?.id])
+  }, [sessionId, sessionReady, user?.id, visitorName, visitorEmail])
 
-  // Poll active conversation every 4s (passes isChatOpen so unread badge stays visible when drawer is closed and clears on open)
+  // Real-time SSE live chat stream (instant Admin reply delivery) + low-noise fallback poll
   useEffect(() => {
-    const poll = async () => {
-      try {
-        const res = await supportApi.getSession(sessionId, isChatOpen)
+    if (!sessionReady) return
+
+    const unsubscribeStream = supportApi.subscribeSessionStream(
+      sessionId,
+      (updatedSession) => {
+        setSession(updatedSession)
+        if (isChatOpenRef.current && Number(updatedSession.unreadClientCount || 0) > 0) {
+          supportApi.getSession(sessionId, true).then(res => {
+            if (res.success && res.data) {
+              setSession(res.data)
+            }
+          }).catch(() => { })
+        }
+      },
+      (connected) => {
+        const wasDisconnected = !sseConnectedRef.current
+        sseConnectedRef.current = connected
+        if (connected && wasDisconnected && isChatOpenRef.current) {
+          supportApi.getSession(sessionId, true).then(res => {
+            if (res.success && res.data) {
+              setSession(res.data)
+            }
+          }).catch(() => { })
+        }
+      }
+    )
+
+    const fallbackInterval = setInterval(() => {
+      if (sseConnectedRef.current || document.visibilityState !== 'visible') return
+      if (!isChatOpenRef.current) return
+      supportApi.getSession(sessionId, true).then(res => {
         if (res.success && res.data) {
           setSession(res.data)
         }
-      } catch {
-        // Silent fallback
-      }
+      }).catch(() => { })
+    }, 5000)
+
+    return () => {
+      unsubscribeStream()
+      clearInterval(fallbackInterval)
     }
-    poll()
-    const interval = setInterval(poll, 4000)
-    return () => clearInterval(interval)
-  }, [isChatOpen, sessionId])
+  }, [sessionId, sessionReady])
 
   // Auto-scroll to newest message
   useEffect(() => {
@@ -211,19 +402,31 @@ export const WhatsAppButton: React.FC = () => {
       ]
     setSelectedProducts(nextList)
     setChatError(null)
+    if (!exists && user?.role !== 'ADMIN') {
+      analyticsApi.trackProductView({
+        productId: prod.id,
+        productName: prod.name,
+        productSku: prod.sku,
+        category: prod.category,
+        price: Number(prod.price || 0),
+        imageUrl: prod.images?.[0] || null,
+        source: 'LIVECHAT_SELECT'
+      })
+    }
+    const resolved = getResolvedVisitorMeta()
     try {
       const res = await supportApi.initSession({
         sessionId,
         visitorId: sessionId,
         userId: user?.id,
-        visitorName: visitorName || undefined,
-        visitorEmail: visitorEmail || undefined,
-        visitorPhone: visitorPhone || undefined,
+        visitorName: resolved.visitorName || undefined,
+        visitorEmail: resolved.visitorEmail || undefined,
+        visitorPhone: resolved.visitorPhone || undefined,
         topic: selectedTopic,
         selectedProducts: nextList
       })
       if (res.success && res.data) {
-        setSession(res.data)
+        applySessionResponse(res.data)
       } else {
         setChatError(res.error || 'Could not update selected items in chat session.')
       }
@@ -236,19 +439,20 @@ export const WhatsAppButton: React.FC = () => {
   const handleSelectTopic = async (topic: SupportTopic) => {
     setSelectedTopic(topic)
     setChatError(null)
+    const resolved = getResolvedVisitorMeta()
     try {
       const res = await supportApi.initSession({
         sessionId,
         visitorId: sessionId,
         userId: user?.id,
-        visitorName: visitorName || undefined,
-        visitorEmail: visitorEmail || undefined,
-        visitorPhone: visitorPhone || undefined,
+        visitorName: resolved.visitorName || undefined,
+        visitorEmail: resolved.visitorEmail || undefined,
+        visitorPhone: resolved.visitorPhone || undefined,
         topic,
         selectedProducts
       })
       if (res.success && res.data) {
-        setSession(res.data)
+        applySessionResponse(res.data)
       } else {
         setChatError(res.error || 'Could not update inquiry topic.')
       }
@@ -266,6 +470,8 @@ export const WhatsAppButton: React.FC = () => {
         ? `I am interested in [${selectedTopic}] regarding: ${selectedProducts.map(p => `${p.name} ($${Number(p.price).toLocaleString()})`).join(', ')}. Can you share availability, specs, and purchase details?`
         : `I need assistance with: ${selectedTopic}.`)
 
+    const resolved = getResolvedVisitorMeta()
+
     setChatError(null)
     setIsSending(true)
     try {
@@ -273,12 +479,12 @@ export const WhatsAppButton: React.FC = () => {
         content: textToSend,
         topic: selectedTopic,
         selectedProducts,
-        visitorName: visitorName || undefined,
-        visitorEmail: visitorEmail || undefined,
-        visitorPhone: visitorPhone || undefined
+        visitorName: resolved.visitorName || undefined,
+        visitorEmail: resolved.visitorEmail || undefined,
+        visitorPhone: resolved.visitorPhone || undefined
       })
       if (res.success && res.data) {
-        setSession(res.data)
+        applySessionResponse(res.data)
         setIsCatalogueOpen(false)
       } else {
         setChatError(res.error || 'Unable to submit inquiry. Please check your details and try again.')
@@ -296,9 +502,11 @@ export const WhatsAppButton: React.FC = () => {
     const trimmed = messageInput.trim()
     if (!trimmed || isSending) return
 
-    if (visitorName) localStorage.setItem('dfe_visitor_name', visitorName)
-    if (visitorEmail) localStorage.setItem('dfe_visitor_email', visitorEmail)
-    if (visitorPhone) localStorage.setItem('dfe_visitor_phone', visitorPhone)
+    const resolved = getResolvedVisitorMeta()
+
+    if (resolved.visitorName) localStorage.setItem('dfe_visitor_name', resolved.visitorName)
+    if (resolved.visitorEmail) localStorage.setItem('dfe_visitor_email', resolved.visitorEmail)
+    if (resolved.visitorPhone) localStorage.setItem('dfe_visitor_phone', resolved.visitorPhone)
 
     setChatError(null)
     setIsSending(true)
@@ -307,12 +515,12 @@ export const WhatsAppButton: React.FC = () => {
         content: trimmed,
         topic: selectedTopic,
         selectedProducts,
-        visitorName: visitorName || undefined,
-        visitorEmail: visitorEmail || undefined,
-        visitorPhone: visitorPhone || undefined
+        visitorName: resolved.visitorName || undefined,
+        visitorEmail: resolved.visitorEmail || undefined,
+        visitorPhone: resolved.visitorPhone || undefined
       })
       if (res.success && res.data) {
-        setSession(res.data)
+        applySessionResponse(res.data)
         setMessageInput('')
       } else {
         setChatError(res.error || 'Failed to send message. Please try again.')
@@ -355,11 +563,15 @@ export const WhatsAppButton: React.FC = () => {
                     DriveFlyElectric LiveChat
                   </h3>
                   <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                    Online
+                    {session?.aiPaused ? 'Live Specialist' : 'Online'}
                   </span>
                 </div>
-                <p className="text-[10px] text-gray-400">
-                  Order &amp; Vehicle Support
+                <p className="text-[10px] text-gray-400 truncate max-w-[195px]">
+                  {session?.aiPaused
+                    ? 'Connected with live support specialist'
+                    : user
+                    ? `Account: ${visitorName || user.email}`
+                    : 'Order & Vehicle Support'}
                 </p>
               </div>
             </div>
@@ -400,7 +612,13 @@ export const WhatsAppButton: React.FC = () => {
                   className="text-[10px] font-bold text-creamy-600 dark:text-creamy-400 hover:underline flex items-center gap-1"
                 >
                   <UserIcon className="w-3 h-3" />
-                  <span>{visitorEmail ? visitorEmail : 'Add Your Email/Name'}</span>
+                  <span>
+                    {user
+                      ? visitorEmail || user.email
+                      : visitorEmail
+                      ? visitorEmail
+                      : 'Add Your Email/Name'}
+                  </span>
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-1.5">
@@ -473,7 +691,7 @@ export const WhatsAppButton: React.FC = () => {
                         selectedProducts
                       }).then(res => {
                         if (res.success && res.data) {
-                          setSession(res.data)
+                          applySessionResponse(res.data)
                           setIsContactOpen(false)
                         } else {
                           setChatError(res.error || 'Please enter a valid email address.')
@@ -617,6 +835,11 @@ export const WhatsAppButton: React.FC = () => {
 
           {/* Messages Thread */}
           <div className="flex-1 overflow-y-auto p-3.5 space-y-3 min-h-[230px] max-h-[320px] bg-white dark:bg-[#13151b]">
+            {isInitializing && (!session?.messages || session.messages.length === 0) && (
+              <div className="rounded-2xl px-3.5 py-2.5 text-xs bg-gray-100 dark:bg-[#1c1f28] text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-neutral-800 animate-pulse">
+                Connecting to DriveFlyElectric LiveChat...
+              </div>
+            )}
             {(session?.messages || []).map(msg => {
               const isClient = msg.senderRole === 'CLIENT'
               const isAdmin = msg.senderRole === 'ADMIN'

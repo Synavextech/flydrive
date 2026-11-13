@@ -24,6 +24,23 @@ export interface OrderReceiptData {
   }>
 }
 
+let cachedRuntimeSupportEmail: string | null = null
+
+export function setSupportContactEmail(email?: string | null): void {
+  const trimmed = String(email || '').trim()
+  if (trimmed.includes('@')) {
+    cachedRuntimeSupportEmail = trimmed
+  }
+}
+
+export function getSupportContactEmail(): string {
+  if (cachedRuntimeSupportEmail && cachedRuntimeSupportEmail.includes('@')) {
+    return cachedRuntimeSupportEmail
+  }
+  const envEmail = String((import.meta as any).env?.VITE_SUPPORT_EMAIL || '').trim()
+  return envEmail.includes('@') ? envEmail : 'support@driveflyelectric.shop'
+}
+
 export function getSupportWhatsAppDigits(): string {
   const digits = String((import.meta as any).env?.VITE_WHATSAPP_NUMBER || '19785236630').replace(/\D/g, '')
   return digits || '19785236630'
@@ -78,7 +95,7 @@ export const generateReceiptText = (r: OrderReceiptData): string => {
     `Full details for this order have been reviewed by customer`,
     `Additional Transaction Details:`,
     `If you've purchased this item, it means you know the item you purchased and have agreed with our terms and conditions that apply to final order settlement.`,
-    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (${supportPhone}) if you have any questions or concerns. They're available 24/7.`,
+    `Feel free to contact our Customer Service via email (${getSupportContactEmail()}) or WhatsApp (${supportPhone}) if you have any questions or concerns. They're available 24/7.`,
     `Regards,`,
     `DriveFlyElectric Team`,
     `https://driveflyelectric.shop/`
@@ -200,7 +217,7 @@ export const generateReceiptPdfBytes = (r: OrderReceiptData): Uint8Array => {
   commands.push('0.85 0.85 0.85 RG 0.75 w 50 54 m 562 54 l S')
   commands.push('0.45 0.45 0.48 rg')
   commands.push(
-    'BT /F1 8 Tf 50 42 Td (Verified Electronic Receipt  |  DriveFlyElectric  |  info-eurotopmobility@driveflyelectric.shop) Tj ET'
+    `BT /F1 8 Tf 50 42 Td (${escapePdfText(`Verified Electronic Receipt  |  DriveFlyElectric  |  ${getSupportContactEmail()}`)}) Tj ET`
   )
 
   const streamContent = commands.join('\n')

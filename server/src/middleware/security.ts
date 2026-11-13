@@ -285,3 +285,92 @@ export function getFormattedSupportWhatsApp(): string {
   return `+${digits || '19785236630'}`
 }
 
+const VALID_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/
+
+export function isValidEmailAddress(email?: unknown): email is string {
+  if (typeof email !== 'string') return false
+  return VALID_EMAIL_REGEX.test(email.trim())
+}
+
+/**
+ * Returns valid system/admin notification contact email(s) configured via SYSTEM_NOTIFICATION_EMAIL.
+ * Never mixes ADMIN_EMAIL (portal login username) or outbound SMTP sender addresses into alert recipients.
+ */
+export function getSystemNotificationEmails(): string[] {
+  const raw = String(process.env.SYSTEM_NOTIFICATION_EMAIL || 'support@driveflyelectric.shop')
+  const valid = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => isValidEmailAddress(entry))
+
+  return valid.length > 0 ? Array.from(new Set(valid)) : ['support@driveflyelectric.shop']
+}
+
+/**
+ * Primary public/admin customer support contact email (SYSTEM_NOTIFICATION_EMAIL first entry).
+ */
+export function getAdminContactEmail(): string {
+  return getSystemNotificationEmails()[0] || 'support@driveflyelectric.shop'
+}
+
+/**
+ * Outbound SMTP mailbox used for sending system & customer inquiry emails.
+ */
+export function getInquirySenderEmail(): string {
+  const candidates = [process.env.SMTP_EMAIL, process.env.SMTP_USER]
+  for (const candidate of candidates) {
+    if (isValidEmailAddress(candidate)) {
+      return candidate.trim()
+    }
+  }
+  return 'info-eurotopmobility@driveflyelectric.shop'
+}
+
+/**
+ * Extracts buyer email(s) and postal code persisted inside structured guest order notes.
+ */
+export function extractGuestMetadataFromNotes(notes?: string | null): {
+  emails: string[]
+  zips: string[]
+} {
+  if (!notes) return { emails: [], zips: [] }
+  const emails: string[] = []
+  const zips: string[] = []
+
+  const emailMatches = notes.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)
+  if (emailMatches) {
+    emails.push(...Array.from(new Set(emailMatches.map((e) => e.trim().toLowerCase()))))
+  }
+
+  const postalMatch = notes.match(/Postal:\s*([A-Za-z0-9 -]{2,20})/i)
+  if (postalMatch?.[1]) {
+    zips.push(postalMatch[1].trim().toLowerCase())
+  }
+
+  return { emails, zips }
+}
+
+/**
+ * Resolves all unique, valid recipient email addresses for an order (explicit + user + guest notes).
+ */
+export function resolveOrderCustomerEmails(
+  order: any,
+  ...explicitEmails: Array<string | null | undefined>
+): string[] {
+  const noteEmails = extractGuestMetadataFromNotes(order?.notes).emails
+  const candidates = [
+    ...explicitEmails,
+    order?.user?.email,
+    order?.shippingAddress?.email,
+    ...noteEmails
+  ]
+
+  const deduped = new Set<string>()
+  for (const candidate of candidates) {
+    if (isValidEmailAddress(candidate)) {
+      deduped.add(candidate.trim())
+    }
+  }
+  return Array.from(deduped)
+}
+

@@ -1,6 +1,8 @@
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
+import { useEffect } from 'react'
+import { BrowserRouter as Router, Routes, Route, useLocation } from 'react-router-dom'
 import { ThemeProvider } from './contexts/ThemeContext'
-import { AuthProvider } from './contexts/AuthContext'
+import { AuthProvider, useAuth } from './contexts/AuthContext'
+import { analyticsApi } from './services/api'
 import { ProductProvider } from './contexts/ProductContext'
 import { CartProvider } from './contexts/CartContext'
 import Navbar from './components/Navbar'
@@ -15,6 +17,19 @@ import OrderSuccessPage from './pages/OrderSuccessPage'
 import ProtectedRoute from './components/ProtectedRoute'
 import WhatsAppButton from './components/WhatsAppButton'
 
+function RouteVisitTracker() {
+  const location = useLocation()
+  const { user, isLoading } = useAuth()
+
+  useEffect(() => {
+    if (isLoading) return
+    if (user?.role === 'ADMIN' || location.pathname.startsWith('/admin')) return
+    analyticsApi.trackSiteVisit(`${location.pathname}${location.search || ''}`)
+  }, [location.pathname, location.search, user?.role, isLoading])
+
+  return null
+}
+
 function App() {
   return (
     <ThemeProvider>
@@ -22,6 +37,7 @@ function App() {
         <ProductProvider>
           <CartProvider>
             <Router>
+              <RouteVisitTracker />
               <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-[#0e1014] dark:text-white transition-colors duration-200">
               <Navbar />
               <Routes>

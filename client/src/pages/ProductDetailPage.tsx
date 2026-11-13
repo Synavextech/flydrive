@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   Star,
   Truck,
@@ -25,6 +25,7 @@ import {
 import { useProducts } from '../contexts/ProductContext'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
+import { analyticsApi } from '../services/api'
 import { ShareProductButton } from '../components/ShareProductButton'
 import { BookComingSoonModal } from '../components/BookComingSoonModal'
 import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
@@ -46,6 +47,7 @@ const isVideoMedia = (url?: string) => {
 export const ProductDetailPage = () => {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
   const {
     currentProduct: rawProduct,
     fetchProductById,
@@ -119,6 +121,36 @@ export const ProductDetailPage = () => {
       }, 150)
     }
   }, [currentProduct?.id])
+
+  // Track checked / inspected product page view
+  useEffect(() => {
+    if (!currentProduct || currentProduct.id !== id || user?.role === 'ADMIN') return
+    analyticsApi.trackProductView({
+      productId: currentProduct.id,
+      productName: currentProduct.name,
+      productSku: currentProduct.sku,
+      category: currentProduct.category,
+      price: Number(currentProduct.price || 0),
+      imageUrl: currentProduct.images?.[0] || null,
+      source: 'PRODUCT_PAGE',
+      path: location.pathname
+    })
+  }, [currentProduct?.id, id, user?.role, location.pathname])
+
+  // Track booking modal check from product detail view
+  useEffect(() => {
+    if (!isBookingModalOpen || !currentProduct || user?.role === 'ADMIN') return
+    analyticsApi.trackProductView({
+      productId: currentProduct.id,
+      productName: currentProduct.name,
+      productSku: currentProduct.sku,
+      category: currentProduct.category,
+      price: Number(currentProduct.price || 0),
+      imageUrl: currentProduct.images?.[0] || null,
+      source: 'BOOKING_MODAL',
+      path: location.pathname
+    })
+  }, [isBookingModalOpen, currentProduct?.id, user?.role, location.pathname])
 
   // Dynamic Product SEO Meta Tags & JSON-LD Product Structured Data
   useEffect(() => {
@@ -242,9 +274,24 @@ export const ProductDetailPage = () => {
     setIsLightboxOpen(true)
   }
 
+  const trackDetailCartCheck = () => {
+    if (!currentProduct || user?.role === 'ADMIN') return
+    analyticsApi.trackProductView({
+      productId: currentProduct.id,
+      productName: currentProduct.name,
+      productSku: currentProduct.sku,
+      category: currentProduct.category,
+      price: Number(currentProduct.price || 0),
+      imageUrl: currentProduct.images?.[0] || null,
+      source: 'CART_ADD',
+      path: location.pathname
+    })
+  }
+
   const handleAddToCart = () => {
     if (currentProduct) {
       addToCart(currentProduct, quantity)
+      trackDetailCartCheck()
       setAddedNotice(true)
       setTimeout(() => setAddedNotice(false), 2500)
     }
@@ -253,6 +300,7 @@ export const ProductDetailPage = () => {
   const handleBuyNow = () => {
     if (currentProduct) {
       addToCart(currentProduct, quantity)
+      trackDetailCartCheck()
       navigate('/checkout')
     }
   }

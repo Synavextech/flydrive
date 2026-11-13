@@ -119,6 +119,12 @@ app.use(
   })
 )
 
+// Preserve raw JSON payload strictly for Stripe webhook signature verification
+app.use(
+  '/api/payments/stripe/webhook',
+  express.raw({ type: 'application/json', limit: '2mb' })
+)
+
 // Body parsing middleware
 app.use(express.json({ limit: '5mb' }))
 app.use(express.urlencoded({ extended: true, limit: '5mb' }))
@@ -296,14 +302,7 @@ app.post('/api/addresses', protect, createAddress)
 app.put('/api/addresses/:id', protect, updateAddress)
 app.delete('/api/addresses/:id', protect, deleteAddress)
 
-// Public Real-Time Client LiveChat & Support Routes (rate-limited + visitor session token protected)
-const supportRateLimit = createRateLimiter({
-  windowMs: 15 * 60 * 1000,
-  max: 60,
-  keyPrefix: 'support-chat',
-  message: 'Too many support chat requests. Please wait a moment.'
-})
-
+// Public Real-Time Client LiveChat & Support Routes (unlimited messaging; session-token & registered-account scoped)
 const supportSelectedProductSchema = z.object({
   id: z.string().trim().min(1).max(120),
   name: z.string().trim().min(1).max(200),
@@ -333,7 +332,8 @@ const supportSessionInitSchema = z.object({
   selectedProducts: z.array(supportSelectedProductItemSchema).max(20).optional(),
   visitorName: z.string().trim().max(120).optional(),
   visitorEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
-  visitorPhone: z.string().trim().max(40).optional()
+  visitorPhone: z.string().trim().max(40).optional(),
+  resumeOnly: z.boolean().optional()
 })
 
 const supportMessageSchema = z.object({
@@ -345,15 +345,25 @@ const supportMessageSchema = z.object({
   visitorPhone: z.string().trim().max(40).optional()
 })
 
-function hasSupportSessionAccess(req: express.Request, sessionId: string): boolean {
+function hasSupportSessionAccess(req: express.Request, sessionId: string, existingSession?: any): boolean {
   if (req.user?.role === 'ADMIN') return true
+  if (req.user?.id && existingSession) {
+    if (existingSession.userId && existingSession.userId === req.user.id) return true
+    if (
+      existingSession.visitorEmail &&
+      req.user.email &&
+      String(existingSession.visitorEmail).trim().toLowerCase() === String(req.user.email).trim().toLowerCase()
+    ) {
+      return true
+    }
+  }
   const token = String(
     (req.headers['x-support-token'] as string) || (req.query.token as string) || ''
   ).trim()
   return verifySupportVisitorToken(sessionId, token)
 }
 
-app.post('/api/support/session', supportRateLimit, optionalAuth, async (req, res) => {
+app.post('/api/support/session', optionalAuth, async (req, res) => {
   try {
     const parsed = supportSessionInitSchema.safeParse(req.body || {})
     if (!parsed.success) {
@@ -366,7 +376,10 @@ app.post('/api/support/session', supportRateLimit, optionalAuth, async (req, res
     const requestedId = parsed.data.id || parsed.data.sessionId || parsed.data.visitorId
     if (requestedId) {
       const existing = await databaseService.getSupportSession(requestedId)
-      if (existing && !hasSupportSessionAccess(req, requestedId)) {
+      if (existing && !hasSupportSessionAccess(req, requestedId, existing)) {
+        if (parsed.data.resumeOnly) {
+          return res.status(200).json({ success: true, data: null })
+        }
         return res.status(403).json({
           success: false,
           error: 'Support session token mismatch. Please start a new chat session.'
@@ -376,9 +389,14 @@ app.post('/api/support/session', supportRateLimit, optionalAuth, async (req, res
 
     const session = await databaseService.upsertSupportSession({
       ...parsed.data,
-      userId: req.user?.id
+      userId: req.user?.id,
+      registeredUser: req.user
     })
+    if (!session) {
+      return res.status(200).json({ success: true, data: null })
+    }
     const visitorToken = signSupportVisitorToken(session.id)
+    emailService.emitSupportSync(session, 'session_updated')
     res.status(200).json({ success: true, data: session, visitorToken })
   } catch (err) {
     console.error('Support session init error:', err)
@@ -386,32 +404,83 @@ app.post('/api/support/session', supportRateLimit, optionalAuth, async (req, res
   }
 })
 
-app.get('/api/support/session/:id', supportRateLimit, optionalAuth, async (req, res) => {
+app.get('/api/support/session/:id/stream', optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
-    if (!hasSupportSessionAccess(req, sessionId)) {
+    const existing = await databaseService.getSupportSession(sessionId)
+    if (!hasSupportSessionAccess(req, sessionId, existing)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to stream this support session.'
+      })
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream')
+    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
+    res.flushHeaders?.()
+
+    res.write(
+      `event: connected\ndata: ${JSON.stringify({ connected: true, sessionId, timestamp: new Date().toISOString() })}\n\n`
+    )
+
+    const onUpdate = (payload: any) => {
+      if (payload?.session) {
+        res.write(`event: session_update\ndata: ${JSON.stringify(payload.session)}\n\n`)
+      }
+    }
+
+    emailService.supportEmitter.on(`session:${sessionId}`, onUpdate)
+
+    const heartbeat = setInterval(() => {
+      res.write(`: heartbeat\n\n`)
+    }, 25000)
+
+    req.on('close', () => {
+      clearInterval(heartbeat)
+      emailService.supportEmitter.off(`session:${sessionId}`, onUpdate)
+    })
+  } catch (err) {
+    console.error('Support stream error:', err)
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: 'Failed to open support stream' })
+    }
+  }
+})
+
+app.get('/api/support/session/:id', optionalAuth, async (req, res) => {
+  try {
+    const sessionId = req.params.id
+    const existing = await databaseService.getSupportSession(sessionId)
+    if (!hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized to access this support session.'
       })
     }
 
+    const hadUnreadClient = Boolean(existing && Number(existing.unreadClientCount || 0) > 0)
     await databaseService.updateSupportPresence(sessionId, true)
-    if (req.query.open === 'true') {
+    if (req.query.open === 'true' && hadUnreadClient) {
       await databaseService.markSupportSessionRead(sessionId, 'CLIENT')
     }
     const session = await databaseService.getSupportSession(sessionId)
     if (!session) {
       return res.status(404).json({ success: false, error: 'Support session not found' })
     }
-    res.status(200).json({ success: true, data: session })
+    if (req.query.open === 'true' && hadUnreadClient) {
+      emailService.emitSupportSync(session, 'client_read')
+    }
+    const visitorToken = signSupportVisitorToken(session.id)
+    res.status(200).json({ success: true, data: session, visitorToken })
   } catch (err) {
     console.error('Support session fetch error:', err)
     res.status(500).json({ success: false, error: 'Failed to load support session' })
   }
 })
 
-app.post('/api/support/session/:id/messages', supportRateLimit, optionalAuth, async (req, res) => {
+app.post('/api/support/session/:id/messages', optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
     const parsed = supportMessageSchema.safeParse(req.body || {})
@@ -423,7 +492,7 @@ app.post('/api/support/session/:id/messages', supportRateLimit, optionalAuth, as
     }
 
     const existing = await databaseService.getSupportSession(sessionId)
-    if (existing && !hasSupportSessionAccess(req, sessionId)) {
+    if (existing && !hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized to post to this support session.'
@@ -433,15 +502,18 @@ app.post('/api/support/session/:id/messages', supportRateLimit, optionalAuth, as
     const { content, topic, selectedProducts, visitorName, visitorEmail, visitorPhone } = parsed.data
     const result = await databaseService.appendSupportMessage(sessionId, {
       senderRole: 'CLIENT',
-      senderName: visitorName || 'Store Visitor',
+      senderName: visitorName || undefined,
       content,
       topic,
       selectedProducts,
+      userId: req.user?.id,
+      registeredUser: req.user,
       visitorName,
       visitorEmail: visitorEmail || undefined,
       visitorPhone
     })
 
+    emailService.emitSupportSync(result.session, 'client_message')
     emailService
       .sendSupportInquiryAlert(result.session, content)
       .catch((err) => console.error('Support inquiry alert error:', err))
@@ -459,17 +531,132 @@ app.post('/api/support/session/:id/messages', supportRateLimit, optionalAuth, as
   }
 })
 
-app.post('/api/support/session/:id/heartbeat', supportRateLimit, optionalAuth, async (req, res) => {
+app.post('/api/support/session/:id/heartbeat', optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
-    if (!hasSupportSessionAccess(req, sessionId)) {
+    const existing = await databaseService.getSupportSession(sessionId)
+    if (!hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({ success: false })
     }
-    const isOnline = req.body?.isOnline !== undefined ? Boolean(req.body.isOnline) : true
+    const isOnline =
+      req.body?.isOnline !== undefined
+        ? Boolean(req.body.isOnline)
+        : req.query.isOnline !== undefined
+        ? req.query.isOnline !== 'false'
+        : true
     const session = await databaseService.updateSupportPresence(sessionId, isOnline, req.body)
+    if (session && (!existing || Boolean(existing.isOnline) !== Boolean(session.isOnline))) {
+      emailService.emitSupportSync(session, 'presence')
+    }
     res.status(200).json({ success: true, data: session })
   } catch {
     res.status(200).json({ success: false })
+  }
+})
+
+// Storefront analytics tracking (site visits & checked products)
+const analyticsRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 120,
+  keyPrefix: 'storefront-analytics',
+  message: 'Analytics rate limit exceeded'
+})
+
+const analyticsVisitSchema = z.object({
+  visitorId: z.string().trim().min(1).max(120),
+  sessionKey: z.string().trim().min(1).max(120).optional(),
+  path: z.string().trim().min(1).max(300),
+  referrer: z.string().trim().max(400).nullable().optional()
+})
+
+const analyticsProductViewSchema = z.object({
+  productId: z.string().trim().min(1).max(120),
+  productName: z.string().trim().max(200).optional(),
+  productSku: z.string().trim().max(100).nullable().optional(),
+  category: z.string().trim().max(100).nullable().optional(),
+  price: z.number().finite().nonnegative().optional(),
+  imageUrl: z.string().trim().max(500).nullable().optional(),
+  visitorId: z.string().trim().min(1).max(120),
+  sessionKey: z.string().trim().min(1).max(120).optional(),
+  source: z.enum(['PRODUCT_PAGE', 'CART_ADD', 'BOOKING_MODAL', 'LIVECHAT_SELECT', 'SHARE']).default('PRODUCT_PAGE'),
+  path: z.string().trim().max(300).nullable().optional()
+})
+
+function extractAnalyticsContext(req: express.Request, pathValue?: string | null) {
+  const skip = req.user?.role === 'ADMIN' || Boolean(pathValue && pathValue.startsWith('/admin'))
+  const forwarded = req.headers['x-forwarded-for']
+  const ip =
+    (typeof forwarded === 'string' ? forwarded.split(',')[0]?.trim() : null) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    null
+  const country =
+    (req.headers['cf-ipcountry'] as string) ||
+    (req.headers['x-vercel-ip-country'] as string) ||
+    null
+  return {
+    skip,
+    ip,
+    country,
+    userAgent: req.get('user-agent') || null,
+    userId: req.user?.id || null,
+    userEmail: req.user?.email || null
+  }
+}
+
+app.post('/api/analytics/visit', analyticsRateLimiter, optionalAuth, async (req, res) => {
+  try {
+    const parsed = analyticsVisitSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: 'Invalid visit payload' })
+    }
+    const ctx = extractAnalyticsContext(req, parsed.data.path)
+    if (ctx.skip) {
+      return res.status(200).json({ success: true, recorded: false })
+    }
+    const result = await databaseService.recordSiteVisit({
+      visitorId: parsed.data.visitorId,
+      sessionKey: parsed.data.sessionKey,
+      path: parsed.data.path,
+      referrer: parsed.data.referrer || req.get('referer') || null,
+      userId: ctx.userId,
+      userEmail: ctx.userEmail,
+      userAgent: ctx.userAgent,
+      country: ctx.country,
+      ip: ctx.ip
+    })
+    if (result.recorded && result.visit) {
+      emailService.emitAnalyticsSync('visit', result.visit)
+    }
+    res.status(200).json({ success: true, recorded: result.recorded })
+  } catch (error) {
+    console.error('Error recording site visit:', error)
+    res.status(200).json({ success: false, recorded: false })
+  }
+})
+
+app.post('/api/analytics/product-view', analyticsRateLimiter, optionalAuth, async (req, res) => {
+  try {
+    const parsed = analyticsProductViewSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: 'Invalid product view payload' })
+    }
+    const ctx = extractAnalyticsContext(req, parsed.data.path)
+    if (ctx.skip) {
+      return res.status(200).json({ success: true, recorded: false })
+    }
+    const result = await databaseService.recordProductView({
+      ...parsed.data,
+      userId: ctx.userId,
+      userEmail: ctx.userEmail
+    })
+    if (result.recorded && result.view) {
+      emailService.emitAnalyticsSync('product_view', result.view)
+    }
+    res.status(200).json({ success: true, recorded: result.recorded })
+  } catch (error) {
+    console.error('Error recording product view:', error)
+    res.status(200).json({ success: false, recorded: false })
   }
 })
 
@@ -508,11 +695,13 @@ async function connectDatabase() {
 
 // Graceful shutdown
 process.on('SIGINT', () => {
+  emailService.stopCartReminderScheduler()
   console.log('🛑 Shutting down server...')
   process.exit(0)
 })
 
 process.on('SIGTERM', () => {
+  emailService.stopCartReminderScheduler()
   console.log('🛑 Shutting down server...')
   process.exit(0)
 })
@@ -520,6 +709,9 @@ process.on('SIGTERM', () => {
 // Start server
 async function startServer() {
   await connectDatabase()
+  emailService.loadRecentActivities(50).catch(() => {})
+  emailService.verifySmtpConnection().catch(() => {})
+  emailService.startCartReminderScheduler()
 
   app.listen(PORT, () => {
     console.log(`🚀 DriveFlyElectric server is running on port ${PORT}`)

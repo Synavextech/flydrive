@@ -8,6 +8,7 @@ export interface AuthUser {
   role: string
   firstName?: string | null
   lastName?: string | null
+  phone?: string | null
 }
 
 function getJwtSecret(): string {
@@ -59,7 +60,8 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
       email: user.email,
       role: user.role,
       firstName: user.firstName,
-      lastName: user.lastName
+      lastName: user.lastName,
+      phone: user.phone ?? null
     }
 
     next()
@@ -83,7 +85,7 @@ export const authorize = (...roles: string[]) => {
   }
 }
 
-export const optionalAuth = async (req: Request, res: Response, next: NextFunction) => {
+export const optionalAuth = async (req: Request, _res: Response, next: NextFunction) => {
   let token: string | undefined
 
   if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
@@ -106,7 +108,8 @@ export const optionalAuth = async (req: Request, res: Response, next: NextFuncti
         email: user.email,
         role: user.role,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        phone: user.phone ?? null
       }
     }
   } catch (error) {

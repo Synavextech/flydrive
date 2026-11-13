@@ -1,6 +1,8 @@
 import { Request, Response } from 'express'
 import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
+import { isValidEmailAddress } from '../middleware/security.js'
+import type { CartReminderItem } from '../types/database.js'
 
 const addToCartSchema = z.object({
   productId: z.string().trim().min(1, 'Product ID is required.').max(100),
@@ -84,6 +86,7 @@ export const addToCart = async (req: Request, res: Response) => {
     }
 
     const cartItem = await databaseService.addToCart(userId, productId, quantity)
+    databaseService.syncUserCartReminder(userId).catch(() => {})
 
     res.status(201).json({
       success: true,
@@ -152,6 +155,7 @@ export const updateCartItem = async (req: Request, res: Response) => {
     }
 
     const updatedCartItem = await databaseService.updateCartItem(cartItemId, quantity)
+    databaseService.syncUserCartReminder(req.user!.id).catch(() => {})
 
     res.status(200).json({
       success: true,
@@ -195,6 +199,7 @@ export const removeFromCart = async (req: Request, res: Response) => {
     }
 
     await databaseService.removeCartItem(cartItemId)
+    databaseService.syncUserCartReminder(req.user!.id).catch(() => {})
 
     res.status(200).json({
       success: true,
@@ -217,6 +222,14 @@ export const clearCart = async (req: Request, res: Response) => {
     const userId = req.user!.id
 
     await databaseService.clearCart(userId)
+    databaseService
+      .markCartRemindersInactive({
+        userId,
+        email: req.user?.email || null,
+        visitorId: typeof req.body?.visitorId === 'string' ? req.body.visitorId : null,
+        status: 'CLEARED'
+      })
+      .catch(() => {})
 
     res.status(200).json({
       success: true,
@@ -274,5 +287,124 @@ export const getCartSummary = async (req: Request, res: Response) => {
       success: false,
       error: 'Server Error'
     })
+  }
+}
+
+const reminderSnapshotSchema = z.object({
+  email: z.string().trim().email().max(254).optional().or(z.literal('')),
+  customerName: z.string().trim().max(150).optional(),
+  visitorId: z.string().trim().max(120).optional(),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().trim().min(1).max(100),
+        quantity: z.coerce.number().int().min(1).max(50).default(1)
+      })
+    )
+    .max(25)
+    .optional()
+})
+
+// @desc    Sync cart snapshot for progressive abandoned-cart reminder emails (1h, 6h, 12h, 24h, 48h, 72h)
+// @route   POST /api/cart/reminder-snapshot
+// @access  Public / OptionalAuth
+export const syncCartReminderSnapshot = async (req: Request, res: Response) => {
+  try {
+    const parsed = reminderSnapshotSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid cart reminder payload.'
+      })
+    }
+
+    const userId = req.user?.id || null
+    const targetEmail = (parsed.data.email || req.user?.email || '').trim().toLowerCase()
+    const visitorId = (parsed.data.visitorId || '').trim() || null
+
+    if (!targetEmail || !isValidEmailAddress(targetEmail)) {
+      return res.status(200).json({
+        success: true,
+        skipped: true
+      })
+    }
+
+    // Authenticated user without explicit items payload: sync directly from authoritative DB cart
+    if (userId && !parsed.data.items) {
+      await databaseService.syncUserCartReminder(userId)
+      return res.status(200).json({ success: true })
+    }
+
+    const rawItems = parsed.data.items || []
+    if (rawItems.length === 0) {
+      await databaseService.markCartRemindersInactive({
+        userId,
+        visitorId,
+        email: targetEmail,
+        status: 'CLEARED'
+      })
+      return res.status(200).json({ success: true, cleared: true })
+    }
+
+    const aggregated = new Map<string, number>()
+    for (const entry of rawItems) {
+      aggregated.set(entry.productId, (aggregated.get(entry.productId) || 0) + entry.quantity)
+    }
+
+    const authoritativeItems: CartReminderItem[] = []
+    for (const [productId, quantity] of aggregated.entries()) {
+      const prod = await databaseService.findProductById(productId)
+      if (!prod || prod.isActive === false || prod.isComingSoon) continue
+      authoritativeItems.push({
+        productId: prod.id,
+        name: prod.name,
+        price: Number(prod.price || 0),
+        quantity: Math.min(50, quantity),
+        image: Array.isArray(prod.images) && prod.images[0] ? String(prod.images[0]) : undefined
+      })
+    }
+
+    const customerName =
+      parsed.data.customerName?.trim() ||
+      (req.user ? `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim() : '') ||
+      null
+
+    const saved = await databaseService.upsertCartReminderSnapshot({
+      userId,
+      visitorId,
+      email: targetEmail,
+      customerName,
+      items: authoritativeItems
+    })
+
+    return res.status(200).json({
+      success: true,
+      data: saved ? { id: saved.id, itemCount: saved.itemCount, subtotal: saved.subtotal } : null
+    })
+  } catch (error) {
+    console.error('Cart reminder snapshot sync error:', error)
+    return res.status(500).json({
+      success: false,
+      error: 'Unable to sync cart reminder snapshot.'
+    })
+  }
+}
+
+// @desc    Clear pending unpaid-cart reminder snapshots for guest or user
+// @route   DELETE /api/cart/reminder-snapshot
+// @access  Public / OptionalAuth
+export const clearCartReminderSnapshot = async (req: Request, res: Response) => {
+  try {
+    const email = String(req.body?.email || req.query?.email || req.user?.email || '').trim().toLowerCase()
+    const visitorId = String(req.body?.visitorId || req.query?.visitorId || '').trim()
+    await databaseService.markCartRemindersInactive({
+      userId: req.user?.id || null,
+      visitorId: visitorId || null,
+      email: isValidEmailAddress(email) ? email : null,
+      status: 'CLEARED'
+    })
+    return res.status(200).json({ success: true })
+  } catch {
+    return res.status(200).json({ success: false })
   }
 }

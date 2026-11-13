@@ -1,7 +1,8 @@
 import express, { Request } from 'express'
+import Stripe from 'stripe'
 import { z } from 'zod'
 import { optionalAuth } from '../middleware/auth.js'
-import { createRateLimiter, resolveSafeRedirectOrigin } from '../middleware/security.js'
+import { createRateLimiter, getAdminContactEmail, resolveSafeRedirectOrigin } from '../middleware/security.js'
 import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
 import {
@@ -113,7 +114,8 @@ router.get('/config', async (_req, res) => {
       paypalClientId,
       paypalMerchantId,
       paypalMode,
-      paypalClientToken
+      paypalClientToken,
+      supportEmail: getAdminContactEmail()
     }
   })
 })
@@ -198,13 +200,27 @@ router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (
     })
   } catch (error: any) {
     console.error('Stripe create-intent error:', error)
-    const message =
+    const isInventoryOrCartError =
       error?.message?.includes('Coming Soon') ||
       error?.message?.includes('Inventory') ||
       error?.message?.includes('Insufficient inventory') ||
       error?.message?.includes('available')
-        ? error.message
-        : 'Unable to initialize Stripe card payment. Please verify your cart and try again.'
+    const message = isInventoryOrCartError
+      ? error.message
+      : 'Unable to initialize Stripe card payment. Please verify your cart and try again.'
+
+    if (!isInventoryOrCartError) {
+      emailService
+        .recordPaymentFailure({
+          gateway: 'STRIPE',
+          stage: 'Intent Initialization',
+          userEmail: req.body?.customerEmail || req.user?.email || undefined,
+          reason: error?.message || message,
+          notifySystem: false
+        })
+        .catch(() => {})
+    }
+
     res.status(400).json({
       success: false,
       error: message
@@ -213,7 +229,7 @@ router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (
 })
 
 // Confirm / Check status of Stripe payment
-router.post('/stripe/confirm', paymentInitRateLimit, async (req, res) => {
+router.post('/stripe/confirm', paymentInitRateLimit, optionalAuth, async (req, res) => {
   try {
     const parsed = z
       .object({
@@ -231,16 +247,32 @@ router.post('/stripe/confirm', paymentInitRateLimit, async (req, res) => {
     const stripe = getStripeClient()
     const paymentIntent = await stripe.paymentIntents.retrieve(parsed.data.paymentIntentId)
     const usdAmount = paymentIntent.amount / 100
+    const payerEmail = paymentIntent.receipt_email || req.user?.email || undefined
 
     if (paymentIntent.status === 'succeeded') {
       emailService.recordActivity({
         type: 'PAYMENT_CAPTURED',
         title: `Stripe Card Payment Settled • $${usdAmount.toFixed(2)} USD`,
         message: `Stripe PaymentIntent (${paymentIntent.id}) verified as SUCCEEDED for $${usdAmount.toFixed(2)} USD.`,
+        userEmail: payerEmail,
         amount: usdAmount,
         emailDispatched: false,
         systemMailDispatched: false
       })
+    } else if (paymentIntent.status !== 'processing') {
+      emailService
+        .recordPaymentFailure({
+          gateway: 'STRIPE',
+          stage: 'Card Confirmation',
+          amount: usdAmount,
+          userEmail: payerEmail,
+          referenceId: paymentIntent.id,
+          reason:
+            paymentIntent.last_payment_error?.message ||
+            `Stripe PaymentIntent status: ${paymentIntent.status}.`,
+          notifySystem: paymentIntent.status === 'requires_payment_method' || paymentIntent.status === 'canceled'
+        })
+        .catch(() => {})
     }
 
     res.status(200).json({
@@ -252,11 +284,231 @@ router.post('/stripe/confirm', paymentInitRateLimit, async (req, res) => {
         currency: paymentIntent.currency
       }
     })
-  } catch (error) {
+  } catch (error: any) {
     console.error('Stripe confirm error:', error)
+    emailService
+      .recordPaymentFailure({
+        gateway: 'STRIPE',
+        stage: 'Card Confirmation',
+        userEmail: req.user?.email || undefined,
+        referenceId: req.body?.paymentIntentId,
+        reason: error?.message || 'Unable to confirm Stripe payment status.',
+        notifySystem: true
+      })
+      .catch(() => {})
+
     res.status(500).json({
       success: false,
       error: 'Unable to confirm Stripe payment status.'
+    })
+  }
+})
+
+const processedStripeEventIds = new Set<string>()
+function markStripeEventProcessed(eventId: string) {
+  processedStripeEventIds.add(eventId)
+  if (processedStripeEventIds.size > 500) {
+    const oldest = processedStripeEventIds.values().next().value
+    if (oldest) processedStripeEventIds.delete(oldest)
+  }
+}
+
+function extractStripeObjectId(ref?: string | { id?: string } | null): string | undefined {
+  if (!ref) return undefined
+  return typeof ref === 'string' ? ref : ref.id
+}
+
+// Verified Stripe Webhook endpoint (expects raw JSON Buffer mounted in server/src/index.ts)
+router.post('/stripe/webhook', async (req, res) => {
+  const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim()
+  if (!webhookSecret) {
+    return res.status(503).json({
+      success: false,
+      error: 'Stripe webhook secret is not configured on the server.'
+    })
+  }
+
+  const signature = req.headers['stripe-signature']
+  if (!signature || typeof signature !== 'string' || !Buffer.isBuffer(req.body)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing Stripe signature header or raw webhook payload.'
+    })
+  }
+
+  let event: Stripe.Event
+  try {
+    const stripe = getStripeClient()
+    event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret)
+  } catch (err: any) {
+    console.warn('Stripe webhook signature verification failed:', err?.message)
+    return res.status(400).json({
+      success: false,
+      error: `Webhook signature verification failed: ${err?.message || 'Invalid signature'}`
+    })
+  }
+
+  if (processedStripeEventIds.has(event.id)) {
+    return res.status(200).json({ received: true, duplicate: true })
+  }
+
+  try {
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        const pi = event.data.object as Stripe.PaymentIntent
+        const amountUsd = (pi.amount_received || pi.amount || 0) / 100
+        const payerEmail = pi.receipt_email || undefined
+        const existingOrder = await databaseService.findOrderByPaymentId(pi.id)
+
+        if (existingOrder) {
+          if (existingOrder.paymentStatus !== 'COMPLETED' || existingOrder.status === 'PENDING') {
+            const nextStatus = existingOrder.status === 'PENDING' ? 'PROCESSING' : existingOrder.status
+            const updated = await databaseService.updateOrderPaymentAndStatus(existingOrder.id, {
+              paymentStatus: 'COMPLETED',
+              paymentVerified: true,
+              status: nextStatus
+            })
+            if (existingOrder.status === 'PENDING') {
+              emailService.sendOrderStatusUpdate(updated, payerEmail).catch(() => {})
+            }
+          }
+        } else {
+          emailService.recordActivity({
+            type: 'PAYMENT_CAPTURED',
+            title: `Stripe Webhook Payment Settled • $${amountUsd.toFixed(2)} USD`,
+            message: `Stripe PaymentIntent (${pi.id}) confirmed via signed webhook for $${amountUsd.toFixed(2)} USD.`,
+            userEmail: payerEmail,
+            amount: amountUsd,
+            metadata: {
+              gateway: 'STRIPE',
+              webhookEventId: event.id,
+              paymentIntentId: pi.id
+            },
+            emailDispatched: false,
+            systemMailDispatched: false
+          })
+        }
+        break
+      }
+
+      case 'payment_intent.payment_failed': {
+        const pi = event.data.object as Stripe.PaymentIntent
+        const amountUsd = (pi.amount || 0) / 100
+        const payerEmail = pi.receipt_email || undefined
+        const reason = pi.last_payment_error?.message || 'Card payment failed during Stripe authorization.'
+        const existingOrder = await databaseService.findOrderByPaymentId(pi.id)
+
+        if (existingOrder && existingOrder.paymentStatus !== 'COMPLETED') {
+          await databaseService
+            .updateOrderPaymentAndStatus(existingOrder.id, {
+              paymentStatus: 'FAILED',
+              status: 'CANCELLED'
+            })
+            .catch(() => {})
+        }
+
+        await emailService
+          .recordPaymentFailure({
+            gateway: 'STRIPE',
+            stage: 'Webhook payment_intent.payment_failed',
+            amount: amountUsd,
+            userEmail: payerEmail,
+            referenceId: pi.id,
+            reason,
+            notifySystem: true
+          })
+          .catch(() => {})
+        break
+      }
+
+      case 'charge.refunded': {
+        const charge = event.data.object as Stripe.Charge
+        const paymentIntentId = extractStripeObjectId(charge.payment_intent)
+        const refundedUsd = (charge.amount_refunded || charge.amount || 0) / 100
+        const payerEmail = charge.receipt_email || charge.billing_details?.email || undefined
+        const isFullRefund = Boolean(charge.refunded) || charge.amount_refunded >= charge.amount
+        const existingOrder = paymentIntentId
+          ? await databaseService.findOrderByPaymentId(paymentIntentId)
+          : null
+
+        if (existingOrder) {
+          if (isFullRefund && (existingOrder.status !== 'REFUNDED' || existingOrder.paymentStatus !== 'REFUNDED')) {
+            const updated = await databaseService.updateOrderPaymentAndStatus(existingOrder.id, {
+              status: 'REFUNDED',
+              paymentStatus: 'REFUNDED'
+            })
+            emailService.sendOrderStatusUpdate(updated, payerEmail).catch(() => {})
+          } else if (!isFullRefund) {
+            emailService.recordActivity({
+              type: 'ORDER_REFUNDED',
+              title: `Stripe Partial Refund • #${existingOrder.orderNumber}`,
+              message: `Partial refund of $${refundedUsd.toFixed(2)} USD issued on Stripe charge ${charge.id}.`,
+              userEmail: payerEmail,
+              orderNumber: existingOrder.orderNumber,
+              amount: refundedUsd,
+              metadata: {
+                gateway: 'STRIPE',
+                webhookEventId: event.id,
+                chargeId: charge.id,
+                paymentIntentId
+              },
+              emailDispatched: false,
+              systemMailDispatched: false
+            })
+          }
+        } else {
+          emailService.recordActivity({
+            type: 'ORDER_REFUNDED',
+            title: `Stripe Refund Processed • $${refundedUsd.toFixed(2)} USD`,
+            message: `Stripe signed webhook recorded refund on charge ${charge.id}${paymentIntentId ? ` (${paymentIntentId})` : ''}.`,
+            userEmail: payerEmail,
+            amount: refundedUsd,
+            metadata: {
+              gateway: 'STRIPE',
+              webhookEventId: event.id,
+              chargeId: charge.id,
+              paymentIntentId
+            },
+            emailDispatched: false,
+            systemMailDispatched: false
+          })
+        }
+        break
+      }
+
+      case 'charge.dispute.created': {
+        const dispute = event.data.object as Stripe.Dispute
+        const paymentIntentId = extractStripeObjectId(dispute.payment_intent)
+        const disputeUsd = (dispute.amount || 0) / 100
+        const existingOrder = paymentIntentId
+          ? await databaseService.findOrderByPaymentId(paymentIntentId)
+          : null
+
+        await emailService
+          .recordPaymentFailure({
+            gateway: 'STRIPE',
+            stage: 'Chargeback Dispute Opened',
+            amount: disputeUsd,
+            userEmail: existingOrder?.user?.email,
+            referenceId: paymentIntentId || dispute.id,
+            reason: `Stripe dispute ${dispute.id} opened (${dispute.reason || 'general'}) • Status: ${dispute.status}`,
+            notifySystem: true
+          })
+          .catch(() => {})
+        break
+      }
+
+      default:
+        break
+    }
+
+    markStripeEventProcessed(event.id)
+    return res.status(200).json({ received: true, eventType: event.type })
+  } catch (err: any) {
+    console.error(`Stripe webhook processing error (${event.type}):`, err)
+    return res.status(500).json({
+      success: false,
+      error: 'Webhook handler encountered an internal error.'
     })
   }
 })
@@ -357,6 +609,17 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
 
     if (!orderRes.ok) {
       console.error('PayPal create-order API rejected:', orderData)
+      emailService
+        .recordPaymentFailure({
+          gateway: 'PAYPAL',
+          stage: 'Order Initialization',
+          amount: pricing.total,
+          userEmail: customerEmail,
+          reason: orderData?.message || orderData?.details?.[0]?.description || 'PayPal create-order rejected.',
+          notifySystem: false
+        })
+        .catch(() => {})
+
       return res.status(502).json({
         success: false,
         error: 'PayPal could not initialize this checkout session. Please verify your address and try again.'
@@ -386,12 +649,26 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
     })
   } catch (error: any) {
     console.error('PayPal create-order error:', error)
-    const message =
+    const isInventoryError =
       error?.message?.includes('Coming Soon') ||
       error?.message?.includes('Insufficient inventory') ||
       error?.message?.includes('available')
-        ? error.message
-        : 'Unable to initialize PayPal checkout. Please try again.'
+    const message = isInventoryError
+      ? error.message
+      : 'Unable to initialize PayPal checkout. Please try again.'
+
+    if (!isInventoryError) {
+      emailService
+        .recordPaymentFailure({
+          gateway: 'PAYPAL',
+          stage: 'Order Initialization',
+          userEmail: req.body?.customerEmail || req.user?.email || undefined,
+          reason: error?.message || message,
+          notifySystem: false
+        })
+        .catch(() => {})
+    }
+
     res.status(400).json({
       success: false,
       error: message
@@ -400,7 +677,7 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
 })
 
 // Capture PayPal Order (Called by PayPal JS SDK onApprove / CardFields or Return Redirect)
-router.post('/paypal/capture', paymentInitRateLimit, async (req, res) => {
+router.post('/paypal/capture', paymentInitRateLimit, optionalAuth, async (req, res) => {
   try {
     const parsed = z
       .object({
@@ -430,9 +707,21 @@ router.post('/paypal/capture', paymentInitRateLimit, async (req, res) => {
 
     if (!captureRes.ok) {
       console.error('PayPal capture API rejected:', captureData)
+      const reason = captureData?.details?.[0]?.description || 'Payment authorization was declined or could not be captured.'
+      emailService
+        .recordPaymentFailure({
+          gateway: 'PAYPAL',
+          stage: 'Order Capture',
+          userEmail: req.user?.email || undefined,
+          referenceId: orderId,
+          reason,
+          notifySystem: true
+        })
+        .catch(() => {})
+
       return res.status(400).json({
         success: false,
-        error: captureData?.details?.[0]?.description || 'Payment authorization was declined or could not be captured.'
+        error: reason
       })
     }
 
@@ -463,8 +752,19 @@ router.post('/paypal/capture', paymentInitRateLimit, async (req, res) => {
         payer: captureData.payer
       }
     })
-  } catch (error) {
+  } catch (error: any) {
     console.error('PayPal capture error:', error)
+    emailService
+      .recordPaymentFailure({
+        gateway: 'PAYPAL',
+        stage: 'Order Capture',
+        userEmail: req.user?.email || undefined,
+        referenceId: req.body?.orderId,
+        reason: error?.message || 'Unable to capture PayPal payment.',
+        notifySystem: true
+      })
+      .catch(() => {})
+
     res.status(500).json({
       success: false,
       error: 'Unable to capture PayPal payment. Please contact support if charged.'

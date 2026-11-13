@@ -5,12 +5,16 @@ import { supabase } from '../utils/supabase.js'
 const INTERNAL_EVENT_CATEGORIES = new Set([
   'LIVECHAT_SESSION',
   'PRODUCT_REVIEW',
-  'PRODUCT_BOOKING'
+  'PRODUCT_BOOKING',
+  'SYSTEM_ACTIVITY',
+  'CART_REMINDER',
+  'SITE_VISIT',
+  'PRODUCT_VIEW'
 ])
 
 /**
  * GET /api/events
- * Query public events from Supabase database (excluding internal chat/review/booking records)
+ * Query public events from Supabase database (excluding internal chat/review/booking/activity records)
  */
 export const getEvents = async (req: Request, res: Response) => {
   try {
@@ -28,7 +32,7 @@ export const getEvents = async (req: Request, res: Response) => {
     let queryBuilder = supabase
       .from('events')
       .select('*', { count: 'exact' })
-      .or('category.is.null,and(category.neq.LIVECHAT_SESSION,category.neq.PRODUCT_REVIEW,category.neq.PRODUCT_BOOKING)')
+      .or('category.is.null,and(category.neq.LIVECHAT_SESSION,category.neq.PRODUCT_REVIEW,category.neq.PRODUCT_BOOKING,category.neq.SYSTEM_ACTIVITY,category.neq.CART_REMINDER,category.neq.SITE_VISIT,category.neq.PRODUCT_VIEW)')
 
     if (category) {
       queryBuilder = queryBuilder.ilike('category', String(category).trim().slice(0, 60))

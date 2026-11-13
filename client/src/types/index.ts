@@ -267,6 +267,7 @@ export interface SupportSession {
   id: string
   visitorId: string
   userId?: string
+  isRegisteredUser?: boolean
   visitorName: string
   visitorEmail?: string
   visitorPhone?: string
@@ -278,7 +279,107 @@ export interface SupportSession {
   lastSeenText?: string
   unreadAdminCount: number
   unreadClientCount: number
+  aiPaused?: boolean
   createdAt: string
   updatedAt: string
   messages: SupportMessage[]
+}
+
+export type ProductViewSource =
+  | 'PRODUCT_PAGE'
+  | 'CART_ADD'
+  | 'BOOKING_MODAL'
+  | 'LIVECHAT_SELECT'
+  | 'SHARE'
+
+export interface SiteVisitRecord {
+  id: string
+  visitorId: string
+  sessionKey: string
+  userId?: string | null
+  userEmail?: string | null
+  path: string
+  referrer?: string | null
+  userAgent?: string | null
+  deviceType: 'desktop' | 'mobile' | 'tablet'
+  country?: string | null
+  createdAt: string
+}
+
+export interface ProductViewRecord {
+  id: string
+  productId: string
+  productName: string
+  productSku?: string | null
+  category?: string | null
+  price: number
+  imageUrl?: string | null
+  visitorId: string
+  sessionKey?: string | null
+  userId?: string | null
+  userEmail?: string | null
+  source: ProductViewSource
+  path?: string | null
+  createdAt: string
+}
+
+export interface TrafficAnalyticsSummary {
+  periodDays: number
+  totalVisits: number
+  visitsToday: number
+  visitsLast7d: number
+  uniqueVisitors: number
+  uniqueVisitorsToday: number
+  uniqueVisitorsLast7d: number
+  totalProductViews: number
+  productViewsToday: number
+  uniqueProductsChecked: number
+  deviceBreakdown: {
+    desktop: number
+    mobile: number
+    tablet: number
+  }
+  topPages: Array<{
+    path: string
+    visits: number
+    uniqueVisitors: number
+    lastVisitedAt: string
+  }>
+  topReferrers: Array<{
+    referrer: string
+    visits: number
+  }>
+  topProductsChecked: Array<{
+    productId: string
+    productName: string
+    productSku?: string | null
+    category?: string | null
+    price: number
+    imageUrl?: string | null
+    totalViews: number
+    pageViews: number
+    cartAdds: number
+    bookingChecks: number
+    chatSelections: number
+    uniqueVisitors: number
+    lastViewedAt: string
+  }>
+  dailySeries: Array<{
+    date: string
+    label: string
+    visits: number
+    uniqueVisitors: number
+    productViews: number
+  }>
+  recentVisits: SiteVisitRecord[]
+  recentProductViews: ProductViewRecord[]
+}
+
+export interface AdminAnalyticsData {
+  revenueByMonth: Array<{ month: string; revenue: number; orders: number }>
+  ordersByStatus: Array<{ status: string; _count: { id: number } }>
+  topProducts: Product[]
+  recentActivity: Order[]
+  activeCartRemindersCount?: number
+  trafficAnalytics: TrafficAnalyticsSummary
 }
