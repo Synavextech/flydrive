@@ -1,7 +1,44 @@
-import { ApiResponse, Product, ProductReview, Cart, Order, TrackedOrderDetails, User, Address, SupportSession, SupportSelectedProduct } from '../types'
+import {
+  ApiResponse,
+  Product,
+  ProductBooking,
+  ProductReview,
+  Cart,
+  Order,
+  TrackedOrderDetails,
+  User,
+  Address,
+  SupportSession,
+  SupportSelectedProduct
+} from '../types'
 
 // API base URL
 const API_URL = (import.meta as any).env?.VITE_API_URL || '/api'
+
+function getSupportTokenKey(sessionId: string): string {
+  return `dfe_support_token_${sessionId}`
+}
+
+function getFriendlyHttpError(status: number): string {
+  switch (status) {
+    case 400:
+      return 'Please check your entered information and try again.'
+    case 401:
+      return 'Please sign in to continue.'
+    case 403:
+      return 'You do not have permission to perform this action.'
+    case 404:
+      return 'The requested item could not be found.'
+    case 409:
+      return 'This action conflicts with an existing record.'
+    case 429:
+      return 'Too many requests right now. Please wait a moment and try again.'
+    default:
+      return status >= 500
+        ? 'Our service encountered a temporary issue. Please try again shortly.'
+        : 'Unable to complete your request. Please try again.'
+  }
+}
 
 // Generic API request function
 async function apiRequest<T>(
@@ -26,6 +63,7 @@ async function apiRequest<T>(
   }
 
   const config: RequestInit = {
+    credentials: 'include',
     ...options,
     headers
   }
@@ -36,27 +74,32 @@ async function apiRequest<T>(
     const isJson = contentType.includes('application/json')
 
     if (!response.ok) {
-      let errorMessage = `HTTP error! status: ${response.status}`
+      let errorMessage = getFriendlyHttpError(response.status)
+      let requiresVerification = false
+
       if (isJson) {
         try {
           const errorData = await response.json()
           errorMessage = errorData.error || errorData.message || errorMessage
+          if (errorData.requiresVerification) {
+            requiresVerification = true
+          }
         } catch {
-          // Fallback to HTTP error
-        }
-      } else {
-        const text = await response.text()
-        if (text && !text.includes('<!DOCTYPE') && text.length < 150) {
-          errorMessage = text
-        } else {
-          errorMessage = `Endpoint ${endpoint} returned ${response.status} (${response.statusText || 'Error'})`
+          // Use friendly fallback message
         }
       }
-      throw new Error(errorMessage)
+
+      const err = new Error(errorMessage) as Error & {
+        status?: number
+        requiresVerification?: boolean
+      }
+      err.status = response.status
+      err.requiresVerification = requiresVerification
+      throw err
     }
 
     if (!isJson) {
-      throw new Error(`Server returned non-JSON response for ${endpoint} (${contentType || 'text'})`)
+      throw new Error('Received an unexpected response format. Please refresh and try again.')
     }
 
     return await response.json()
@@ -152,6 +195,24 @@ export const productApi = {
       body: formData,
     })
   },
+
+  // Reserve / book a Coming Soon vehicle for launch & dispatch priority
+  bookComingSoonVehicle: async (
+    productId: string,
+    payload: {
+      fullName: string
+      email: string
+      phone?: string
+      country: string
+      quantity?: number
+      notes?: string
+    }
+  ): Promise<ApiResponse<ProductBooking & { productName?: string }>> => {
+    return apiRequest(`/products/${encodeURIComponent(productId)}/book`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
 }
 
 // Cart API functions
@@ -230,8 +291,15 @@ export const orderApi = {
   },
 
   // Track order by Tracking Number (TRK-...) or Order Number (DFE-...)
-  trackOrder: async (identifier: string): Promise<ApiResponse<TrackedOrderDetails>> => {
-    return apiRequest(`/orders/track/${encodeURIComponent(identifier.trim())}`)
+  trackOrder: async (
+    identifier: string,
+    verification?: { email?: string; zip?: string }
+  ): Promise<ApiResponse<TrackedOrderDetails>> => {
+    const params = new URLSearchParams()
+    if (verification?.email?.trim()) params.set('email', verification.email.trim())
+    if (verification?.zip?.trim()) params.set('zip', verification.zip.trim())
+    const qs = params.toString()
+    return apiRequest(`/orders/track/${encodeURIComponent(identifier.trim())}${qs ? `?${qs}` : ''}`)
   },
 }
 
@@ -295,9 +363,13 @@ export const authApi = {
     return apiRequest('/auth/verify')
   },
 
-  // Logout (client-side only)
+  // Logout (clears token and server HttpOnly auth cookie)
   logout: (): void => {
     localStorage.removeItem('token')
+    fetch(`${API_URL}/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+    }).catch(() => {})
   },
 
   // Get current user
@@ -462,6 +534,21 @@ export const adminApi = {
       body: JSON.stringify(payload),
     })
   },
+
+  // Coming Soon vehicle reservations management (admin)
+  getBookings: async (): Promise<ApiResponse<ProductBooking[]>> => {
+    return apiRequest('/admin/bookings')
+  },
+
+  updateBookingStatus: async (
+    id: string,
+    status: ProductBooking['status']
+  ): Promise<ApiResponse<ProductBooking>> => {
+    return apiRequest(`/admin/bookings/${encodeURIComponent(id)}/status`, {
+      method: 'PUT',
+      body: JSON.stringify({ status }),
+    })
+  },
 }
 
 // Public Client LiveChat & Support API functions
@@ -476,14 +563,24 @@ export const supportApi = {
     topic?: string
     selectedProducts?: SupportSelectedProduct[]
   }): Promise<ApiResponse<SupportSession>> => {
-    return apiRequest('/support/session', {
+    const existingId = payload.sessionId
+    const storedToken = existingId ? localStorage.getItem(getSupportTokenKey(existingId)) : null
+    const res = await apiRequest<SupportSession>('/support/session', {
       method: 'POST',
+      headers: storedToken ? { 'x-support-token': storedToken } : undefined,
       body: JSON.stringify(payload),
     })
+    if (res.data?.id && res.visitorToken) {
+      localStorage.setItem(getSupportTokenKey(res.data.id), res.visitorToken)
+    }
+    return res
   },
 
   getSession: async (sessionId: string, isOpen?: boolean): Promise<ApiResponse<SupportSession>> => {
-    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}${isOpen ? '?open=true' : ''}`)
+    const storedToken = localStorage.getItem(getSupportTokenKey(sessionId))
+    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}${isOpen ? '?open=true' : ''}`, {
+      headers: storedToken ? { 'x-support-token': storedToken } : undefined,
+    })
   },
 
   sendMessage: async (
@@ -497,18 +594,26 @@ export const supportApi = {
       visitorPhone?: string
     }
   ): Promise<ApiResponse<SupportSession>> => {
-    return apiRequest(`/support/session/${encodeURIComponent(sessionId)}/messages`, {
+    const storedToken = localStorage.getItem(getSupportTokenKey(sessionId))
+    const res = await apiRequest<SupportSession>(`/support/session/${encodeURIComponent(sessionId)}/messages`, {
       method: 'POST',
+      headers: storedToken ? { 'x-support-token': storedToken } : undefined,
       body: JSON.stringify(payload),
     })
+    if (res.data?.id && res.visitorToken) {
+      localStorage.setItem(getSupportTokenKey(res.data.id), res.visitorToken)
+    }
+    return res
   },
 
   sendHeartbeat: async (
     sessionId: string,
     payload: { isOnline: boolean; visitorName?: string; visitorEmail?: string }
   ): Promise<ApiResponse<SupportSession>> => {
+    const storedToken = localStorage.getItem(getSupportTokenKey(sessionId))
     return apiRequest(`/support/session/${encodeURIComponent(sessionId)}/heartbeat`, {
       method: 'POST',
+      headers: storedToken ? { 'x-support-token': storedToken } : undefined,
       body: JSON.stringify(payload),
     })
   },
@@ -527,14 +632,29 @@ export const paymentApi = {
     return apiRequest('/payments/config')
   },
 
-  // Create Stripe payment intent (USD)
-  createStripePaymentIntent: async (amount: number, customerEmail?: string): Promise<ApiResponse<{
+  // Create Stripe payment intent (USD) with server-authoritative pricing
+  createStripePaymentIntent: async (
+    payload:
+      | number
+      | {
+          items: Array<{ productId: string; quantity: number }>
+          customerEmail?: string
+          shippingAddress?: Record<string, string | undefined>
+        },
+    customerEmail?: string
+  ): Promise<ApiResponse<{
     clientSecret: string
     paymentIntentId: string
+    amountUsd?: number
+    countryCode?: string
   }>> => {
+    const body =
+      typeof payload === 'number'
+        ? { amount: payload, customerEmail }
+        : payload
     return apiRequest('/payments/stripe/create-intent', {
       method: 'POST',
-      body: JSON.stringify({ amount, customerEmail }),
+      body: JSON.stringify(body),
     })
   },
 
@@ -549,14 +669,29 @@ export const paymentApi = {
     })
   },
 
-  // Create PayPal order (USD)
-  createPayPalOrder: async (amount: number, customerEmail?: string): Promise<ApiResponse<{
+  // Create PayPal order (USD) with server-authoritative pricing
+  createPayPalOrder: async (
+    payload:
+      | number
+      | {
+          items: Array<{ productId: string; quantity: number }>
+          customerEmail?: string
+          shippingAddress?: Record<string, string | undefined>
+        },
+    customerEmail?: string
+  ): Promise<ApiResponse<{
     orderId: string
-    approveUrl: string
+    approveUrl?: string
+    amountUsd?: number
+    countryCode?: string
   }>> => {
+    const body =
+      typeof payload === 'number'
+        ? { amount: payload, customerEmail }
+        : payload
     return apiRequest('/payments/paypal/create-order', {
       method: 'POST',
-      body: JSON.stringify({ amount, customerEmail }),
+      body: JSON.stringify(body),
     })
   },
 

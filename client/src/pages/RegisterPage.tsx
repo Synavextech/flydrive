@@ -30,6 +30,11 @@ const RegisterPage = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
+    if (formData.password.length < 8) {
+      setValidationError('Password must be at least 8 characters long')
+      return
+    }
+
     if (formData.password !== formData.confirmPassword) {
       setValidationError('Passwords do not match')
       return
@@ -142,10 +147,11 @@ const RegisterPage = () => {
                   name="password"
                   autoComplete="new-password"
                   required
+                  minLength={8}
                   value={formData.password}
                   onChange={handleInputChange}
                   className={`${inputClasses} pr-10`}
-                  placeholder="Minimum 6 characters"
+                  placeholder="Minimum 8 characters"
                 />
                 <button
                   type="button"

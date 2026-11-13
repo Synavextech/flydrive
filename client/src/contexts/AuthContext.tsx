@@ -107,6 +107,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       if (!token) return
 
       const response = await fetch(`${API_URL}/auth/verify`, {
+        credentials: 'include',
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -133,6 +134,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     try {
       const response = await fetch(`${API_URL}/auth/login`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -178,6 +180,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     try {
       const response = await fetch(`${API_URL}/auth/register`, {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -195,7 +198,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       }
 
       if (!response.ok) {
-        const errMessage = data?.error || data?.message || `Registration failed (${response.status} ${response.statusText || 'Error'})`
+        const errMessage =
+          data?.error ||
+          data?.message ||
+          'Unable to create your account right now. Please check your details and try again.'
         throw new Error(errMessage)
       }
 
@@ -215,6 +221,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   // Logout function
   const logout = () => {
+    fetch(`${API_URL}/auth/logout`, {
+      method: 'POST',
+      credentials: 'include',
+    }).catch(() => { })
     localStorage.removeItem('token')
     dispatch({ type: 'LOGOUT' })
   }

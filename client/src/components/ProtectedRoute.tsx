@@ -48,8 +48,7 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
           </div>
           <h2 className="text-xl font-black uppercase text-gray-900 dark:text-white mb-2">Access Restricted</h2>
           <p className="text-xs text-gray-600 dark:text-gray-400 mb-6 font-medium leading-relaxed">
-            Administrative permissions required. Your current account role is{' '}
-            <span className="font-bold text-creamy-500 uppercase">{user?.role}</span>.
+            This section requires authorized store administrator access.
           </p>
           <Link
             to="/"

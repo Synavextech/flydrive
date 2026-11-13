@@ -12,19 +12,20 @@ import {
   AlertTriangle,
   X,
   RefreshCw,
-  Image as ImageIcon,
   Download,
   FileText,
   Printer,
   Copy,
   Check,
   MessageSquare,
-  Send
+  Send,
+  CalendarClock,
+  Sparkles
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useProducts } from '../contexts/ProductContext'
 import { adminApi } from '../services/api'
-import { Product, Order, User, SupportSession } from '../types'
+import { Product, Order, User, SupportSession, ProductBooking } from '../types'
 import {
   OrderReceiptData,
   generateReceiptText,
@@ -48,7 +49,7 @@ const isVideoMedia = (url?: string) => {
 export const AdminDashboard: React.FC = () => {
   const { user } = useAuth()
   const { fetchProducts: fetchGlobalProducts } = useProducts()
-  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'users' | 'support'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'bookings' | 'users' | 'support'>('overview')
 
   // Dashboard Stats
   const [stats, setStats] = useState<{
@@ -68,7 +69,10 @@ export const AdminDashboard: React.FC = () => {
   // Data lists
   const [productsList, setProductsList] = useState<Product[]>([])
   const [ordersList, setOrdersList] = useState<Order[]>([])
+  const [bookingsList, setBookingsList] = useState<ProductBooking[]>([])
   const [usersList, setUsersList] = useState<User[]>([])
+  const [productStatusFilter, setProductStatusFilter] = useState<'ALL' | 'AVAILABLE' | 'COMING_SOON'>('ALL')
+  const [bookingStatusFilter, setBookingStatusFilter] = useState<'ALL' | ProductBooking['status']>('ALL')
 
   // Loading states
   const [isLoading, setIsLoading] = useState(true)
@@ -93,9 +97,11 @@ export const AdminDashboard: React.FC = () => {
     imageUrl: '',
     images: [] as string[],
     isNew: true,
+    isComingSoon: false,
+    comingSoonRelease: '',
     topSpeed: '60 km/h',
     range: '70 km',
-    deliveryTime: '21 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+    deliveryTime: '12-21 business days (Worldwide Express Dispatch)',
   })
 
   // Order status filter
@@ -137,10 +143,22 @@ export const AdminDashboard: React.FC = () => {
     }
   }
 
+  const fetchBookings = async () => {
+    try {
+      const res = await adminApi.getBookings()
+      if (res.success && Array.isArray(res.data)) {
+        setBookingsList(res.data)
+      }
+    } catch {
+      // Silent fallback
+    }
+  }
+
   useEffect(() => {
     fetchDashboardStats()
     fetchNotifications()
     fetchSupportSessions()
+    fetchBookings()
     const interval = setInterval(() => {
       fetchNotifications()
       fetchSupportSessions()
@@ -159,6 +177,7 @@ export const AdminDashboard: React.FC = () => {
   useEffect(() => {
     if (activeTab === 'products') fetchProducts()
     if (activeTab === 'orders') fetchOrders()
+    if (activeTab === 'bookings') fetchBookings()
     if (activeTab === 'users') fetchUsers()
     if (activeTab === 'support') fetchSupportSessions()
   }, [activeTab, orderFilter])
@@ -309,7 +328,11 @@ export const AdminDashboard: React.FC = () => {
         brand: productForm.brand || 'DriveFlyElectric',
         images: allImages,
         isNew: productForm.isNew,
-        averageDeliveryTime: productForm.deliveryTime || '21-35 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        isComingSoon: Boolean(productForm.isComingSoon),
+        comingSoonRelease: productForm.isComingSoon
+          ? (productForm.comingSoonRelease.trim() || null)
+          : null,
+        averageDeliveryTime: productForm.deliveryTime || '12-21 business days (Worldwide Express Dispatch)',
         isActive: true,
       }
 
@@ -373,9 +396,11 @@ export const AdminDashboard: React.FC = () => {
       imageUrl: imgs[0] || '',
       images: imgs,
       isNew: product.isNew,
+      isComingSoon: Boolean(product.isComingSoon),
+      comingSoonRelease: product.comingSoonRelease || '',
       topSpeed: '60 km/h',
       range: '70 km',
-      deliveryTime: product.averageDeliveryTime || '21-35 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+      deliveryTime: product.averageDeliveryTime || '12-21 business days (Worldwide Express Dispatch)',
     })
     setIsProductModalOpen(true)
   }
@@ -395,11 +420,26 @@ export const AdminDashboard: React.FC = () => {
       imageUrl: '',
       images: [],
       isNew: true,
+      isComingSoon: false,
+      comingSoonRelease: '',
       topSpeed: '65 km/h',
       range: '70 km',
-      deliveryTime: '21-35 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+      deliveryTime: '12-21 business days (Worldwide Express Dispatch)',
     })
     setIsProductModalOpen(true)
+  }
+
+  // Handle Coming Soon Booking Status Update
+  const handleUpdateBookingStatus = async (bookingId: string, nextStatus: ProductBooking['status']) => {
+    try {
+      const res = await adminApi.updateBookingStatus(bookingId, nextStatus)
+      if (res.success) {
+        notify('success', `Booking status updated to ${nextStatus}`)
+        fetchBookings()
+      }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to update booking status')
+    }
   }
 
   // Handle Order Status Update
@@ -574,7 +614,7 @@ export const AdminDashboard: React.FC = () => {
             <div className="flex items-center gap-2 text-xs font-bold text-creamy-500 uppercase tracking-widest mb-1">
               <span>DriveFlyElectric</span>
               <span>•</span>
-              <span>Nanshan, Shenzhen, Guangdong Province, China HQ Operations</span>
+              <span>Operations HQ</span>
               {user && (
                 <>
                   <span>•</span>
@@ -586,7 +626,7 @@ export const AdminDashboard: React.FC = () => {
               Management Dashboard
             </h1>
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              Store catalog administration, upload products, track Stripe & PayPal orders, and manage users.
+              Catalog administration, order fulfillment, customer accounts, and live support.
             </p>
           </div>
 
@@ -594,6 +634,7 @@ export const AdminDashboard: React.FC = () => {
             <button
               onClick={() => {
                 fetchDashboardStats()
+                fetchBookings()
                 if (activeTab === 'products') fetchProducts()
                 if (activeTab === 'orders') fetchOrders()
                 if (activeTab === 'users') fetchUsers()
@@ -638,6 +679,12 @@ export const AdminDashboard: React.FC = () => {
             { id: 'overview', label: 'Store Overview', icon: TrendingUp },
             { id: 'products', label: 'Fleet Products', icon: Package },
             { id: 'orders', label: 'Orders & Settlements', icon: ShoppingBag },
+            {
+              id: 'bookings',
+              label: 'Bookings',
+              icon: CalendarClock,
+              badge: bookingsList.filter(b => b.status === 'PENDING').length
+            },
             { id: 'users', label: 'User Accounts', icon: Users },
             {
               id: 'support',
@@ -692,7 +739,7 @@ export const AdminDashboard: React.FC = () => {
                   </div>
                 </div>
                 <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{stats.totalOrders}</p>
-                <span className="text-[10px] text-blue-500 font-bold mt-1 inline-block">Routed via Stripe & PayPal</span>
+                <span className="text-[10px] text-blue-500 font-bold mt-1 inline-block">Stripe &amp; PayPal Transactions</span>
               </div>
 
               <div className="bg-white dark:bg-[#16181e] p-6 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm">
@@ -714,16 +761,16 @@ export const AdminDashboard: React.FC = () => {
                   </div>
                 </div>
                 <p className="text-3xl font-black text-gray-900 dark:text-white font-anton">{stats.totalUsers || 1}</p>
-                <span className="text-[10px] text-purple-500 font-bold mt-1 inline-block">Supabase auth enabled</span>
+                <span className="text-[10px] text-purple-500 font-bold mt-1 inline-block">Verified Member Accounts</span>
               </div>
             </div>
 
             {/* Quick Actions & Store Config Note */}
             <div className="bg-white dark:bg-[#16181e] p-6 rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
               <div>
-                <h3 className="font-anton text-lg uppercase text-gray-900 dark:text-white">DriveFlyElectric — Nanshan, Shenzhen, Guangdong Province, China Warehouse</h3>
+                <h3 className="font-anton text-lg uppercase text-gray-900 dark:text-white">DriveFlyElectric — Operations &amp; Global Fulfillment</h3>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                  HQ: 1000 DriveFly Electric Way, Suite 400, Nanshan, Shenzhen, Guangdong Province, China.
+                  HQ: 1000 DriveFly Electric Way, Suite 400, Austin, TX 78701, United States.
                 </p>
               </div>
               <button
@@ -734,18 +781,18 @@ export const AdminDashboard: React.FC = () => {
               </button>
             </div>
 
-            {/* Real-Time System Activity & Integrated SMTP Notification Feed */}
+            {/* Live Store Activity & Email Dispatch Feed */}
             <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
               <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex items-center justify-between">
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
                     <h3 className="font-anton text-lg uppercase text-gray-900 dark:text-white">
-                      Real-Time System Activity & SMTP Mail Stream
+                      Live Store Activity &amp; Email Dispatch Feed
                     </h3>
                   </div>
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                    Live notifications for customer purchases (PDF receipts attached), account registrations, and order updates dispatched to customer and system mail.
+                    Real-time updates for confirmed purchases, PDF receipts, customer registrations, and dispatch alerts.
                   </p>
                 </div>
                 <button
@@ -772,6 +819,8 @@ export const AdminDashboard: React.FC = () => {
                           ? 'bg-blue-500/15 text-blue-500 border border-blue-500/30'
                           : typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY'
                           ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
+                          : typeStr === 'PRODUCT_BOOKING'
+                          ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
                           : typeStr === 'USER_REGISTERED' || typeStr === 'USER_LOGIN'
                           ? 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/30'
                           : 'bg-creamy-500/15 text-creamy-500 border border-creamy-500/30'
@@ -800,12 +849,21 @@ export const AdminDashboard: React.FC = () => {
                                 Reply in Support
                               </button>
                             )}
+                            {typeStr === 'PRODUCT_BOOKING' && (
+                              <button
+                                type="button"
+                                onClick={() => setActiveTab('bookings')}
+                                className="px-2.5 py-1 rounded-lg bg-amber-400 hover:bg-amber-300 text-black font-black text-[10px] uppercase tracking-wider"
+                              >
+                                View Booking
+                              </button>
+                            )}
                             <div className="text-right">
                               <span className="text-[10px] font-mono text-gray-400 block">
                                 {new Date(act.timestamp).toLocaleTimeString()}
                               </span>
                               <span className="text-[10px] font-bold text-emerald-500">
-                                {act.emailDispatched || act.systemMailDispatched ? 'SMTP Dispatched' : 'Logged & Streamed'}
+                                {act.emailDispatched || act.systemMailDispatched ? 'Email Sent' : 'Recorded'}
                               </span>
                             </div>
                           </div>
@@ -846,124 +904,179 @@ export const AdminDashboard: React.FC = () => {
         )}
 
         {/* Tab 2: PRODUCTS MANAGEMENT */}
-        {activeTab === 'products' && (
-          <div className="bg-white dark:bg-[#16181e] rounded-2xl shadow-sm border border-gray-200 dark:border-neutral-800 overflow-hidden">
-            <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-              <div>
-                <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">Fleet Products Catalog</h3>
-                <p className="text-xs text-gray-500 dark:text-gray-400">
-                  Total {productsList.length} items live. Create, update prices, or upload images directly.
-                </p>
+        {activeTab === 'products' && (() => {
+          const comingSoonCount = productsList.filter(p => Boolean(p.isComingSoon)).length
+          const visibleProducts = productsList.filter(p => {
+            if (productStatusFilter === 'COMING_SOON') return Boolean(p.isComingSoon)
+            if (productStatusFilter === 'AVAILABLE') return !p.isComingSoon
+            return true
+          })
+
+          return (
+            <div className="bg-white dark:bg-[#16181e] rounded-2xl shadow-sm border border-gray-200 dark:border-neutral-800 overflow-hidden">
+              <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                <div>
+                  <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">Fleet Products Catalog</h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Total {productsList.length} items ({comingSoonCount} marked Coming Soon). Create, categorize, update prices, or upload media directly.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex items-center rounded-xl border border-gray-200 dark:border-neutral-700 overflow-hidden bg-gray-50 dark:bg-[#1a1d24]">
+                    {[
+                      { id: 'ALL', label: `All (${productsList.length})` },
+                      { id: 'AVAILABLE', label: `In Store (${productsList.length - comingSoonCount})` },
+                      { id: 'COMING_SOON', label: `Coming Soon (${comingSoonCount})` },
+                    ].map((pill) => (
+                      <button
+                        key={pill.id}
+                        type="button"
+                        onClick={() => setProductStatusFilter(pill.id as any)}
+                        className={`px-3 py-1.5 text-[10px] font-black uppercase tracking-wider transition-colors ${
+                          productStatusFilter === pill.id
+                            ? pill.id === 'COMING_SOON'
+                              ? 'bg-amber-400 text-black'
+                              : 'bg-creamy-500 text-black'
+                            : 'text-gray-500 hover:text-gray-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {pill.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <button
+                    onClick={openAddModal}
+                    className="bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs flex items-center gap-1.5 shadow-md"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>Upload New Product</span>
+                  </button>
+                </div>
               </div>
-              <button
-                onClick={openAddModal}
-                className="bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-2.5 px-4 rounded-xl text-xs flex items-center gap-1.5 self-start sm:self-auto shadow-md"
-              >
-                <Plus className="w-4 h-4" />
-                <span>Upload New Product</span>
-              </button>
-            </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-gray-50 dark:bg-[#1f222a] text-gray-400 text-[11px] uppercase tracking-wider font-bold">
-                  <tr>
-                    <th className="px-6 py-3.5">Product & Image</th>
-                    <th className="px-6 py-3.5">SKU / Category</th>
-                    <th className="px-6 py-3.5">USD Price</th>
-                    <th className="px-6 py-3.5">Stock</th>
-                    <th className="px-6 py-3.5 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100 dark:divide-neutral-800">
-                  {productsList.length === 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-gray-50 dark:bg-[#1f222a] text-gray-400 text-[11px] uppercase tracking-wider font-bold">
                     <tr>
-                      <td colSpan={5} className="px-6 py-8 text-center text-gray-400">
-                        No products found. Click "Upload New Product" to add.
-                      </td>
+                      <th className="px-6 py-3.5">Product &amp; Image</th>
+                      <th className="px-6 py-3.5">SKU / Categorization</th>
+                      <th className="px-6 py-3.5">USD Price</th>
+                      <th className="px-6 py-3.5">Stock</th>
+                      <th className="px-6 py-3.5 text-right">Actions</th>
                     </tr>
-                  ) : (
-                    productsList.map((p) => (
-                      <tr key={p.id} className="hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors">
-                        <td className="px-6 py-4 flex items-center gap-3">
-                          <div className="w-12 h-12 rounded-xl bg-gray-100 dark:bg-neutral-800 overflow-hidden flex-shrink-0 border border-gray-200 dark:border-neutral-700">
-                            {p.images && p.images.length > 0 ? (
-                              isVideoMedia(p.images[0]) ? (
-                                <video
-                                  src={getSafeMediaUrl(p.images[0])}
-                                  className="w-full h-full object-cover"
-                                  muted
-                                  playsInline
-                                />
-                              ) : (
-                                <img
-                                  src={getSafeMediaUrl(p.images[0])}
-                                  alt={p.name}
-                                  className="w-full h-full object-cover"
-                                  onError={(e) => {
-                                    const target = e.target as HTMLImageElement
-                                    target.src = '/images/hero1.jpeg'
-                                  }}
-                                />
-                              )
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center text-gray-400 text-[10px]">
-                                No img
-                              </div>
-                            )}
-                          </div>
-                          <div>
-                            <p className="font-bold text-gray-900 dark:text-white truncate max-w-xs text-xs">{p.name}</p>
-                            <span className="text-[11px] text-gray-400">{p.brand || 'DriveFlyElectric'}</span>
-                          </div>
-                        </td>
-
-                        <td className="px-6 py-4">
-                          <p className="font-mono text-xs font-semibold text-gray-700 dark:text-gray-300">{p.sku}</p>
-                          <span className="text-[10px] text-creamy-500 uppercase font-black px-2 py-0.5 rounded bg-creamy-500/10">
-                            {p.category}
-                          </span>
-                        </td>
-
-                        <td className="px-6 py-4 font-black text-gray-900 dark:text-creamy-400">
-                          {formatPrice(p.price)}
-                        </td>
-
-                        <td className="px-6 py-4">
-                          <span
-                            className={`text-[10px] font-black uppercase px-2.5 py-1 rounded-full ${p.stock > 10
-                              ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400'
-                              : 'bg-red-100 dark:bg-red-950/40 text-red-700 dark:text-red-400'
-                              }`}
-                          >
-                            {p.stock} units
-                          </span>
-                        </td>
-
-                        <td className="px-6 py-4 text-right space-x-2">
-                          <button
-                            onClick={() => openEditModal(p)}
-                            className="p-1.5 text-gray-500 hover:text-creamy-500 rounded-lg hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
-                            title="Edit"
-                          >
-                            <Edit2 className="w-4 h-4" />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteProduct(p.id, p.name)}
-                            className="p-1.5 text-red-500 hover:text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 dark:divide-neutral-800">
+                    {visibleProducts.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-6 py-8 text-center text-gray-400">
+                          {productsList.length === 0
+                            ? 'No products found. Click "Upload New Product" to add.'
+                            : 'No items match the selected filter.'}
                         </td>
                       </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+                    ) : (
+                      visibleProducts.map((p) => (
+                        <tr key={p.id} className="hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors">
+                          <td className="px-6 py-4 flex items-center gap-3">
+                            <div className="w-12 h-12 rounded-xl bg-gray-100 dark:bg-neutral-800 overflow-hidden flex-shrink-0 border border-gray-200 dark:border-neutral-700">
+                              {p.images && p.images.length > 0 ? (
+                                isVideoMedia(p.images[0]) ? (
+                                  <video
+                                    src={getSafeMediaUrl(p.images[0])}
+                                    className="w-full h-full object-cover"
+                                    muted
+                                    playsInline
+                                  />
+                                ) : (
+                                  <img
+                                    src={getSafeMediaUrl(p.images[0])}
+                                    alt={p.name}
+                                    className="w-full h-full object-cover"
+                                    onError={(e) => {
+                                      const target = e.target as HTMLImageElement
+                                      target.src = '/images/hero1.jpeg'
+                                    }}
+                                  />
+                                )
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center text-gray-400 text-[10px]">
+                                  No img
+                                </div>
+                              )}
+                            </div>
+                            <div className="min-w-0">
+                              <p className="font-bold text-gray-900 dark:text-white truncate max-w-xs text-xs">{p.name}</p>
+                              <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                                <span className="text-[11px] text-gray-400">{p.brand || 'DriveFlyElectric'}</span>
+                                {p.isComingSoon && (
+                                  <span className="inline-flex items-center gap-1 text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-500 border border-amber-400/40">
+                                    <Sparkles className="w-2.5 h-2.5" />
+                                    Coming Soon
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          <td className="px-6 py-4">
+                            <p className="font-mono text-xs font-semibold text-gray-700 dark:text-gray-300">{p.sku}</p>
+                            <div className="flex items-center gap-1.5 flex-wrap mt-1">
+                              <span className="text-[10px] text-creamy-500 uppercase font-black px-2 py-0.5 rounded bg-creamy-500/10">
+                                {p.category}
+                              </span>
+                              {p.isComingSoon && (
+                                <span className="text-[10px] text-black uppercase font-black px-2 py-0.5 rounded bg-amber-400">
+                                  Coming Soon{p.comingSoonRelease ? ` • ${p.comingSoonRelease}` : ''}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+
+                          <td className="px-6 py-4 font-black text-gray-900 dark:text-creamy-400">
+                            {formatPrice(p.price)}
+                          </td>
+
+                          <td className="px-6 py-4">
+                            <span
+                              className={`text-[10px] font-black uppercase px-2.5 py-1 rounded-full ${
+                                p.isComingSoon
+                                  ? 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+                                  : p.stock > 10
+                                  ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400'
+                                  : 'bg-red-100 dark:bg-red-950/40 text-red-700 dark:text-red-400'
+                              }`}
+                            >
+                              {p.isComingSoon ? 'Pre-Book Only' : `${p.stock} units`}
+                            </span>
+                          </td>
+
+                          <td className="px-6 py-4 text-right space-x-2">
+                            <button
+                              onClick={() => openEditModal(p)}
+                              className="p-1.5 text-gray-500 hover:text-creamy-500 rounded-lg hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+                              title="Edit"
+                            >
+                              <Edit2 className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteProduct(p.id, p.name)}
+                              className="p-1.5 text-red-500 hover:text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
+                              title="Delete"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
-          </div>
-        )}
+          )
+        })()}
 
         {/* Tab 3: ORDERS MANAGEMENT */}
         {activeTab === 'orders' && (
@@ -1083,6 +1196,109 @@ export const AdminDashboard: React.FC = () => {
             </div>
           </div>
         )}
+
+        {/* Tab 3b: COMING SOON BOOKINGS MANAGEMENT */}
+        {activeTab === 'bookings' && (() => {
+          const filteredBookings = bookingsList.filter((b) =>
+            bookingStatusFilter === 'ALL' ? true : b.status === bookingStatusFilter
+          )
+          return (
+            <div className="bg-white dark:bg-[#16181e] rounded-2xl shadow-sm border border-gray-200 dark:border-neutral-800 overflow-hidden">
+              <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div>
+                  <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">
+                    Coming Soon Vehicle Bookings
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Priority pre-booking submissions from the storefront Coming Soon showcase.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-gray-500 font-semibold">Status:</span>
+                  <select
+                    value={bookingStatusFilter}
+                    onChange={(e) => setBookingStatusFilter(e.target.value as any)}
+                    className="px-3 py-1.5 text-xs font-bold border border-gray-300 dark:border-neutral-700 rounded-xl bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
+                  >
+                    <option value="ALL">All Bookings ({bookingsList.length})</option>
+                    <option value="PENDING">PENDING</option>
+                    <option value="CONFIRMED">CONFIRMED</option>
+                    <option value="NOTIFIED">NOTIFIED</option>
+                    <option value="CANCELLED">CANCELLED</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-gray-50 dark:bg-[#1f222a] text-gray-400 text-[11px] uppercase tracking-wider font-bold">
+                    <tr>
+                      <th className="px-6 py-3.5">Booking Ref</th>
+                      <th className="px-6 py-3.5">Customer</th>
+                      <th className="px-6 py-3.5">Vehicle</th>
+                      <th className="px-6 py-3.5">Qty / Country</th>
+                      <th className="px-6 py-3.5">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 dark:divide-neutral-800">
+                    {filteredBookings.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-6 py-8 text-center text-gray-400">
+                          No Coming Soon reservation bookings recorded yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredBookings.map((b) => (
+                        <tr key={b.id} className="hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors">
+                          <td className="px-6 py-4">
+                            <p className="font-mono font-bold text-xs text-creamy-500">{b.bookingReference}</p>
+                            <span className="text-[11px] text-gray-400">
+                              {new Date(b.createdAt).toLocaleDateString()}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4">
+                            <p className="font-bold text-xs text-gray-900 dark:text-white">{b.fullName}</p>
+                            <p className="text-[11px] text-gray-500 font-mono">{b.email}</p>
+                            {b.phone && <p className="text-[11px] text-gray-400">{b.phone}</p>}
+                          </td>
+                          <td className="px-6 py-4">
+                            <p className="font-bold text-xs text-gray-900 dark:text-white">
+                              {b.product?.name || `Product #${b.productId.slice(0, 8)}`}
+                            </p>
+                            {b.notes && (
+                              <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 max-w-xs line-clamp-2">
+                                {b.notes}
+                              </p>
+                            )}
+                          </td>
+                          <td className="px-6 py-4 text-xs">
+                            <span className="font-black text-gray-900 dark:text-white block">
+                              {b.quantity} {b.quantity === 1 ? 'unit' : 'units'}
+                            </span>
+                            <span className="text-[11px] text-gray-500">{b.country}</span>
+                          </td>
+                          <td className="px-6 py-4">
+                            <select
+                              value={b.status}
+                              onChange={(e) => handleUpdateBookingStatus(b.id, e.target.value as any)}
+                              className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
+                            >
+                              <option value="PENDING">PENDING</option>
+                              <option value="CONFIRMED">CONFIRMED</option>
+                              <option value="NOTIFIED">NOTIFIED</option>
+                              <option value="CANCELLED">CANCELLED</option>
+                            </select>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )
+        })()}
 
         {/* Tab 4: USERS MANAGEMENT */}
         {activeTab === 'users' && (
@@ -1328,7 +1544,7 @@ export const AdminDashboard: React.FC = () => {
                                   ? 'Client: '
                                   : lastMsg.senderRole === 'ADMIN'
                                   ? 'You: '
-                                  : 'Bot: '}
+                                  : 'Concierge: '}
                               </span>
                               {lastMsg.content}
                             </p>
@@ -1453,7 +1669,7 @@ export const AdminDashboard: React.FC = () => {
                                       : 'bg-creamy-500/20 text-creamy-400'
                                   }`}
                                 >
-                                  {msg.senderRole}
+                                  {isClient ? 'CUSTOMER' : isAdmin ? 'SPECIALIST' : 'CONCIERGE'}
                                 </span>
                                 <span className="text-[9px] text-gray-400">
                                   {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -1498,7 +1714,7 @@ export const AdminDashboard: React.FC = () => {
                           {[
                             'Hello! I am a live DriveFlyElectric specialist. Your selected rig is in stock and ready for dispatch.',
                             'You can complete your purchase securely via Stripe Card or PayPal at checkout—free express crate shipping is included.',
-                            'All rigs ship from our Nanshan, Shenzhen warehouse with full tracking and a 12-month warranty. How can I assist further?'
+                            'All rigs ship with full tracking and a 12-month factory warranty. How can I assist further?'
                           ].map((tpl, i) => (
                             <button
                               key={i}
@@ -1565,7 +1781,7 @@ export const AdminDashboard: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <label className="block text-xs font-bold text-gray-700 dark:text-gray-300">
-                        Product Media (Images & Videos to /public/images)
+                        Product Media (Images &amp; Video Clips)
                       </label>
                       <p className="text-[10px] text-gray-400">
                         Select multiple images or video clips. First media item is the primary thumbnail.
@@ -1792,6 +2008,43 @@ export const AdminDashboard: React.FC = () => {
                     className="w-full px-3 py-2 text-sm bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-neutral-500 focus:ring-2 focus:ring-creamy-500 outline-none transition-colors"
                     placeholder="Highlight motor wattage, battery capacity, frame materials, top speed, and range..."
                   />
+                </div>
+
+                {/* Coming Soon Categorization Indicator */}
+                <div className="p-3.5 rounded-xl border border-amber-400/35 bg-amber-500/10 space-y-3">
+                  <div className="flex items-start gap-2.5">
+                    <input
+                      type="checkbox"
+                      id="isComingSoon"
+                      checked={productForm.isComingSoon}
+                      onChange={(e) => setProductForm({ ...productForm, isComingSoon: e.target.checked })}
+                      className="mt-0.5 w-4 h-4 text-amber-500 rounded border-gray-300 dark:border-neutral-700 accent-amber-500"
+                    />
+                    <div className="flex-1">
+                      <label htmlFor="isComingSoon" className="text-xs font-black uppercase tracking-wider text-amber-600 dark:text-amber-400 flex items-center gap-1.5 cursor-pointer">
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Coming Soon Categorization (Enable Hero Showcase &amp; Book Now)</span>
+                      </label>
+                      <p className="text-[11px] text-gray-600 dark:text-gray-300 mt-0.5">
+                        Displays a COMING SOON badge on this item, features it inside the Hero auto-scrolling marquee, and replaces instant checkout with priority Book Now pre-booking.
+                      </p>
+                    </div>
+                  </div>
+
+                  {productForm.isComingSoon && (
+                    <div>
+                      <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                        Expected Launch / Release Window (Optional)
+                      </label>
+                      <input
+                        type="text"
+                        value={productForm.comingSoonRelease}
+                        onChange={(e) => setProductForm({ ...productForm, comingSoonRelease: e.target.value })}
+                        placeholder="e.g. Q3 2026, August 2026"
+                        className="w-full px-3 py-2 text-xs bg-white dark:bg-[#1a1d24] border border-amber-400/40 rounded-xl text-gray-900 dark:text-white placeholder:text-gray-400 focus:ring-2 focus:ring-amber-400 outline-none"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2">

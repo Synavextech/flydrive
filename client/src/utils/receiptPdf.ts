@@ -1,4 +1,6 @@
 export interface OrderReceiptData {
+  orderId?: string
+  receiptToken?: string
   date: string
   orderDate: string
   orderNumber: string
@@ -22,11 +24,25 @@ export interface OrderReceiptData {
   }>
 }
 
+export function getSupportWhatsAppDigits(): string {
+  const digits = String((import.meta as any).env?.VITE_WHATSAPP_NUMBER || '19785236630').replace(/\D/g, '')
+  return digits || '19785236630'
+}
+
+export function formatSupportPhone(): string {
+  const digits = getSupportWhatsAppDigits()
+  if (digits.length === 11 && digits.startsWith('1')) {
+    return `+1 (${digits.slice(1, 4)}) ${digits.slice(4, 7)}-${digits.slice(7)}`
+  }
+  return `+${digits}`
+}
+
 /**
  * Generates the standardized receipt text block for an order.
  */
 export const generateReceiptText = (r: OrderReceiptData): string => {
   const trackingNum = r.trackingNumber || `TRK-${r.orderNumber}`
+  const supportPhone = formatSupportPhone()
   const lines = [
     `Receipt `,
     ` Order Summary `,
@@ -47,7 +63,6 @@ export const generateReceiptText = (r: OrderReceiptData): string => {
     `Final Cost     : ${r.finalCost}`,
     `Total Refund   : ${r.totalRefund || '$0.00'}`,
     `Refund Trans   : N/A`,
-    `N/A`,
     ``
   ]
 
@@ -60,10 +75,10 @@ export const generateReceiptText = (r: OrderReceiptData): string => {
   }
 
   lines.push(
-    `Full details for this order have been reviewed by user`,
+    `Full details for this order have been reviewed by customer`,
     `Additional Transaction Details:`,
-    `If you've purchased a this item, it means you know the item you purchased and have agreed with our terms and conditions that says payment is non-refundable.`,
-    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (+1 978 523-6630) if you have any questions or concerns. They're available 24/7.`,
+    `If you've purchased this item, it means you know the item you purchased and have agreed with our terms and conditions that apply to final order settlement.`,
+    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (${supportPhone}) if you have any questions or concerns. They're available 24/7.`,
     `Regards,`,
     `DriveFlyElectric Team`,
     `https://driveflyelectric.shop/`

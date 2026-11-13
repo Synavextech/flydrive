@@ -1,13 +1,12 @@
-import { Request, Response, NextFunction } from 'express'
+import { Request, Response } from 'express'
 
-export const notFound = (req: Request, res: Response, next: NextFunction) => {
-  // Enhanced logging for debugging /api requests
+export const notFound = (req: Request, res: Response) => {
   if (req.originalUrl.startsWith('/api')) {
-    console.log(`⚠️ Unmatched API Route: ${req.method} ${req.originalUrl} from ${req.ip}`)
+    console.warn(`⚠️ Unmatched API Route: ${req.method} ${req.originalUrl}`)
   }
 
   res.status(404).json({
     success: false,
-    error: `Resource not found: ${req.method} ${req.originalUrl}`
+    error: 'The requested resource could not be found.'
   })
 }

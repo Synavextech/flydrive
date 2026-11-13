@@ -19,7 +19,9 @@ import {
   MessageSquare,
   ZoomIn,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Sparkles,
+  CalendarClock
 } from 'lucide-react'
 import { Product } from '../types'
 import { useProducts } from '../contexts/ProductContext'
@@ -27,9 +29,13 @@ import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
 import { AuthModal } from '../components/AuthModal'
 import { QuickCartDrawer } from '../components/QuickCartDrawer'
+import { ShareProductButton } from '../components/ShareProductButton'
+import { BookComingSoonModal } from '../components/BookComingSoonModal'
+import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
 const CATEGORIES = [
   { id: 'all', label: 'All Rigs' },
+  { id: 'coming-soon', label: 'Coming Soon' },
   { id: 'mini-helicopter', label: 'MiniHeliCopters' },
   { id: 'microcars', label: 'Microcars' },
   { id: 'go karts', label: 'Go Karts' },
@@ -59,6 +65,13 @@ export const HomePage: React.FC = () => {
   // Modals state
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false)
   const [isCartDrawerOpen, setIsCartDrawerOpen] = useState(false)
+  const [bookingModalProduct, setBookingModalProduct] = useState<Product | null>(null)
+  const [footerModalTopic, setFooterModalTopic] = useState<'shipping' | 'payments' | 'warranty' | 'privacy' | 'terms' | 'contact' | null>(null)
+  const [newsletterEmail, setNewsletterEmail] = useState('')
+  const [newsletterSubscribed, setNewsletterSubscribed] = useState(false)
+
+  const supportPhone = formatSupportPhone()
+  const whatsAppDigits = getSupportWhatsAppDigits()
 
   // Quick Review Composer & Photo Zoom Modal state
   const [reviewModalProduct, setReviewModalProduct] = useState<Product | null>(null)
@@ -258,17 +271,21 @@ export const HomePage: React.FC = () => {
             sku: prod.sku,
             category: prod.category,
             image: fullImg,
-            url: `${origin}/products/${prod.id}`,
+            url: `${origin}/product/${prod.id}`,
             brand: {
               '@type': 'Brand',
               name: prod.brand || 'DriveFlyElectric'
             },
             offers: {
               '@type': 'Offer',
-              url: `${origin}/products/${prod.id}`,
+              url: `${origin}/product/${prod.id}`,
               priceCurrency: 'USD',
               price: Number(prod.price || 0).toFixed(2),
-              availability: prod.stock > 0 ? 'https://schema.org/InStock' : 'https://schema.org/OutOfStock',
+              availability: prod.isComingSoon
+                ? 'https://schema.org/PreOrder'
+                : prod.stock > 0
+                ? 'https://schema.org/InStock'
+                : 'https://schema.org/OutOfStock',
               itemCondition: 'https://schema.org/NewCondition'
             }
           }
@@ -279,6 +296,16 @@ export const HomePage: React.FC = () => {
     scriptEl.textContent = JSON.stringify(itemListSchema)
   }, [selectedCategory, safeProducts])
 
+  const comingSoonProducts = safeProducts.filter((p) => Boolean(p.isComingSoon))
+  const marqueeHalfItems =
+    comingSoonProducts.length > 0
+      ? Array.from(
+          { length: Math.max(4, comingSoonProducts.length) },
+          (_, i) => comingSoonProducts[i % comingSoonProducts.length]
+        )
+      : []
+  const heroMarqueeItems = [...marqueeHalfItems, ...marqueeHalfItems]
+
   // Filter products by selected category or keyword
   const filteredProducts = selectedCategory === 'all'
     ? safeProducts
@@ -286,6 +313,10 @@ export const HomePage: React.FC = () => {
       const cat = (p.category || '').toLowerCase()
       const name = (p.name || '').toLowerCase()
       const sel = selectedCategory.toLowerCase()
+
+      if (sel === 'coming-soon') {
+        return Boolean(p.isComingSoon)
+      }
 
       if (sel === 'mini-helicopter' || sel === 'minihelicopters') {
         return cat.includes('heli') || cat.includes('rotor') || cat.includes('aircraft') || cat.includes('copter') ||
@@ -398,8 +429,8 @@ export const HomePage: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-white dark:bg-[#131316] text-gray-900 dark:text-white selection:bg-creamy-500 selection:text-black transition-colors duration-200">
-      {/* High-Impact Hero Section — Locally Hosted Files & Brand Tagline */}
-      <header className="relative w-full h-[64vh] min-h-[480px] max-h-[740px] flex items-center overflow-hidden bg-black border-b border-gray-200 dark:border-white/10">
+      {/* High-Impact Hero Section — Locally Hosted Files & Narrow Auto-Scrolling Coming Soon Section */}
+      <header className="relative w-full min-h-[500px] lg:h-[66vh] lg:min-h-[540px] lg:max-h-[760px] py-12 flex items-center overflow-hidden bg-black border-b border-gray-200 dark:border-white/10">
         <div className="absolute inset-0 z-0">
           <img
             src="/images/hero1.jpeg"
@@ -410,14 +441,14 @@ export const HomePage: React.FC = () => {
               target.src = '/images/hero2.jpeg'
             }}
           />
-          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/70" />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/30 to-black/75" />
         </div>
 
         <div className="relative z-10 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="max-w-4xl space-y-5 md:space-y-6">
+          <div className="max-w-4xl space-y-4 md:space-y-5">
             <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-creamy-500/20 border border-creamy-500/40 text-creamy-400 text-xs font-bold uppercase tracking-widest backdrop-blur-md">
               <span className="w-2 h-2 rounded-full bg-creamy-400 animate-pulse" />
-              Nanshan, Shenzhen, Guangdong Province, China
+              Austin, Texas HQ • Worldwide Express Dispatch
             </div>
 
             <h1 className="font-anton text-5xl sm:text-7xl lg:text-8xl text-white leading-none tracking-tight uppercase">
@@ -426,46 +457,98 @@ export const HomePage: React.FC = () => {
 
             <p className="text-base sm:text-lg text-gray-300 max-w-2xl border-l-4 border-creamy-500 pl-6 leading-relaxed font-medium">
               <span className="font-extrabold text-creamy-400 block text-sm sm:text-base uppercase tracking-wider mb-1">
-                Electric Microcars, MiniHeliCopters & Performance Rides
+                Electric Microcars, MiniHeliCopters &amp; Performance Rides
               </span>
             </p>
 
-            <div className="flex flex-wrap gap-3 pt-2">
-              <a
-                href="#store-catalog"
-                onClick={() => setSelectedCategory('mini-helicopter')}
-                className="bg-creamy-500 hover:bg-creamy-400 text-black px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg active:scale-95 transition-all shadow-lg shadow-creamy-500/20"
-              >
-                Shop MiniHeliCopters
-              </a>
-              <a
-                href="#store-catalog"
-                onClick={() => setSelectedCategory('microcars')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
-              >
-                Shop Microcars
-              </a>
-              <a
-                href="#store-catalog"
-                onClick={() => setSelectedCategory('go karts')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
-              >
-                Shop Go Karts
-              </a>
-              <a
-                href="#store-catalog"
-                onClick={() => setSelectedCategory('trikes')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
-              >
-                Shop Trikes
-              </a>
-              <a
-                href="#store-catalog"
-                onClick={() => setSelectedCategory('dirtbikes')}
-                className="border-2 border-white/30 text-white px-6 py-3.5 font-extrabold text-xs uppercase tracking-widest rounded-lg hover:border-creamy-500 hover:text-creamy-500 active:scale-95 transition-all"
-              >
-                Shop Dirtbikes
-              </a>
+            {/* Narrow-Fitting Auto-Scrolling Coming Soon Showcase with Book Now */}
+            <div className="pt-1 w-full max-w-3xl min-w-0">
+              <div className="rounded-2xl border border-creamy-500/35 bg-black/70 backdrop-blur-md p-2.5 sm:p-3 shadow-2xl overflow-hidden">
+                <div className="flex items-center justify-between gap-2 px-1 pb-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-creamy-500 text-black text-[9px] font-black uppercase tracking-widest shrink-0">
+                      <Sparkles className="w-2.5 h-2.5" />
+                      Coming Soon
+                    </span>
+                    <span className="text-[11px] font-bold text-gray-200 truncate">
+                      {comingSoonProducts.length > 0
+                        ? 'Next-Gen Electric Releases — Priority Pre-Booking Open'
+                        : 'Next-Generation Fleet Pipeline — Pre-Booking Opens Soon'}
+                    </span>
+                  </div>
+                  <a
+                    href="#store-catalog"
+                    onClick={() => setSelectedCategory(comingSoonProducts.length > 0 ? 'coming-soon' : 'all')}
+                    className="text-[10px] font-black uppercase tracking-wider text-creamy-400 hover:text-creamy-300 whitespace-nowrap shrink-0 flex items-center gap-1"
+                  >
+                    <span>{comingSoonProducts.length > 0 ? `View All (${comingSoonProducts.length})` : 'Browse Catalog'}</span>
+                    <ArrowRight className="w-3 h-3" />
+                  </a>
+                </div>
+
+                {comingSoonProducts.length > 0 ? (
+                  <div className="overflow-hidden relative">
+                    <div className="animate-marquee flex items-center gap-2.5">
+                      {heroMarqueeItems.map((item, idx) => (
+                        <div
+                          key={`hero-coming-${item.id}-${idx}`}
+                          className="w-[265px] sm:w-[290px] shrink-0 flex items-center gap-2.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 hover:border-creamy-500/50 p-2 transition-colors"
+                        >
+                          <Link
+                            to={`/product/${item.id}`}
+                            className="w-12 h-12 rounded-lg overflow-hidden bg-black/60 shrink-0 border border-white/10"
+                          >
+                            <img
+                              src={getSafeMediaUrl(item.images?.[0])}
+                              alt={item.name}
+                              className="w-full h-full object-cover"
+                              onError={(e) => {
+                                const target = e.target as HTMLImageElement
+                                target.src = '/images/hero2.jpeg'
+                              }}
+                            />
+                          </Link>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-1.5 text-[9px]">
+                              <span className="font-black uppercase tracking-wider text-amber-400 truncate">
+                                {item.comingSoonRelease || 'Upcoming'}
+                              </span>
+                              <span className="text-gray-500">•</span>
+                              <span className="font-bold text-creamy-400 shrink-0">{formatPrice(item.price)}</span>
+                            </div>
+                            <Link
+                              to={`/product/${item.id}`}
+                              className="block font-anton text-sm uppercase text-white truncate hover:text-creamy-400 transition-colors leading-tight mt-0.5"
+                            >
+                              {item.name}
+                            </Link>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setBookingModalProduct(item)}
+                            className="px-2.5 py-1.5 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[10px] whitespace-nowrap shrink-0 shadow transition-transform active:scale-95"
+                          >
+                            Book Now
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between gap-3 rounded-xl bg-white/5 border border-white/10 px-3 py-2 text-xs text-gray-300">
+                    <span className="flex items-center gap-2 truncate">
+                      <CalendarClock className="w-4 h-4 text-creamy-400 shrink-0" />
+                      <span className="truncate">New aircraft &amp; electric microcar editions arriving soon for priority booking.</span>
+                    </span>
+                    <a
+                      href="#store-catalog"
+                      className="px-3 py-1 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black text-[10px] uppercase tracking-wider shrink-0"
+                    >
+                      Explore Fleet
+                    </a>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -598,25 +681,38 @@ export const HomePage: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Cut-Corner SALE / NEW Badge matching edrifttrikes.shop */}
-                      <span className="absolute top-2.5 left-2.5 cut-corner-badge font-extrabold text-[10px] uppercase tracking-widest px-3 py-1 bg-creamy-500 text-black shadow-md">
-                        {product.isNew ? 'NEW' : 'SALE'}
+                      {/* Cut-Corner COMING SOON / SALE / NEW Badge */}
+                      <span
+                        className={`absolute top-2.5 left-2.5 cut-corner-badge font-extrabold text-[10px] uppercase tracking-widest px-3 py-1 shadow-md ${
+                          product.isComingSoon
+                            ? 'bg-amber-400 text-black'
+                            : 'bg-creamy-500 text-black'
+                        }`}
+                      >
+                        {product.isComingSoon ? 'COMING SOON' : product.isNew ? 'NEW' : 'SALE'}
                       </span>
 
-                      {product.stock <= 5 && product.stock > 0 && (
+                      {product.isComingSoon && product.comingSoonRelease ? (
+                        <span className="absolute top-2.5 right-2.5 text-[9px] font-black uppercase tracking-widest px-2 py-0.5 bg-black/80 text-amber-300 border border-amber-400/40 rounded">
+                          {product.comingSoonRelease}
+                        </span>
+                      ) : product.stock <= 5 && product.stock > 0 ? (
                         <span className="absolute top-2.5 right-2.5 text-[9px] font-black uppercase tracking-widest px-2 py-0.5 bg-red-600 text-white rounded">
                           {product.stock} Left
                         </span>
-                      )}
+                      ) : null}
                     </Link>
 
                     {/* Card Body */}
                     <div className="p-3.5 sm:p-4 flex flex-col flex-1 text-gray-900 dark:text-white">
-                      <Link to={`/product/${product.id}`}>
-                        <h3 className="font-anton text-base sm:text-lg uppercase leading-tight line-clamp-2 hover:text-creamy-500 transition-colors text-gray-900 dark:text-white">
-                          {product.name}
-                        </h3>
-                      </Link>
+                      <div className="flex items-start justify-between gap-2">
+                        <Link to={`/product/${product.id}`} className="flex-1 min-w-0">
+                          <h3 className="font-anton text-base sm:text-lg uppercase leading-tight line-clamp-2 hover:text-creamy-500 transition-colors text-gray-900 dark:text-white">
+                            {product.name}
+                          </h3>
+                        </Link>
+                        <ShareProductButton product={product} variant="card" />
+                      </div>
 
                       <p className="text-gray-500 dark:text-gray-400 text-xs mt-1 line-clamp-1">
                         {product.description || 'High-performance electric power with precision handling'}
@@ -651,47 +747,66 @@ export const HomePage: React.FC = () => {
                         </span>
                       </div>
 
-                      {/* Quantity Controls & Full-Width Add to Cart Button */}
-                      <div className="mt-3 flex items-center gap-2">
-                        <div className="flex items-center border border-gray-200 dark:border-white/10 rounded bg-gray-100 dark:bg-[#131316]">
+                      {/* Quantity Controls & Add to Cart — OR Book Now for Coming Soon Releases */}
+                      {product.isComingSoon ? (
+                        <div className="mt-3 flex items-center gap-2">
                           <button
                             type="button"
-                            onClick={() => handleQuantityChange(product.id, -1)}
-                            className="p-1 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+                            onClick={() => setBookingModalProduct(product)}
+                            className="flex-1 py-2 sm:py-2.5 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest rounded bg-creamy-500 hover:bg-creamy-400 text-black transition-all active:scale-95 flex items-center justify-center gap-1.5 shadow-sm"
                           >
-                            <Minus className="w-3 h-3" />
+                            <CalendarClock className="w-3.5 h-3.5" />
+                            <span>Book Now</span>
                           </button>
-                          <span className="px-2 text-xs font-bold text-gray-900 dark:text-white">{qty}</span>
+                          <Link
+                            to={`/product/${product.id}`}
+                            className="px-3 py-2 sm:py-2.5 font-bold text-[10px] uppercase tracking-wider rounded border border-gray-200 dark:border-white/15 text-gray-700 dark:text-gray-200 hover:border-creamy-500 hover:text-creamy-500 transition-colors"
+                          >
+                            Specs
+                          </Link>
+                        </div>
+                      ) : (
+                        <div className="mt-3 flex items-center gap-2">
+                          <div className="flex items-center border border-gray-200 dark:border-white/10 rounded bg-gray-100 dark:bg-[#131316]">
+                            <button
+                              type="button"
+                              onClick={() => handleQuantityChange(product.id, -1)}
+                              className="p-1 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+                            >
+                              <Minus className="w-3 h-3" />
+                            </button>
+                            <span className="px-2 text-xs font-bold text-gray-900 dark:text-white">{qty}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleQuantityChange(product.id, 1)}
+                              className="p-1 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+                            >
+                              <Plus className="w-3 h-3" />
+                            </button>
+                          </div>
+
                           <button
                             type="button"
-                            onClick={() => handleQuantityChange(product.id, 1)}
-                            className="p-1 text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white transition-colors"
+                            onClick={(e) => handleAddToCart(product, e)}
+                            className={`flex-1 py-2 sm:py-2.5 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest rounded transition-all active:scale-95 flex items-center justify-center gap-1.5 ${isAdded
+                              ? 'bg-green-600 text-white'
+                              : 'bg-gray-900 text-white dark:bg-white dark:text-black hover:bg-creamy-500 hover:text-black dark:hover:bg-creamy-500 dark:hover:text-black'
+                              }`}
                           >
-                            <Plus className="w-3 h-3" />
+                            {isAdded ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                <span>Added</span>
+                              </>
+                            ) : (
+                              <>
+                                <ShoppingCart className="w-3.5 h-3.5" />
+                                <span>Add to Cart</span>
+                              </>
+                            )}
                           </button>
                         </div>
-
-                        <button
-                          type="button"
-                          onClick={(e) => handleAddToCart(product, e)}
-                          className={`flex-1 py-2 sm:py-2.5 font-extrabold text-[10px] sm:text-xs uppercase tracking-widest rounded transition-all active:scale-95 flex items-center justify-center gap-1.5 ${isAdded
-                            ? 'bg-green-600 text-white'
-                            : 'bg-gray-900 text-white dark:bg-white dark:text-black hover:bg-creamy-500 hover:text-black dark:hover:bg-creamy-500 dark:hover:text-black'
-                            }`}
-                        >
-                          {isAdded ? (
-                            <>
-                              <Check className="w-3.5 h-3.5" />
-                              <span>Added</span>
-                            </>
-                          ) : (
-                            <>
-                              <ShoppingCart className="w-3.5 h-3.5" />
-                              <span>Add to Cart</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
+                      )}
                     </div>
 
                     {/* Collapsible Customer Reviews Below Every Item Listing (Manual Toggle Only) */}
@@ -701,10 +816,12 @@ export const HomePage: React.FC = () => {
                       const avgRating =
                         visibleReviews.length > 0
                           ? (
-                              visibleReviews.reduce((acc, item) => acc + (Number(item.rating) || 5), 0) /
+                              visibleReviews.reduce((acc, item) => acc + (Number(item.rating) || 0), 0) /
                               visibleReviews.length
                             ).toFixed(1)
-                          : '5.0'
+                          : Number(product.rating || 0) > 0
+                          ? Number(product.rating).toFixed(1)
+                          : 'New'
 
                       return (
                         <div className="border-t border-gray-200 dark:border-white/10 bg-gray-50/90 dark:bg-[#121216] p-2.5 sm:p-3 space-y-2 text-[10px]">
@@ -862,17 +979,17 @@ export const HomePage: React.FC = () => {
                 </div>
               </div>
               <div className="space-y-1.5 pt-1 text-xs text-gray-600 dark:text-gray-400">
-                <p className="text-gray-900 dark:text-white font-bold">🏢 Head Office:</p>
+                <p className="text-gray-900 dark:text-white font-bold">🏢 Operations Headquarters:</p>
 
-                <p>Building 6, Lecong Industrial Park</p>
-                <p>Shunde District, Foshan, Guangdong 503315, China</p>
+                <p>1000 DriveFly Electric Way, Suite 400</p>
+                <p>Austin, TX 78701, United States • Global Dispatch</p>
                 <a
-                  href="https://wa.me/19093088313?text=Hello!%20I%20would%20like%20some%20assistance%20regarding%20DriveFlyElectric."
+                  href={`https://wa.me/${whatsAppDigits}?text=Hello!%20I%20would%20like%20some%20assistance%20regarding%20DriveFlyElectric.`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-creamy-600 dark:text-creamy-400 font-semibold pt-1 block hover:underline"
                 >
-                  📞 WhatsApp / Call: +1 (909) 308-8313
+                  📞 WhatsApp / Call: {supportPhone}
                 </a>
                 <p className="text-creamy-600 dark:text-creamy-400 font-semibold">✉️ info-eurotopmobility@driveflyelectric.shop</p>
               </div>
@@ -886,7 +1003,7 @@ export const HomePage: React.FC = () => {
                   {/* Instagram */}
                   <a
                     href="https://www.instagram.com/midgetmicrocars?cplk=MXQxMjRoeWkxMGpycw=="
-                    target="https://www.instagram.com/midgetmicrocars?cplk=MXQxMjRoeWkxMGpycw=="
+                    target="_blank"
                     rel="noopener noreferrer"
                     aria-label="Follow on Instagram"
                     title="Follow on Instagram"
@@ -961,9 +1078,21 @@ export const HomePage: React.FC = () => {
             <div>
               <p className="font-bold text-xs text-creamy-500 uppercase tracking-widest mb-4">Support & Care</p>
               <ul className="space-y-2.5 text-xs text-gray-600 dark:text-gray-400 font-medium">
-                <li><a href="#shipping" className="hover:text-creamy-500 dark:hover:text-white transition-colors">China Depot Express Dispatch</a></li>
-                <li><a href="#payments" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Card & PayPal Protection</a></li>
-                <li><a href="#warranty" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Factory Warranty & Guarantees</a></li>
+                <li>
+                  <button type="button" onClick={() => setFooterModalTopic('shipping')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">
+                    Global Express Dispatch
+                  </button>
+                </li>
+                <li>
+                  <button type="button" onClick={() => setFooterModalTopic('payments')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">
+                    Card &amp; PayPal Protection
+                  </button>
+                </li>
+                <li>
+                  <button type="button" onClick={() => setFooterModalTopic('warranty')} className="hover:text-creamy-500 dark:hover:text-white transition-colors">
+                    Factory Warranty &amp; Guarantees
+                  </button>
+                </li>
                 <li><Link to="/login" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Customer Portal</Link></li>
               </ul>
             </div>
@@ -974,9 +1103,23 @@ export const HomePage: React.FC = () => {
               <p className="text-xs text-gray-600 dark:text-gray-400 mb-3">
                 Get notified first when new limited builds, battery kits, and seasonal sales drop.
               </p>
-              <form onSubmit={(e) => e.preventDefault()} className="space-y-2">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  if (!newsletterEmail.trim()) return
+                  setNewsletterSubscribed(true)
+                  setNewsletterEmail('')
+                }}
+                className="space-y-2"
+              >
                 <input
                   type="email"
+                  required
+                  value={newsletterEmail}
+                  onChange={(e) => {
+                    setNewsletterEmail(e.target.value)
+                    if (newsletterSubscribed) setNewsletterSubscribed(false)
+                  }}
                   placeholder="Enter your email"
                   className="w-full bg-white dark:bg-[#17171c] border border-gray-300 dark:border-white/10 rounded-lg px-3.5 py-2.5 text-xs text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-creamy-500"
                 />
@@ -986,16 +1129,21 @@ export const HomePage: React.FC = () => {
                 >
                   Join VIP Dispatch
                 </button>
+                {newsletterSubscribed && (
+                  <p className="text-[11px] font-bold text-emerald-500 pt-1">
+                    Subscribed! We&apos;ll notify you before upcoming drops.
+                  </p>
+                )}
               </form>
             </div>
           </div>
 
           <div className="pt-8 flex flex-col sm:flex-row items-center justify-between text-xs text-gray-500 dark:text-gray-400 gap-4">
-            <p>© 2026 DriveFlyElectric (driveflyelectric.shop). All rights reserved. By management! All users should create an account to track order progress.</p>
+            <p>© 2026 DriveFlyElectric (driveflyelectric.shop). All rights reserved.</p>
             <div className="flex gap-6">
-              <a href="#privacy" className="hover:text-creamy-500 dark:hover:text-gray-300">Privacy</a>
-              <a href="#terms" className="hover:text-creamy-500 dark:hover:text-gray-300">Terms</a>
-              <a href="#contact" className="hover:text-creamy-500 dark:hover:text-gray-300">China HQ Contact</a>
+              <button type="button" onClick={() => setFooterModalTopic('privacy')} className="hover:text-creamy-500 dark:hover:text-gray-300">Privacy</button>
+              <button type="button" onClick={() => setFooterModalTopic('terms')} className="hover:text-creamy-500 dark:hover:text-gray-300">Terms</button>
+              <button type="button" onClick={() => setFooterModalTopic('contact')} className="hover:text-creamy-500 dark:hover:text-gray-300">HQ Contact</button>
             </div>
           </div>
         </div>
@@ -1257,6 +1405,95 @@ export const HomePage: React.FC = () => {
         }}
       />
 
+      {/* Footer Policy / Info Modal */}
+      {footerModalTopic && (
+        <div
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setFooterModalTopic(null)}
+        >
+          <div
+            className="bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 text-left"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-gray-200 dark:border-white/10 pb-3">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-creamy-500">DriveFlyElectric Info</p>
+                <h3 className="font-anton text-xl uppercase text-gray-900 dark:text-white">
+                  {footerModalTopic === 'shipping' && 'Global Express Dispatch & Freight'}
+                  {footerModalTopic === 'payments' && 'Card & PayPal Buyer Protection'}
+                  {footerModalTopic === 'warranty' && '1-Year Factory Warranty & Inspection'}
+                  {footerModalTopic === 'privacy' && 'Privacy & Data Security'}
+                  {footerModalTopic === 'terms' && 'Terms of Sale & Fulfillment'}
+                  {footerModalTopic === 'contact' && 'Headquarters & Customer Support'}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFooterModalTopic(null)}
+                className="p-1.5 rounded-lg text-gray-400 hover:text-gray-800 dark:hover:text-white"
+                aria-label="Close information dialog"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="text-xs text-gray-600 dark:text-gray-300 leading-relaxed space-y-2.5">
+              {footerModalTopic === 'shipping' && (
+                <>
+                  <p>Every DriveFlyElectric unit is factory crated, insured, and dispatched with live tracking numbers.</p>
+                  <p>Standard shipping is free worldwide ($0.00). Estimated delivery windows depend on model class and destination, and are shown clearly before payment.</p>
+                </>
+              )}
+              {footerModalTopic === 'payments' && (
+                <>
+                  <p>All transactions are encrypted with TLS/HTTPS and processed directly through PayPal (including Integrated Debit/Credit Card processing) and Stripe.</p>
+                  <p>Card numbers never touch or persist on DriveFlyElectric application servers.</p>
+                </>
+              )}
+              {footerModalTopic === 'warranty' && (
+                <>
+                  <p>Every electric microcar, mini-helicopter, kart, drift trike, and dirt bike includes a 12-month limited manufacturer drivetrain &amp; electrical warranty plus full pre-shipment bench inspection.</p>
+                </>
+              )}
+              {footerModalTopic === 'privacy' && (
+                <>
+                  <p>We collect only the contact, shipping, and order details necessary to verify payments, prepare freight manifests, and send PDF purchase receipts.</p>
+                  <p>For account or data requests, email info-eurotopmobility@driveflyelectric.shop.</p>
+                </>
+              )}
+              {footerModalTopic === 'terms' && (
+                <>
+                  <p>By placing an order, you confirm your shipping address, operator readiness, and local regulatory compliance for off-road or private-property recreational vehicles.</p>
+                </>
+              )}
+              {footerModalTopic === 'contact' && (
+                <>
+                  <p className="font-bold text-gray-900 dark:text-white">DriveFlyElectric Operations HQ</p>
+                  <p>1000 DriveFly Electric Way, Suite 400, Austin, TX 78701, United States</p>
+                  <p>Email: info-eurotopmobility@driveflyelectric.shop</p>
+                  <p>WhatsApp / Phone: {supportPhone}</p>
+                </>
+              )}
+            </div>
+            <div className="pt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setFooterModalTopic(null)}
+                className="px-4 py-2 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black text-xs uppercase tracking-wider"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Priority Pre-Booking Modal for Coming Soon Vehicles */}
+      <BookComingSoonModal
+        product={bookingModalProduct}
+        isOpen={Boolean(bookingModalProduct)}
+        onClose={() => setBookingModalProduct(null)}
+      />
+
       {/* Same-Page Prompted Sign-in / Register Modal */}
       <AuthModal
         isOpen={isAuthModalOpen}
@@ -1264,7 +1501,7 @@ export const HomePage: React.FC = () => {
         onSuccess={() => {
           navigate('/checkout')
         }}
-        message="By management! All users should sign in or create an account to track order progress and checkout."
+        message="Sign in or create an account to save your delivery details and follow your order live."
       />
     </div>
   )

@@ -1,74 +1,73 @@
 import { Request, Response, NextFunction } from 'express'
+import { ZodError } from 'zod'
 
 export interface CustomError extends Error {
   statusCode?: number
+  status?: number
   code?: string
-  meta?: any
+  meta?: unknown
 }
 
-// Enhanced error handler for database operations
 export const errorHandler = (
   err: CustomError,
   req: Request,
   res: Response,
-  next: NextFunction
+  _next: NextFunction
 ) => {
-  let error = { ...err }
-  error.message = err.message
+  let statusCode = err.statusCode || err.status || 500
+  let message = err.message || 'An unexpected error occurred.'
 
-  // Log error
-  console.error('Error:', err)
+  // Log internally without leaking internals to the client in production
+  console.error(`[ErrorHandler] ${req.method} ${req.originalUrl}:`, err.message)
 
-  // Prisma error handling
-  if (err.name === 'PrismaClientKnownRequestError') {
-    switch (err.code) {
-      case 'P2002':
-        // Unique constraint violation
-        error.statusCode = 400
-        error.message = 'A record with this information already exists'
-        break
-      case 'P2025':
-        // Record not found
-        error.statusCode = 404
-        error.message = 'Record not found'
-        break
-      case 'P2003':
-        // Foreign key constraint failed
-        error.statusCode = 400
-        error.message = 'Related record not found'
-        break
-      case 'P2014':
-        // Invalid ID
-        error.statusCode = 400
-        error.message = 'Invalid ID format'
-        break
-      default:
-        error.statusCode = 500
-        error.message = 'Database operation failed'
+  // Zod request validation errors
+  if (err instanceof ZodError) {
+    statusCode = 400
+    const firstIssue = err.issues[0]
+    message = firstIssue?.message || 'Invalid request input.'
+  } else if (err.name === 'MulterError') {
+    statusCode = 400
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      message = 'Uploaded file exceeds the maximum allowed size.'
+    } else if (err.code === 'LIMIT_FILE_COUNT') {
+      message = 'Too many files uploaded at once.'
+    } else {
+      message = 'File upload failed validation.'
     }
+  } else if (err instanceof SyntaxError && statusCode === 400) {
+    statusCode = 400
+    message = 'Malformed JSON request body.'
+  } else if (err.code === '23505') {
+    statusCode = 409
+    message = 'A record with this information already exists.'
+  } else if (err.code === '23503') {
+    statusCode = 400
+    message = 'Referenced record does not exist.'
+  } else if (err.code === '22P02') {
+    statusCode = 400
+    message = 'Invalid identifier format.'
+  } else if (err.name === 'JsonWebTokenError') {
+    statusCode = 401
+    message = 'Invalid authentication token.'
+  } else if (err.name === 'TokenExpiredError') {
+    statusCode = 401
+    message = 'Authentication token has expired.'
+  } else if (err.name === 'ValidationError') {
+    statusCode = 400
+    message = 'Validation failed.'
+  } else if (err.message === 'CORS origin not allowed') {
+    statusCode = 403
+    message = 'Origin not authorized.'
   }
 
-  // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    error.statusCode = 401
-    error.message = 'Invalid token'
+  const isDevelopment = process.env.NODE_ENV === 'development'
+  if (statusCode >= 500 && !isDevelopment) {
+    message = 'An unexpected server error occurred. Please try again later.'
   }
 
-  if (err.name === 'TokenExpiredError') {
-    error.statusCode = 401
-    error.message = 'Token expired'
-  }
-
-  // Validation errors
-  if (err.name === 'ValidationError') {
-    error.statusCode = 400
-    error.message = 'Validation failed'
-  }
-
-  // Default error response
-  res.status(error.statusCode || 500).json({
+  res.status(statusCode).json({
     success: false,
-    error: error.message || 'Server Error',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    error: message,
+    ...(isDevelopment && statusCode >= 500 ? { stack: err.stack } : {})
   })
 }

@@ -1,5 +1,30 @@
 import { Request, Response } from 'express'
+import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
+
+const updateProfileSchema = z.object({
+  firstName: z.string().trim().min(1, 'First name is required.').max(100),
+  lastName: z.string().trim().min(1, 'Last name is required.').max(100),
+  phone: z.string().trim().max(40).optional().nullable()
+})
+
+const addressSchema = z.object({
+  type: z.enum(['SHIPPING', 'BILLING']).optional().default('SHIPPING'),
+  firstName: z.string().trim().min(1, 'First name is required.').max(100),
+  lastName: z.string().trim().min(1, 'Last name is required.').max(100),
+  company: z.string().trim().max(150).optional().nullable(),
+  address1: z.string().trim().min(1, 'Street address is required.').max(255),
+  address2: z.string().trim().max(255).optional().nullable(),
+  city: z.string().trim().min(1, 'City is required.').max(120),
+  state: z.string().trim().min(1, 'State or province is required.').max(120),
+  zipCode: z.string().trim().min(1).max(30).optional(),
+  postalCode: z.string().trim().min(1).max(30).optional(),
+  country: z.string().trim().min(2, 'Country is required.').max(120),
+  phone: z.string().trim().max(40).optional().nullable(),
+  isDefault: z.boolean().optional().default(false)
+})
+
+const updateAddressSchema = addressSchema.partial()
 
 // @desc    Get user profile
 // @route   GET /api/users/profile
@@ -35,7 +60,7 @@ export const getProfile = async (req: Request, res: Response) => {
     console.error('Error fetching user profile:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load profile.'
     })
   }
 }
@@ -45,13 +70,19 @@ export const getProfile = async (req: Request, res: Response) => {
 // @access  Private
 export const updateProfile = async (req: Request, res: Response) => {
   try {
-    const userId = req.user!.id
-    const { firstName, lastName, phone } = req.body
+    const parsed = updateProfileSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid profile data.'
+      })
+    }
 
+    const userId = req.user!.id
     const updatedUser = await databaseService.updateUser(userId, {
-      firstName,
-      lastName,
-      phone
+      firstName: parsed.data.firstName,
+      lastName: parsed.data.lastName,
+      phone: parsed.data.phone ?? undefined
     })
 
     res.status(200).json({
@@ -70,7 +101,7 @@ export const updateProfile = async (req: Request, res: Response) => {
     console.error('Error updating user profile:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update profile.'
     })
   }
 }
@@ -92,7 +123,7 @@ export const getAddresses = async (req: Request, res: Response) => {
     console.error('Error fetching user addresses:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load saved addresses.'
     })
   }
 }
@@ -102,13 +133,32 @@ export const getAddresses = async (req: Request, res: Response) => {
 // @access  Private
 export const createAddress = async (req: Request, res: Response) => {
   try {
-    const userId = req.user!.id
-    const addressData = {
-      ...req.body,
-      userId
+    const parsed = addressSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid address data.'
+      })
     }
 
-    const address = await databaseService.createAddress(addressData)
+    const userId = req.user!.id
+    const resolvedZip = parsed.data.zipCode || parsed.data.postalCode || ''
+    if (!resolvedZip) {
+      return res.status(400).json({
+        success: false,
+        error: 'Postal / ZIP code is required.'
+      })
+    }
+
+    const { postalCode: _ignoredPostal, ...restCreate } = parsed.data
+    const address = await databaseService.createAddress({
+      ...restCreate,
+      zipCode: resolvedZip,
+      company: parsed.data.company || undefined,
+      address2: parsed.data.address2 || undefined,
+      phone: parsed.data.phone || undefined,
+      userId
+    })
 
     res.status(201).json({
       success: true,
@@ -119,7 +169,7 @@ export const createAddress = async (req: Request, res: Response) => {
     console.error('Error creating address:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to save address.'
     })
   }
 }
@@ -129,9 +179,21 @@ export const createAddress = async (req: Request, res: Response) => {
 // @access  Private
 export const updateAddress = async (req: Request, res: Response) => {
   try {
+    const parsed = updateAddressSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid address update data.'
+      })
+    }
+
     const userId = req.user!.id
     const addressId = req.params.id
-    const updateData = req.body
+    const { postalCode, zipCode, ...restUpdate } = parsed.data
+    const updateData = {
+      ...restUpdate,
+      ...(zipCode || postalCode ? { zipCode: zipCode || postalCode } : {})
+    }
 
     // Check if address belongs to user
     const address = await databaseService.prisma.address.findFirst({
@@ -153,7 +215,7 @@ export const updateAddress = async (req: Request, res: Response) => {
       await databaseService.prisma.address.updateMany({
         where: {
           userId,
-          type: address.type,
+          type: updateData.type || address.type,
           isDefault: true
         },
         data: { isDefault: false }
@@ -174,7 +236,7 @@ export const updateAddress = async (req: Request, res: Response) => {
     console.error('Error updating address:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update address.'
     })
   }
 }

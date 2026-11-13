@@ -1,7 +1,63 @@
 import { Request, Response } from 'express'
+import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
 import { buildReceiptDataFromOrder, generateReceiptPdfBuffer } from '../utils/receiptPdf.js'
+
+const optionalNullableNumber = z.preprocess(
+  (val) => (val === '' || val === undefined || val === null ? null : val),
+  z.coerce.number().min(0).max(10000000).nullable()
+)
+
+const adminProductSchema = z.object({
+  name: z.string().trim().min(1, 'Product name is required.').max(200),
+  description: z.string().trim().max(10000).optional().nullable(),
+  price: z.coerce.number().min(0).max(10000000),
+  originalPrice: optionalNullableNumber.optional(),
+  sku: z.string().trim().min(1, 'SKU is required.').max(100),
+  stock: z.coerce.number().int().min(0).max(100000).default(0),
+  images: z.array(z.string().trim().max(2048)).max(20).optional().default([]),
+  category: z.string().trim().min(1, 'Category is required.').max(100),
+  brand: z.string().trim().max(100).optional().nullable(),
+  isActive: z.boolean().optional().default(true),
+  isNew: z.boolean().optional().default(false),
+  isComingSoon: z.boolean().optional().default(false),
+  comingSoonRelease: z.string().trim().max(100).optional().nullable(),
+  shippingRequired: z.boolean().optional().default(true),
+  averageDeliveryTime: z.string().trim().max(100).optional().nullable(),
+  weight: optionalNullableNumber.optional(),
+  dimensions: z.string().trim().max(150).optional().nullable()
+})
+
+const adminProductUpdateSchema = adminProductSchema.partial()
+
+const orderStatusSchema = z.object({
+  status: z.enum(['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED'])
+})
+
+const userStatusSchema = z.object({
+  isActive: z.boolean()
+})
+
+const bookingStatusSchema = z.object({
+  status: z.enum(['PENDING', 'CONFIRMED', 'NOTIFIED', 'CANCELLED'])
+})
+
+const replySupportSchema = z.object({
+  content: z.string().trim().min(1, 'Reply message content is required.').max(2000)
+})
+
+const sanitizeUser = (user: any) => ({
+  id: user.id,
+  email: user.email,
+  firstName: user.firstName,
+  lastName: user.lastName,
+  phone: user.phone,
+  role: user.role,
+  isActive: user.isActive,
+  createdAt: user.createdAt,
+  updatedAt: user.updatedAt
+})
 
 // @desc    Get admin dashboard data
 // @route   GET /api/admin/dashboard
@@ -69,31 +125,28 @@ export const getProducts = async (req: Request, res: Response) => {
       })
     }
 
-    const { category, search, limit = '100', page = '1' } = req.query
+    const { category, search, comingSoon, limit = '100', page = '1' } = req.query
 
-    const limitNum = parseInt(limit as string)
-    const offset = (parseInt(page as string) - 1) * limitNum
-
-    const where: any = {}
-    if (category) where.category = category
-    if (search) {
-      where.OR = [
-        { name: { contains: search as string, mode: 'insensitive' } },
-        { description: { contains: search as string, mode: 'insensitive' } },
-        { sku: { contains: search as string, mode: 'insensitive' } }
-      ]
-    }
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit as string, 10) || 100))
+    const pageNum = Math.max(1, parseInt(page as string, 10) || 1)
+    const offset = (pageNum - 1) * limitNum
+    const comingSoonFilter =
+      comingSoon === 'true' ? true : comingSoon === 'false' ? false : undefined
 
     const [products, totalProducts] = await Promise.all([
       databaseService.findProducts({
         category: category as string,
         search: search as string,
+        comingSoon: comingSoonFilter,
+        includeInactive: true,
         limit: limitNum,
         offset
       }),
       databaseService.getProductCount({
         category: category as string,
-        search: search as string
+        search: search as string,
+        comingSoon: comingSoonFilter,
+        includeInactive: true
       })
     ])
 
@@ -101,8 +154,8 @@ export const getProducts = async (req: Request, res: Response) => {
       success: true,
       data: products,
       pagination: {
-        currentPage: parseInt(page as string),
-        totalPages: Math.ceil(totalProducts / limitNum),
+        currentPage: pageNum,
+        totalPages: Math.max(1, Math.ceil(totalProducts / limitNum)),
         totalProducts
       }
     })
@@ -110,7 +163,7 @@ export const getProducts = async (req: Request, res: Response) => {
     console.error('Error fetching admin products:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to fetch products.'
     })
   }
 }
@@ -127,9 +180,15 @@ export const createProduct = async (req: Request, res: Response) => {
       })
     }
 
-    const productData = req.body
+    const parsed = adminProductSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid product payload.'
+      })
+    }
 
-    const newProduct = await databaseService.createProduct(productData)
+    const newProduct = await databaseService.createProduct(parsed.data)
 
     emailService.recordActivity({
       type: 'PRODUCT_UPDATED',
@@ -149,7 +208,7 @@ export const createProduct = async (req: Request, res: Response) => {
     console.error('Error creating product:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to create product.'
     })
   }
 }
@@ -166,10 +225,16 @@ export const updateProduct = async (req: Request, res: Response) => {
       })
     }
 
-    const productId = req.params.id
-    const updateData = req.body
+    const parsed = adminProductUpdateSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid product update payload.'
+      })
+    }
 
-    const updatedProduct = await databaseService.updateProduct(productId, updateData)
+    const productId = req.params.id
+    const updatedProduct = await databaseService.updateProduct(productId, parsed.data)
 
     emailService.recordActivity({
       type: 'PRODUCT_UPDATED',
@@ -187,15 +252,9 @@ export const updateProduct = async (req: Request, res: Response) => {
     })
   } catch (error) {
     console.error('Error updating product:', error)
-    if (error instanceof Error && 'code' in error && error.code === 'P2025') {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      })
-    }
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update product.'
     })
   }
 }
@@ -249,11 +308,9 @@ export const getOrders = async (req: Request, res: Response) => {
 
     const { status, limit = '20', page = '1' } = req.query
 
-    const limitNum = parseInt(limit as string)
-    const offset = (parseInt(page as string) - 1) * limitNum
-
-    const where: any = {}
-    if (status) where.status = status
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10) || 20))
+    const pageNum = Math.max(1, parseInt(page as string, 10) || 1)
+    const offset = (pageNum - 1) * limitNum
 
     const [orders, totalOrders] = await Promise.all([
       databaseService.findOrders({
@@ -270,8 +327,8 @@ export const getOrders = async (req: Request, res: Response) => {
       success: true,
       data: orders,
       pagination: {
-        currentPage: parseInt(page as string),
-        totalPages: Math.ceil(totalOrders / limitNum),
+        currentPage: pageNum,
+        totalPages: Math.max(1, Math.ceil(totalOrders / limitNum)),
         totalOrders
       }
     })
@@ -279,7 +336,7 @@ export const getOrders = async (req: Request, res: Response) => {
     console.error('Error fetching admin orders:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load orders.'
     })
   }
 }
@@ -296,10 +353,16 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
       })
     }
 
-    const { status } = req.body
-    const orderId = req.params.id
+    const parsed = orderStatusSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid order status.'
+      })
+    }
 
-    const updatedOrder = await databaseService.updateOrderStatus(orderId, status)
+    const orderId = req.params.id
+    const updatedOrder = await databaseService.updateOrderStatus(orderId, parsed.data.status)
 
     emailService
       .sendOrderStatusUpdate(updatedOrder, updatedOrder.user?.email)
@@ -312,15 +375,9 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
     })
   } catch (error) {
     console.error('Error updating order status:', error)
-    if (error instanceof Error && 'code' in error && error.code === 'P2025') {
-      return res.status(404).json({
-        success: false,
-        error: 'Order not found'
-      })
-    }
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update order status.'
     })
   }
 }
@@ -380,27 +437,34 @@ export const updateUserStatus = async (req: Request, res: Response) => {
       })
     }
 
-    const { isActive } = req.body
-    const userId = req.params.id
+    const parsed = userStatusSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'isActive must be a boolean.'
+      })
+    }
 
-    const updatedUser = await databaseService.updateUser(userId, { isActive })
+    const userId = req.params.id
+    if (req.user!.id === userId && !parsed.data.isActive) {
+      return res.status(400).json({
+        success: false,
+        error: 'Administrators cannot deactivate their own account.'
+      })
+    }
+
+    const updatedUser = await databaseService.updateUser(userId, { isActive: parsed.data.isActive })
 
     res.status(200).json({
       success: true,
-      message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
-      data: updatedUser
+      message: `User ${parsed.data.isActive ? 'activated' : 'deactivated'} successfully`,
+      data: sanitizeUser(updatedUser)
     })
   } catch (error) {
     console.error('Error updating user status:', error)
-    if (error instanceof Error && 'code' in error && error.code === 'P2025') {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      })
-    }
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update user status.'
     })
   }
 }
@@ -557,15 +621,15 @@ export const replySupportSession = async (req: Request, res: Response) => {
     }
 
     const sessionId = req.params.id
-    const { content } = req.body
-
-    if (!content || !String(content).trim()) {
+    const parsed = replySupportSchema.safeParse(req.body)
+    if (!parsed.success) {
       return res.status(400).json({
         success: false,
-        error: 'Reply message content is required'
+        error: parsed.error.issues[0]?.message || 'Reply message content is required.'
       })
     }
 
+    const cleanContent = parsed.data.content
     const adminFirstName = (req.user as any)?.firstName
     const senderName = adminFirstName
       ? `${adminFirstName} (DriveFlyElectric Support)`
@@ -574,12 +638,12 @@ export const replySupportSession = async (req: Request, res: Response) => {
     const result = await databaseService.appendSupportMessage(sessionId, {
       senderRole: 'ADMIN',
       senderName,
-      content: String(content).trim()
+      content: cleanContent
     })
 
     // Dispatch SMTP email copy to client (if visitorEmail is provided) and log to Real-Time System Activity stream
     emailService
-      .sendSupportReplyNotification(result.session, String(content).trim(), senderName)
+      .sendSupportReplyNotification(result.session, cleanContent, senderName)
       .catch((err) => console.error('Support reply notification error:', err))
 
     res.status(200).json({
@@ -630,6 +694,67 @@ export const updateSupportSessionStatus = async (req: Request, res: Response) =>
     res.status(500).json({
       success: false,
       error: 'Failed to update support session'
+    })
+  }
+}
+
+// @desc    Get all Coming Soon vehicle booking requests (Admin)
+// @route   GET /api/admin/bookings
+// @access  Private/Admin
+export const getProductBookings = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const bookings = await databaseService.listProductBookings()
+    res.status(200).json({
+      success: true,
+      data: bookings
+    })
+  } catch (error) {
+    console.error('Error fetching product bookings:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to fetch reservation bookings.'
+    })
+  }
+}
+
+// @desc    Update a Coming Soon vehicle booking status (Admin)
+// @route   PUT /api/admin/bookings/:id/status
+// @access  Private/Admin
+export const updateProductBookingStatus = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const parsed = bookingStatusSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid booking status.'
+      })
+    }
+
+    const updated = await databaseService.updateProductBookingStatus(req.params.id, parsed.data.status)
+    res.status(200).json({
+      success: true,
+      message: 'Booking status updated successfully',
+      data: updated
+    })
+  } catch (error) {
+    console.error('Error updating product booking status:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to update booking status.'
     })
   }
 }

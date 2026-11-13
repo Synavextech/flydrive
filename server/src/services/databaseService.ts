@@ -5,6 +5,7 @@ import type {
   User,
   Product,
   ProductReview,
+  ProductBooking,
   Cart,
   CartItem,
   Order,
@@ -12,6 +13,7 @@ import type {
   Address
 } from '../types/database.js'
 import crypto from 'crypto'
+import { sanitizePostgrestSearch, getFormattedSupportWhatsApp } from '../middleware/security.js'
 
 const { Pool } = pg
 
@@ -25,46 +27,13 @@ export class DatabaseService {
     if (process.env.DATABASE_URL) {
       this.pool = new Pool({
         connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }
-      })
-      this.ensureSecondaryFeaturesSchema().catch(err => {
-        console.warn('Database auto-migration notice:', err?.message || err)
+        ssl: process.env.DB_SSL_INSECURE === 'true'
+          ? { rejectUnauthorized: false }
+          : process.env.DB_SSL_CA
+            ? { rejectUnauthorized: true, ca: process.env.DB_SSL_CA }
+            : { rejectUnauthorized: true }
       })
     }
-  }
-
-  public async ensureSecondaryFeaturesSchema(): Promise<void> {
-    if (!this.pool) return
-    await this.pool.query(`
-      ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
-      CREATE INDEX IF NOT EXISTS idx_orders_tracking_number ON public.orders(tracking_number);
-      UPDATE public.orders SET tracking_number = 'TRK-' || order_number WHERE tracking_number IS NULL AND order_number IS NOT NULL;
-
-      CREATE TABLE IF NOT EXISTS public.product_reviews (
-        id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-        product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE NOT NULL,
-        user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
-        reviewer_name TEXT NOT NULL,
-        reviewer_email TEXT,
-        rating INTEGER CHECK (rating >= 1 AND rating <= 5) NOT NULL DEFAULT 5,
-        title TEXT,
-        comment TEXT NOT NULL,
-        images TEXT[] DEFAULT '{}',
-        verified_purchase BOOLEAN DEFAULT true,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      CREATE INDEX IF NOT EXISTS idx_product_reviews_product_id ON public.product_reviews(product_id);
-      CREATE INDEX IF NOT EXISTS idx_product_reviews_created_at ON public.product_reviews(created_at DESC);
-      ALTER TABLE public.product_reviews ENABLE ROW LEVEL SECURITY;
-      DROP POLICY IF EXISTS "Public can view product reviews" ON public.product_reviews;
-      CREATE POLICY "Public can view product reviews" ON public.product_reviews FOR SELECT USING (true);
-      DROP POLICY IF EXISTS "Anyone can submit product reviews" ON public.product_reviews;
-      CREATE POLICY "Anyone can submit product reviews" ON public.product_reviews FOR INSERT WITH CHECK (true);
-      DROP POLICY IF EXISTS "Admins can manage product reviews" ON public.product_reviews;
-      CREATE POLICY "Admins can manage product reviews" ON public.product_reviews FOR ALL USING (true) WITH CHECK (true);
-      NOTIFY pgrst, 'reload schema';
-    `)
   }
 
   public generateTrackingNumber(orderNumber?: string): string {
@@ -113,11 +82,13 @@ export class DatabaseService {
       brand: raw.brand || null,
       isActive: raw.is_active ?? true,
       isNew: raw.is_new ?? false,
+      isComingSoon: raw.is_coming_soon ?? false,
+      comingSoonRelease: raw.coming_soon_release || null,
       shippingRequired: raw.shipping_required ?? true,
       averageDeliveryTime: raw.average_delivery_time || null,
       weight: raw.weight ? Number(raw.weight) : null,
       dimensions: raw.dimensions || null,
-      rating: raw.rating ? Number(raw.rating) : 4.9,
+      rating: raw.rating !== undefined && raw.rating !== null ? Number(raw.rating) : 0,
       reviews: raw.reviews ? Number(raw.reviews) : 0,
       createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
       updatedAt: raw.updated_at ? new Date(raw.updated_at) : new Date()
@@ -182,7 +153,9 @@ export class DatabaseService {
       discount: Number(raw.discount || 0),
       paymentMethod: raw.payment_method,
       paymentStatus: raw.payment_status,
+      paymentVerified: raw.payment_verified ?? false,
       paymentId: raw.payment_id || null,
+      receiptToken: raw.receipt_token || null,
       shippingAddressId: raw.shipping_address_id || null,
       billingAddressId: raw.billing_address_id || null,
       notes: cleanedNotes,
@@ -296,14 +269,21 @@ export class DatabaseService {
   }
 
   async findUsers(options?: { role?: string; limit?: number; offset?: number }): Promise<User[]> {
-    let query = this.supabase.from('users').select('*').order('created_at', { ascending: false })
+    let query = this.supabase
+      .from('users')
+      .select('id, email, first_name, last_name, phone, role, is_active, created_at, updated_at')
+      .order('created_at', { ascending: false })
     if (options?.role) query = query.eq('role', options.role)
     if (options?.limit) query = query.limit(options.limit)
     if (options?.offset) query = query.range(options.offset, options.offset + (options.limit || 20) - 1)
 
     const { data, error } = await query
     if (error) throw error
-    return (data || []).map(u => this.mapUser(u))
+    return (data || []).map(u => {
+      const mapped = this.mapUser(u)
+      delete mapped.password
+      return mapped
+    })
   }
 
   // ==================== PRODUCT OPERATIONS ====================
@@ -325,29 +305,40 @@ export class DatabaseService {
     if (lower === 'trikes' || lower === 'trike') {
       return query.or('category.ilike.%trike%,name.ilike.%trike%')
     }
-    return query.ilike('category', `%${category}%`)
+    const safeCategory = sanitizePostgrestSearch(category)
+    return safeCategory ? query.ilike('category', `%${safeCategory}%`) : query
   }
 
   async findProducts(filters?: {
     category?: string
     search?: string
+    includeInactive?: boolean
+    comingSoon?: boolean
     limit?: number
     offset?: number
   }): Promise<Product[]> {
-    const { category, search, limit = 100, offset = 0 } = filters || {}
+    const { category, search, includeInactive = false, comingSoon, limit = 100, offset = 0 } = filters || {}
     try {
       let query = this.supabase
         .from('products')
         .select('*')
-        .eq('is_active', true)
         .order('created_at', { ascending: false })
         .range(offset, offset + limit - 1)
+
+      if (!includeInactive) {
+        query = query.eq('is_active', true)
+      }
+      if (comingSoon !== undefined) {
+        query = query.eq('is_coming_soon', comingSoon)
+      }
 
       query = this.applyCategoryFilter(query, category)
 
       if (search && search.trim()) {
-        const s = search.trim()
-        query = query.or(`name.ilike.%${s}%,description.ilike.%${s}%`)
+        const s = sanitizePostgrestSearch(search)
+        if (s) {
+          query = query.or(`name.ilike.%${s}%,description.ilike.%${s}%`)
+        }
       }
 
       const { data, error } = await query
@@ -355,8 +346,12 @@ export class DatabaseService {
       return (data || []).map(p => this.mapProduct(p))
     } catch (err) {
       if (this.pool) {
-        let sql = 'SELECT * FROM products WHERE is_active = true'
+        let sql = includeInactive ? 'SELECT * FROM products WHERE 1=1' : 'SELECT * FROM products WHERE is_active = true'
         const params: any[] = []
+        if (comingSoon !== undefined) {
+          params.push(comingSoon)
+          sql += ` AND COALESCE(is_coming_soon, false) = $${params.length}`
+        }
         if (category && category.toLowerCase() !== 'all') {
           const lower = category.toLowerCase().trim()
           const term = lower.includes('heli') ? 'heli' : lower.includes('kart') ? 'kart' : lower.includes('dirt') ? 'dirt' : lower
@@ -417,28 +412,40 @@ export class DatabaseService {
 
   async createProduct(productData: any): Promise<Product> {
     const id = productData.id || crypto.randomUUID()
-    const { data, error } = await this.supabase
+    const basePayload = {
+      id,
+      name: productData.name,
+      description: productData.description,
+      price: productData.price,
+      original_price: productData.originalPrice,
+      sku: productData.sku,
+      stock: productData.stock ?? 0,
+      images: productData.images || [],
+      category: productData.category,
+      brand: productData.brand,
+      is_active: productData.isActive ?? true,
+      is_new: productData.isNew ?? false,
+      shipping_required: productData.shippingRequired ?? true,
+      average_delivery_time: productData.averageDeliveryTime || '12-20 business days',
+      weight: productData.weight,
+      dimensions: productData.dimensions
+    }
+
+    let { data, error } = await this.supabase
       .from('products')
       .insert({
-        id,
-        name: productData.name,
-        description: productData.description,
-        price: productData.price,
-        original_price: productData.originalPrice,
-        sku: productData.sku,
-        stock: productData.stock ?? 0,
-        images: productData.images || [],
-        category: productData.category,
-        brand: productData.brand,
-        is_active: productData.isActive ?? true,
-        is_new: productData.isNew ?? false,
-        shipping_required: productData.shippingRequired ?? true,
-        average_delivery_time: productData.averageDeliveryTime || '2-4 business days',
-        weight: productData.weight,
-        dimensions: productData.dimensions
+        ...basePayload,
+        is_coming_soon: productData.isComingSoon ?? false,
+        coming_soon_release: productData.comingSoonRelease || null
       })
       .select()
       .single()
+
+    if (error && String(error.message || '').includes('coming_soon')) {
+      const retry = await this.supabase.from('products').insert(basePayload).select().single()
+      data = retry.data
+      error = retry.error
+    }
 
     if (error || !data) throw error || new Error('Failed to create product')
     return this.mapProduct(data)
@@ -457,18 +464,28 @@ export class DatabaseService {
     if (productData.brand !== undefined) payload.brand = productData.brand
     if (productData.isActive !== undefined) payload.is_active = productData.isActive
     if (productData.isNew !== undefined) payload.is_new = productData.isNew
+    if (productData.isComingSoon !== undefined) payload.is_coming_soon = productData.isComingSoon
+    if (productData.comingSoonRelease !== undefined) payload.coming_soon_release = productData.comingSoonRelease
     if (productData.shippingRequired !== undefined) payload.shipping_required = productData.shippingRequired
     if (productData.averageDeliveryTime !== undefined) payload.average_delivery_time = productData.averageDeliveryTime
     if (productData.weight !== undefined) payload.weight = productData.weight
     if (productData.dimensions !== undefined) payload.dimensions = productData.dimensions
     payload.updated_at = new Date().toISOString()
 
-    const { data, error } = await this.supabase
+    let { data, error } = await this.supabase
       .from('products')
       .update(payload)
       .eq('id', id)
       .select()
       .single()
+
+    if (error && String(error.message || '').includes('coming_soon')) {
+      delete payload.is_coming_soon
+      delete payload.coming_soon_release
+      const retry = await this.supabase.from('products').update(payload).eq('id', id).select().single()
+      data = retry.data
+      error = retry.error
+    }
 
     if (error || !data) throw error || new Error('Failed to update product')
     return this.mapProduct(data)
@@ -486,18 +503,26 @@ export class DatabaseService {
     return this.mapProduct(data)
   }
 
-  async getProductCount(filters?: { category?: string; search?: string }): Promise<number> {
+  async getProductCount(filters?: { category?: string; search?: string; includeInactive?: boolean; comingSoon?: boolean }): Promise<number> {
     try {
       let query = this.supabase
         .from('products')
         .select('*', { count: 'exact', head: true })
-        .eq('is_active', true)
+
+      if (!filters?.includeInactive) {
+        query = query.eq('is_active', true)
+      }
+      if (filters?.comingSoon !== undefined) {
+        query = query.eq('is_coming_soon', filters.comingSoon)
+      }
 
       query = this.applyCategoryFilter(query, filters?.category)
 
       if (filters?.search && filters.search.trim()) {
-        const s = filters.search.trim()
-        query = query.or(`name.ilike.%${s}%,description.ilike.%${s}%`)
+        const s = sanitizePostgrestSearch(filters.search)
+        if (s) {
+          query = query.or(`name.ilike.%${s}%,description.ilike.%${s}%`)
+        }
       }
 
       const { count, error } = await query
@@ -505,8 +530,12 @@ export class DatabaseService {
       return count ?? 0
     } catch (err) {
       if (this.pool) {
-        let sql = 'SELECT count(*) FROM products WHERE is_active = true'
+        let sql = filters?.includeInactive ? 'SELECT count(*) FROM products WHERE 1=1' : 'SELECT count(*) FROM products WHERE is_active = true'
         const params: any[] = []
+        if (filters?.comingSoon !== undefined) {
+          params.push(filters.comingSoon)
+          sql += ` AND COALESCE(is_coming_soon, false) = $${params.length}`
+        }
         if (filters?.category && filters.category.toLowerCase() !== 'all') {
           const lower = filters.category.toLowerCase().trim()
           const term = lower.includes('heli') ? 'heli' : lower.includes('kart') ? 'kart' : lower.includes('dirt') ? 'dirt' : lower
@@ -645,7 +674,7 @@ export class DatabaseService {
 
   // ==================== ORDER OPERATIONS ====================
   async createOrder(orderData: {
-    userId: string
+    userId: string | null
     total: number
     subtotal: number
     tax?: number
@@ -654,6 +683,8 @@ export class DatabaseService {
     paymentMethod: 'STRIPE' | 'PAYPAL'
     paymentId?: string
     paymentStatus?: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
+    paymentVerified?: boolean
+    receiptToken?: string | null
     status?: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
     shippingAddressId?: string
     billingAddressId?: string
@@ -673,7 +704,7 @@ export class DatabaseService {
 
     const baseInsertPayload: Record<string, any> = {
       id: orderId,
-      user_id: orderData.userId,
+      user_id: orderData.userId || null,
       order_number: orderNumber,
       total: orderData.total,
       subtotal: orderData.subtotal,
@@ -684,8 +715,8 @@ export class DatabaseService {
       payment_id: orderData.paymentId || null,
       payment_status: orderData.paymentStatus || 'PENDING',
       status: orderData.status || (orderData.paymentStatus === 'COMPLETED' ? 'PROCESSING' : 'PENDING'),
-      shipping_address_id: orderData.shippingAddressId,
-      billing_address_id: orderData.billingAddressId,
+      shipping_address_id: orderData.shippingAddressId || null,
+      billing_address_id: orderData.billingAddressId || null,
       notes: notesWithTracking
     }
 
@@ -696,20 +727,35 @@ export class DatabaseService {
       .from('orders')
       .insert({
         ...baseInsertPayload,
-        tracking_number: trackingNumber
+        tracking_number: trackingNumber,
+        payment_verified: Boolean(orderData.paymentVerified),
+        receipt_token: orderData.receiptToken || null
       })
       .select()
       .single()
 
     if (firstAttempt.error) {
-      // Fallback if PostgREST schema cache hasn't refreshed tracking_number yet
-      const secondAttempt = await this.supabase
+      const retryAttempt = await this.supabase
         .from('orders')
-        .insert(baseInsertPayload)
+        .insert({
+          ...baseInsertPayload,
+          tracking_number: trackingNumber
+        })
         .select()
         .single()
-      order = secondAttempt.data
-      orderError = secondAttempt.error
+
+      if (retryAttempt.error) {
+        const secondAttempt = await this.supabase
+          .from('orders')
+          .insert(baseInsertPayload)
+          .select()
+          .single()
+        order = secondAttempt.data
+        orderError = secondAttempt.error
+      } else {
+        order = retryAttempt.data
+        orderError = null
+      }
 
       if (order && this.pool) {
         await this.pool
@@ -749,10 +795,24 @@ export class DatabaseService {
       }
     }
 
-    // Clear user cart
-    await this.clearCart(orderData.userId).catch(() => {})
+    // Clear user cart only when associated with an authenticated account
+    if (orderData.userId) {
+      await this.clearCart(orderData.userId).catch(() => {})
+    }
 
     return this.findOrderById(order.id) as Promise<Order>
+  }
+
+  async findOrderByPaymentId(paymentId: string): Promise<Order | null> {
+    if (!paymentId) return null
+    const { data, error } = await this.supabase
+      .from('orders')
+      .select('*, order_items(*, products(*)), users(*), shipping_address:addresses!orders_shipping_address_id_fkey(*)')
+      .eq('payment_id', paymentId)
+      .maybeSingle()
+
+    if (error || !data) return null
+    return this.mapOrder(data)
   }
 
   async findOrders(options?: { userId?: string; status?: string; limit?: number; offset?: number }): Promise<Order[]> {
@@ -1033,8 +1093,8 @@ export class DatabaseService {
     try {
       const prod = await this.findProductById(input.productId)
       if (prod) {
-        const prevCount = Math.max(5, Number(prod.reviews || 5))
-        const prevRating = Number(prod.rating || 4.9)
+        const prevCount = Math.max(0, Number(prod.reviews || 0))
+        const prevRating = Number(prod.rating || 0)
         const nextCount = prevCount + 1
         const nextRating = Number(((prevRating * prevCount + cleanRating) / nextCount).toFixed(2))
         await this.supabase
@@ -1619,8 +1679,8 @@ export class DatabaseService {
 
     // 2. Handle Topic: Shipping Issue
     if (topic === 'Shipping Issue' || lowerMsg.includes('ship') || lowerMsg.includes('deliver') || lowerMsg.includes('track') || lowerMsg.includes('freight') || lowerMsg.includes('warehouse')) {
-      const deliveryWindow = matchedProducts[0]?.averageDeliveryTime || '14-25 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)'
-      return `${capturedContactNote}🚚 **DriveFlyElectric Shipping & Freight Support**:\n• **100% Free Express Doorstep Shipping** is included on all orders.\n• **Dispatch & Transit Window**: ${deliveryWindow}, with North American coordination out of our Austin, Texas HQ.\n• All MiniHeliCopters, Microcars, Go Karts, Trikes, and Dirtbikes ship in reinforced steel-framed crates with full customs clearance and tracking.\n• For instant live freight & tracking assistance, you can also click the **green WhatsApp Shipping button** at the bottom-right (+1 909-308-8313).${contactPrompt}`
+      const deliveryWindow = matchedProducts[0]?.averageDeliveryTime || '14-25 business days (Global Express Crated Freight)'
+      return `${capturedContactNote}🚚 **DriveFlyElectric Shipping & Freight Support**:\n• **100% Free Express Doorstep Shipping** is included on all orders.\n• **Dispatch & Transit Window**: ${deliveryWindow}, with international dispatch coordination from our operations centers.\n• All MiniHeliCopters, Microcars, Go Karts, Trikes, and Dirtbikes ship in reinforced steel-framed crates with full customs clearance and tracking.\n• For instant live freight & tracking assistance, you can also click the **green WhatsApp Support button** at the bottom-right (${getFormattedSupportWhatsApp()}).${contactPrompt}`
     }
 
     // 3. Handle Matched / Selected Catalogue Items or Item Purchase Inquiry
@@ -1638,7 +1698,7 @@ export class DatabaseService {
     }
 
     // 4. General Inquiry & Store Details Acquisition
-    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA | **Dispatch Warehouse**: Nanshan, Shenzhen, Guangdong Province, China\n• **Official Support Email**: info-eurotopmobility@driveflyelectric.shop\n• **Shipping WhatsApp Line**: +1 (909) 308-8313\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your rig selection today?${contactPrompt}`
+    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA\n• **Official Support Email**: info-eurotopmobility@driveflyelectric.shop\n• **WhatsApp Support Line**: ${getFormattedSupportWhatsApp()}\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your fleet selection today?${contactPrompt}`
   }
 
   async appendSupportMessage(
@@ -1740,6 +1800,196 @@ export class DatabaseService {
       session: this.enrichSupportSession(session),
       newMessages: createdList
     }
+  }
+
+  // ==================== COMING SOON PRODUCT BOOKING OPERATIONS ====================
+  private bookingsMemoryCache: Map<string, ProductBooking> = new Map()
+
+  public mapProductBooking(raw: any): ProductBooking {
+    return {
+      id: raw.id,
+      productId: raw.product_id || raw.productId,
+      userId: raw.user_id || raw.userId || null,
+      fullName: raw.full_name || raw.fullName || 'Customer',
+      email: raw.email,
+      phone: raw.phone || null,
+      country: raw.country || 'United States',
+      quantity: Number(raw.quantity || 1),
+      notes: raw.notes || null,
+      status: raw.status || 'PENDING',
+      bookingReference: raw.booking_reference || raw.bookingReference,
+      createdAt: raw.created_at ? new Date(raw.created_at) : raw.createdAt ? new Date(raw.createdAt) : new Date(),
+      updatedAt: raw.updated_at ? new Date(raw.updated_at) : raw.updatedAt ? new Date(raw.updatedAt) : new Date(),
+      product: raw.products ? this.mapProduct(raw.products) : raw.product
+    }
+  }
+
+  async createProductBooking(input: {
+    productId: string
+    userId?: string | null
+    fullName: string
+    email: string
+    phone?: string | null
+    country?: string
+    quantity?: number
+    notes?: string | null
+  }): Promise<ProductBooking> {
+    const id = `bk_${crypto.randomUUID()}`
+    const bookingReference = `BKG-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`
+    const nowIso = new Date().toISOString()
+
+    const product = await this.findProductById(input.productId)
+    const booking: ProductBooking = {
+      id,
+      productId: input.productId,
+      userId: input.userId || null,
+      fullName: input.fullName.trim(),
+      email: input.email.trim(),
+      phone: input.phone ? input.phone.trim() : null,
+      country: (input.country || 'United States').trim(),
+      quantity: Math.min(50, Math.max(1, Math.round(Number(input.quantity || 1)))),
+      notes: input.notes ? input.notes.trim() : null,
+      status: 'PENDING',
+      bookingReference,
+      createdAt: new Date(nowIso),
+      updatedAt: new Date(nowIso),
+      product: product || undefined
+    }
+
+    this.bookingsMemoryCache.set(booking.id, booking)
+
+    let persisted = false
+    try {
+      const { error } = await this.supabase.from('product_bookings').insert({
+        id: booking.id,
+        product_id: booking.productId,
+        user_id: booking.userId,
+        full_name: booking.fullName,
+        email: booking.email,
+        phone: booking.phone,
+        country: booking.country,
+        quantity: booking.quantity,
+        notes: booking.notes,
+        status: booking.status,
+        booking_reference: booking.bookingReference,
+        created_at: nowIso,
+        updated_at: nowIso
+      })
+      if (!error) persisted = true
+    } catch {
+      // Fallback below
+    }
+
+    if (!persisted) {
+      try {
+        await this.supabase.from('events').upsert({
+          id: booking.id,
+          title: `BOOKING:${booking.bookingReference}:${booking.productId}`,
+          description: JSON.stringify(booking),
+          date: nowIso.slice(0, 10),
+          time: nowIso,
+          location: booking.productId,
+          category: 'PRODUCT_BOOKING',
+          status: 'upcoming',
+          updated_at: nowIso
+        }, { onConflict: 'id' })
+      } catch {
+        // Memory cache already saved
+      }
+    }
+
+    return booking
+  }
+
+  async listProductBookings(): Promise<ProductBooking[]> {
+    const map = new Map<string, ProductBooking>()
+    for (const [id, bk] of this.bookingsMemoryCache.entries()) {
+      map.set(id, bk)
+    }
+
+    try {
+      const { data, error } = await this.supabase
+        .from('product_bookings')
+        .select('*, products(*)')
+        .order('created_at', { ascending: false })
+        .limit(200)
+      if (!error && Array.isArray(data)) {
+        for (const row of data) {
+          const mapped = this.mapProductBooking(row)
+          map.set(mapped.id, mapped)
+          this.bookingsMemoryCache.set(mapped.id, mapped)
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+
+    try {
+      const { data: evRows } = await this.supabase
+        .from('events')
+        .select('*')
+        .eq('category', 'PRODUCT_BOOKING')
+        .order('updated_at', { ascending: false })
+        .limit(200)
+      for (const ev of evRows || []) {
+        if (ev.description && !map.has(ev.id)) {
+          try {
+            const parsed = this.mapProductBooking(JSON.parse(ev.description))
+            map.set(parsed.id, parsed)
+            this.bookingsMemoryCache.set(parsed.id, parsed)
+          } catch {
+            // Skip malformed JSON
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    return Array.from(map.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )
+  }
+
+  async updateProductBookingStatus(
+    id: string,
+    status: 'PENDING' | 'CONFIRMED' | 'NOTIFIED' | 'CANCELLED'
+  ): Promise<ProductBooking | null> {
+    const nowIso = new Date().toISOString()
+    try {
+      const { data, error } = await this.supabase
+        .from('product_bookings')
+        .update({ status, updated_at: nowIso })
+        .eq('id', id)
+        .select('*, products(*)')
+        .maybeSingle()
+
+      if (!error && data) {
+        const mapped = this.mapProductBooking(data)
+        this.bookingsMemoryCache.set(id, mapped)
+        return mapped
+      }
+    } catch {
+      // Fallback below
+    }
+
+    const existing = (await this.listProductBookings()).find(b => b.id === id)
+    if (!existing) return null
+    existing.status = status
+    existing.updatedAt = new Date(nowIso)
+    this.bookingsMemoryCache.set(id, existing)
+
+    await this.supabase
+      .from('events')
+      .update({
+        description: JSON.stringify(existing),
+        updated_at: nowIso
+      })
+      .eq('id', id)
+      .eq('category', 'PRODUCT_BOOKING')
+      .then(() => {}, () => {})
+
+    return existing
   }
 
   // ==================== CONTROLLER COMPATIBILITY LAYER ====================

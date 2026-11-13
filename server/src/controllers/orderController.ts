@@ -1,52 +1,172 @@
 import { Request, Response } from 'express'
+import crypto from 'crypto'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
+import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
 import { buildReceiptDataFromOrder, generateReceiptPdfBuffer } from '../utils/receiptPdf.js'
+import {
+  getJwtSecret,
+  signReceiptAccessToken,
+  verifyReceiptAccessToken
+} from '../middleware/security.js'
+import {
+  computeAuthoritativeOrderPricing,
+  verifyPayPalPayment,
+  verifyStripePaymentIntent
+} from '../utils/paymentVerification.js'
+
+const createOrderSchema = z.object({
+  customer: z
+    .object({
+      email: z.string().trim().email().max(254).optional(),
+      firstName: z.string().trim().max(100).optional(),
+      lastName: z.string().trim().max(100).optional(),
+      phone: z.string().trim().max(40).optional()
+    })
+    .optional(),
+  shippingAddressId: z.string().trim().max(100).optional().nullable(),
+  billingAddressId: z.string().trim().max(100).optional().nullable(),
+  shippingAddress: z
+    .object({
+      email: z.string().trim().email().max(254).optional(),
+      firstName: z.string().trim().max(100).optional(),
+      lastName: z.string().trim().max(100).optional(),
+      phone: z.string().trim().max(40).optional(),
+      company: z.string().trim().max(150).optional(),
+      address1: z.string().trim().max(255).optional(),
+      address2: z.string().trim().max(255).optional(),
+      city: z.string().trim().max(120).optional(),
+      state: z.string().trim().max(120).optional(),
+      zipCode: z.string().trim().max(30).optional(),
+      postalCode: z.string().trim().max(30).optional(),
+      country: z.string().trim().max(120).optional(),
+      countryCode: z.string().trim().max(5).optional()
+    })
+    .optional(),
+  paymentMethod: z.enum(['STRIPE', 'PAYPAL']).default('PAYPAL'),
+  paymentId: z.string().trim().min(3, 'A verified payment transaction ID is required.').max(200),
+  paypalOrderId: z.string().trim().max(120).optional(),
+  notes: z.string().trim().max(2000).optional(),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().trim().optional(),
+        id: z.string().trim().optional(),
+        product: z.object({ id: z.string().trim().optional() }).optional(),
+        quantity: z.coerce.number().int().min(1).max(50).default(1)
+      })
+    )
+    .optional(),
+  password: z.string().max(128).optional().or(z.literal('')),
+  createAccount: z.boolean().optional()
+})
+
+const orderStatusUpdateSchema = z.object({
+  status: z.enum(['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED'])
+})
+
+function extractGuestMetadataFromNotes(notes?: string | null): {
+  emails: string[]
+  zips: string[]
+} {
+  if (!notes) return { emails: [], zips: [] }
+  const emails: string[] = []
+  const zips: string[] = []
+
+  const emailMatches = notes.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)
+  if (emailMatches) {
+    emails.push(...emailMatches.map((e) => e.toLowerCase()))
+  }
+
+  const postalMatch = notes.match(/Postal:\s*([A-Za-z0-9 -]{2,20})/i)
+  if (postalMatch?.[1]) {
+    zips.push(postalMatch[1].trim().toLowerCase())
+  }
+
+  return { emails, zips }
+}
 
 // @desc    Create new order
 // @route   POST /api/orders
-// @access  Public (Guest Checkout supported with optional inline account creation)
+// @access  Public (Verified payment required; guest checkout never collides with existing accounts)
 export const createOrder = async (req: Request, res: Response) => {
   try {
-    let userId = req.user?.id
+    const parsed = createOrderSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid order submission payload.'
+      })
+    }
+
     const {
       customer,
       shippingAddressId,
       billingAddressId,
       shippingAddress: shippingAddressInput,
-      paymentMethod = 'STRIPE',
+      paymentMethod,
       paymentId,
-      paymentStatus,
+      paypalOrderId,
       notes,
       items: bodyItems,
       password: customerPassword,
       createAccount
-    } = req.body
+    } = parsed.data
 
-    const customerEmail = customer?.email || shippingAddressInput?.email || req.user?.email
+    const rawCustomerEmail =
+      customer?.email || shippingAddressInput?.email || req.user?.email || ''
+    const customerEmail = rawCustomerEmail.trim().toLowerCase()
 
-    let tokenToReturn: string | null = null
-    let authUserToReturn: any = null
+    // 1. Idempotency check on raw paymentId before allocating any order/user resources
+    const existingByPayment = await databaseService.findOrderByPaymentId(paymentId)
+    if (existingByPayment) {
+      const guestMeta = extractGuestMetadataFromNotes(existingByPayment.notes)
+      const callerOwnsOrder =
+        req.user?.role === 'ADMIN' ||
+        Boolean(req.user?.id && existingByPayment.userId === req.user.id) ||
+        Boolean(
+          customerEmail &&
+            (existingByPayment.user?.email?.toLowerCase() === customerEmail ||
+              guestMeta.emails.includes(customerEmail))
+        )
 
-    // If unauthenticated, find or automatically create customer user account
-    if (!userId) {
-      if (!customerEmail) {
-        return res.status(400).json({
+      if (!callerOwnsOrder) {
+        return res.status(409).json({
           success: false,
-          error: 'An email address is required to process your order'
+          error: 'This payment reference has already been redeemed for another order.'
         })
       }
 
-      let existingUser = await databaseService.findUserByEmail(customerEmail)
-      if (existingUser) {
-        userId = existingUser.id
-        authUserToReturn = existingUser
-      } else {
-        const salt = await bcrypt.genSalt(10)
-        const passwordToHash = customerPassword || `DFE_${Math.random().toString(36).substring(2, 10)}!1A`
-        const hashedPassword = await bcrypt.hash(passwordToHash, salt)
+      const tokenForExisting =
+        existingByPayment.receiptToken || signReceiptAccessToken(existingByPayment.id)
+      return res.status(200).json({
+        success: true,
+        message: 'Order already recorded',
+        data: { ...existingByPayment, receiptToken: tokenForExisting }
+      })
+    }
+
+    let userId: string | null = req.user?.id || null
+    let tokenToReturn: string | null = null
+    let authUserToReturn: any = null
+
+    if (userId) {
+      authUserToReturn = await databaseService.findUserById(userId).catch(() => null)
+    } else {
+      if (!customerEmail) {
+        return res.status(400).json({
+          success: false,
+          error: 'A valid email address is required to complete your order.'
+        })
+      }
+
+      // CRITICAL SECURITY FIX: Never attach an unauthenticated checkout order to an existing account by email!
+      const existingUser = await databaseService.findUserByEmail(customerEmail)
+      if (!existingUser && createAccount && customerPassword && customerPassword.length >= 8) {
+        const salt = await bcrypt.genSalt(12)
+        const hashedPassword = await bcrypt.hash(customerPassword, salt)
         const firstName = customer?.firstName || shippingAddressInput?.firstName || 'Customer'
         const lastName = customer?.lastName || shippingAddressInput?.lastName || ''
         const phone = customer?.phone || shippingAddressInput?.phone || ''
@@ -62,35 +182,32 @@ export const createOrder = async (req: Request, res: Response) => {
         userId = newUser.id
         authUserToReturn = newUser
 
-        const secret = process.env.JWT_SECRET || 'your_jwt_secret_here'
         tokenToReturn = (jwt as any).sign(
           { id: newUser.id, email: newUser.email, role: newUser.role },
-          secret,
+          getJwtSecret(),
           { expiresIn: process.env.JWT_EXPIRE || '30d' }
         )
 
-        // Dispatch welcome & system notification emails for newly created customer account
         emailService
           .sendAccountRegistrationNotifications(newUser, 'Checkout Account Creation')
           .catch((err) => console.error('Checkout account registration email error:', err))
+      } else {
+        // Proceed cleanly as a guest checkout (userId stays null)
+        userId = null
       }
-    } else if (!authUserToReturn && userId) {
-      // Fetch authenticated user's declared account email & profile
-      authUserToReturn = await databaseService.findUserById(userId).catch(() => null)
     }
 
-    // Determine order items (either from request body or user's database cart)
+    // 2. Resolve items & compute authoritative USD totals on the server
     let candidateItems: Array<{ productId: string; quantity: number }> = []
-
     if (Array.isArray(bodyItems) && bodyItems.length > 0) {
-      candidateItems = bodyItems.map((item: any) => ({
-        productId: item.productId || item.product?.id || item.id,
+      candidateItems = bodyItems.map((item) => ({
+        productId: item.productId || item.product?.id || item.id || '',
         quantity: Number(item.quantity) || 1
       }))
     } else if (userId) {
       const cart = await databaseService.findOrCreateCart(userId)
       if (cart.items && cart.items.length > 0) {
-        candidateItems = cart.items.map(item => ({
+        candidateItems = cart.items.map((item) => ({
           productId: item.productId,
           quantity: item.quantity
         }))
@@ -100,25 +217,60 @@ export const createOrder = async (req: Request, res: Response) => {
     if (!candidateItems.length) {
       return res.status(400).json({
         success: false,
-        error: 'Order items are required'
+        error: 'Order items are required.'
       })
     }
 
-    // Process shipping address if passed as object
-    let finalShippingAddressId = shippingAddressId
-    if (!finalShippingAddressId && shippingAddressInput) {
+    let pricing
+    try {
+      pricing = await computeAuthoritativeOrderPricing(candidateItems)
+    } catch (pricingErr: any) {
+      return res.status(400).json({
+        success: false,
+        error: pricingErr?.message || 'Unable to verify selected items and pricing.'
+      })
+    }
+
+    // 3. Mandatory live gateway verification BEFORE recording settled order
+    const verification =
+      paymentMethod === 'STRIPE'
+        ? await verifyStripePaymentIntent(paymentId, pricing.total)
+        : await verifyPayPalPayment(paymentId, pricing.total, paypalOrderId)
+
+    if (!verification.verified) {
+      return res.status(402).json({
+        success: false,
+        error:
+          verification.reason ||
+          'Payment verification failed with the processor. Your order has not been finalized.'
+      })
+    }
+
+    const verifiedPaymentId = verification.paymentId || paymentId
+    if (verifiedPaymentId !== paymentId) {
+      const duplicateVerified = await databaseService.findOrderByPaymentId(verifiedPaymentId)
+      if (duplicateVerified) {
+        return res.status(409).json({
+          success: false,
+          error: 'This captured payment has already been assigned to an order.'
+        })
+      }
+    }
+
+    // 4. Persist shipping address record only for resolved user accounts
+    let finalShippingAddressId: string | undefined = shippingAddressId || undefined
+    if (!finalShippingAddressId && shippingAddressInput && userId) {
       try {
         const createdAddr = await databaseService.createAddress({
-          userId: userId!,
+          userId,
           type: 'SHIPPING',
-          firstName: shippingAddressInput.firstName,
-          lastName: shippingAddressInput.lastName,
+          firstName: shippingAddressInput.firstName || 'Customer',
+          lastName: shippingAddressInput.lastName || '',
           company: shippingAddressInput.company,
-          address1: shippingAddressInput.address1,
+          address1: shippingAddressInput.address1 || '',
           address2: shippingAddressInput.address2,
-          city: shippingAddressInput.city,
-          state: shippingAddressInput.state,
-          postalCode: shippingAddressInput.postalCode || shippingAddressInput.zipCode || '',
+          city: shippingAddressInput.city || '',
+          state: shippingAddressInput.state || '',
           zipCode: shippingAddressInput.zipCode || shippingAddressInput.postalCode || '',
           country: shippingAddressInput.country || 'United States',
           phone: shippingAddressInput.phone,
@@ -126,75 +278,64 @@ export const createOrder = async (req: Request, res: Response) => {
         })
         finalShippingAddressId = createdAddr.id
       } catch (addrErr) {
-        console.warn('Could not auto-create address:', addrErr)
+        console.warn('Could not auto-create saved address:', addrErr)
       }
     }
 
-    // Calculate totals and validate products
-    let subtotal = 0
-    const orderItems: Array<{ productId: string; quantity: number; price: number }> = []
-
-    for (const item of candidateItems) {
-      const product = await databaseService.findProductById(item.productId)
-
-      if (!product || !product.isActive) {
-        return res.status(400).json({
-          success: false,
-          error: `Product ${item.productId} is no longer available`
-        })
-      }
-
-      if (product.stock < item.quantity) {
-        return res.status(400).json({
-          success: false,
-          error: `Insufficient stock for ${product.name}`
-        })
-      }
-
-      const itemTotal = Number(product.price) * item.quantity
-      subtotal += itemTotal
-      orderItems.push({
-        productId: item.productId,
-        quantity: item.quantity,
-        price: Number(product.price)
-      })
-    }
-
-    // USD Calculations: 100% Free Worldwide & US Express Shipping on all orders, 5% sales tax
-    const shipping = 0
-    const tax = Math.round(subtotal * 0.05 * 100) / 100
-    const total = Math.round((subtotal + tax + shipping) * 100) / 100
-
-    // Create order in Supabase
-    const isSettled = paymentStatus === 'COMPLETED' || !!paymentId
-    const order = await databaseService.createOrder({
-      userId,
-      total,
-      subtotal,
-      tax,
-      shipping,
-      paymentMethod,
-      paymentId: paymentId || undefined,
-      paymentStatus: isSettled ? 'COMPLETED' : 'PENDING',
-      status: isSettled ? 'PROCESSING' : 'PENDING',
-      shippingAddressId: finalShippingAddressId,
-      billingAddressId,
-      notes,
-      items: orderItems
-    })
-
-    // Build full shipping address string for notifications
+    // Build structured notes so guest orders always retain buyer/address details for PDF receipt & tracking lookup
+    const zipValue = shippingAddressInput?.zipCode || shippingAddressInput?.postalCode || ''
     const fullAddress = shippingAddressInput
-      ? `${shippingAddressInput.address1 || ''}${shippingAddressInput.address2 ? `, ${shippingAddressInput.address2}` : ''}, ${shippingAddressInput.city || ''}, ${shippingAddressInput.state || ''} ${shippingAddressInput.postalCode || shippingAddressInput.zipCode || ''}, ${shippingAddressInput.country || 'United States'}`
+      ? `${shippingAddressInput.address1 || ''}${shippingAddressInput.address2 ? `, ${shippingAddressInput.address2}` : ''}, ${shippingAddressInput.city || ''}, ${shippingAddressInput.state || ''} ${zipValue}, ${shippingAddressInput.country || 'United States'}`
+          .replace(/^,\s*/, '')
+          .trim()
       : undefined
 
-    // Dispatch real-time purchase confirmation & PDF receipt to user email (declared during account creation) AND system mail
+    const structuredSegments: string[] = []
+    if (notes && notes.trim()) structuredSegments.push(notes.trim())
+    if (fullAddress) structuredSegments.push(`Delivery to ${fullAddress}.`)
+    if (customerEmail || zipValue) {
+      structuredSegments.push(
+        `[Buyer: ${customerEmail || 'Verified Buyer'} | Postal: ${zipValue || 'N/A'}]`
+      )
+    }
+    const mergedNotes = structuredSegments.join(' ')
+
+    const generatedReceiptToken = crypto.randomBytes(24).toString('hex')
+    const order = await databaseService.createOrder({
+      userId,
+      total: pricing.total,
+      subtotal: pricing.subtotal,
+      tax: pricing.tax,
+      shipping: pricing.shipping,
+      paymentMethod,
+      paymentId: verifiedPaymentId,
+      paymentStatus: 'COMPLETED',
+      paymentVerified: true,
+      receiptToken: generatedReceiptToken,
+      status: 'PROCESSING',
+      shippingAddressId: finalShippingAddressId,
+      billingAddressId: billingAddressId || undefined,
+      notes: mergedNotes,
+      items: pricing.orderItems.map(({ productId, quantity, price }) => ({
+        productId,
+        quantity,
+        price
+      }))
+    })
+
+    const effectiveReceiptToken = order.receiptToken || signReceiptAccessToken(order.id)
+
+    // Clear authenticated user's DB cart once order is finalized
+    if (userId) {
+      databaseService.clearCart(userId).catch(() => {})
+    }
+
     emailService
       .sendPurchaseNotifications(order, {
         accountEmail: authUserToReturn?.email || req.user?.email || customerEmail,
         shippingEmail: customerEmail,
-        firstName: shippingAddressInput?.firstName || authUserToReturn?.firstName,
-        lastName: shippingAddressInput?.lastName || authUserToReturn?.lastName,
+        firstName: shippingAddressInput?.firstName || authUserToReturn?.firstName || customer?.firstName,
+        lastName: shippingAddressInput?.lastName || authUserToReturn?.lastName || customer?.lastName,
         fullAddress
       })
       .catch((err) => console.error('Order purchase notification error:', err))
@@ -211,21 +352,26 @@ export const createOrder = async (req: Request, res: Response) => {
     res.status(201).json({
       success: true,
       message: 'Order created successfully',
-      data: order,
+      data: {
+        ...order,
+        receiptToken: effectiveReceiptToken
+      },
       token: tokenToReturn,
-      user: authUserToReturn ? {
-        id: authUserToReturn.id,
-        email: authUserToReturn.email,
-        firstName: authUserToReturn.firstName,
-        lastName: authUserToReturn.lastName,
-        role: authUserToReturn.role
-      } : undefined
+      user: authUserToReturn
+        ? {
+            id: authUserToReturn.id,
+            email: authUserToReturn.email,
+            firstName: authUserToReturn.firstName,
+            lastName: authUserToReturn.lastName,
+            role: authUserToReturn.role
+          }
+        : undefined
     })
   } catch (error) {
     console.error('Error creating order:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to finalize your order right now. Please contact support if payment was captured.'
     })
   }
 }
@@ -238,8 +384,9 @@ export const getOrders = async (req: Request, res: Response) => {
     const userId = req.user!.id
     const { status, limit = '10', page = '1' } = req.query
 
-    const limitNum = parseInt(limit as string) || 10
-    const offset = (parseInt(page as string) - 1) * limitNum
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10) || 10))
+    const pageNum = Math.max(1, parseInt(page as string, 10) || 1)
+    const offset = (pageNum - 1) * limitNum
 
     const [orders, totalOrders] = await Promise.all([
       databaseService.findOrders({
@@ -258,8 +405,8 @@ export const getOrders = async (req: Request, res: Response) => {
       success: true,
       data: orders,
       pagination: {
-        currentPage: parseInt(page as string) || 1,
-        totalPages: Math.ceil(totalOrders / limitNum),
+        currentPage: pageNum,
+        totalPages: Math.max(1, Math.ceil(totalOrders / limitNum)),
         totalOrders
       }
     })
@@ -267,7 +414,7 @@ export const getOrders = async (req: Request, res: Response) => {
     console.error('Error fetching orders:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load orders.'
     })
   }
 }
@@ -289,7 +436,7 @@ export const getOrder = async (req: Request, res: Response) => {
       })
     }
 
-    if (order.userId !== userId) {
+    if (order.userId !== userId && req.user!.role !== 'ADMIN') {
       return res.status(403).json({
         success: false,
         error: 'Not authorized to view this order'
@@ -298,13 +445,16 @@ export const getOrder = async (req: Request, res: Response) => {
 
     res.status(200).json({
       success: true,
-      data: order
+      data: {
+        ...order,
+        receiptToken: order.receiptToken || signReceiptAccessToken(order.id)
+      }
     })
   } catch (error) {
     console.error('Error fetching order:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load order details.'
     })
   }
 }
@@ -314,10 +464,6 @@ export const getOrder = async (req: Request, res: Response) => {
 // @access  Private/Admin
 export const updateOrderStatus = async (req: Request, res: Response) => {
   try {
-    const { status } = req.body
-    const orderId = req.params.id
-
-    // Check if user is admin
     if (req.user!.role !== 'ADMIN') {
       return res.status(403).json({
         success: false,
@@ -325,7 +471,16 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
       })
     }
 
-    const updatedOrder = await databaseService.updateOrderStatus(orderId, status)
+    const parsed = orderStatusUpdateSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid order status value.'
+      })
+    }
+
+    const orderId = req.params.id
+    const updatedOrder = await databaseService.updateOrderStatus(orderId, parsed.data.status)
 
     emailService
       .sendOrderStatusUpdate(updatedOrder, updatedOrder.user?.email)
@@ -338,15 +493,9 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
     })
   } catch (error) {
     console.error('Error updating order status:', error)
-    if (error instanceof Error && 'code' in error && error.code === 'P2025') {
-      return res.status(404).json({
-        success: false,
-        error: 'Order not found'
-      })
-    }
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update order status.'
     })
   }
 }
@@ -375,7 +524,6 @@ export const cancelOrder = async (req: Request, res: Response) => {
       })
     }
 
-    // Check if order can be cancelled
     if (!['PENDING', 'PROCESSING'].includes(order.status)) {
       return res.status(400).json({
         success: false,
@@ -398,7 +546,7 @@ export const cancelOrder = async (req: Request, res: Response) => {
     console.error('Error cancelling order:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to cancel order.'
     })
   }
 }
@@ -443,14 +591,14 @@ export const getOrderStats = async (req: Request, res: Response) => {
     console.error('Error fetching order statistics:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to fetch order statistics.'
     })
   }
 }
 
 // @desc    Download generated PDF receipt for an order
 // @route   GET /api/orders/:id/receipt.pdf
-// @access  Private (Customer owner or Admin)
+// @access  Private (Customer owner, Admin, or holder of signed receipt token)
 export const downloadOrderReceiptPdf = async (req: Request, res: Response) => {
   try {
     const orderId = req.params.id
@@ -463,10 +611,27 @@ export const downloadOrderReceiptPdf = async (req: Request, res: Response) => {
       })
     }
 
-    if (req.user && req.user.role !== 'ADMIN' && order.userId !== req.user.id) {
+    const isAdmin = req.user?.role === 'ADMIN'
+    const isOwner = Boolean(req.user?.id && order.userId && order.userId === req.user.id)
+    const providedToken = String(
+      (req.query.token as string) || (req.headers['x-receipt-token'] as string) || ''
+    ).trim()
+
+    let matchesStoredToken = false
+    if (providedToken && order.receiptToken) {
+      const providedBuf = Buffer.from(providedToken, 'utf8')
+      const storedBuf = Buffer.from(order.receiptToken, 'utf8')
+      matchesStoredToken =
+        providedBuf.length === storedBuf.length && crypto.timingSafeEqual(providedBuf, storedBuf)
+    }
+
+    const hasValidReceiptToken =
+      Boolean(providedToken) && (matchesStoredToken || verifyReceiptAccessToken(order.id, providedToken))
+
+    if (!isAdmin && !isOwner && !hasValidReceiptToken) {
       return res.status(403).json({
         success: false,
-        error: 'Not authorized to download this receipt'
+        error: 'Please sign in or provide a valid receipt access token to download this receipt.'
       })
     }
 
@@ -488,14 +653,14 @@ export const downloadOrderReceiptPdf = async (req: Request, res: Response) => {
 
 // @desc    Track an order by Tracking Number (TRK-...) or Order Number (DFE-...)
 // @route   GET /api/orders/track/:identifier
-// @access  Public
+// @access  Owner, Admin, or verified email/zip holder
 export const trackOrder = async (req: Request, res: Response) => {
   try {
     const rawIdentifier = (req.params.identifier || (req.query.q as string) || '').trim()
     if (!rawIdentifier) {
       return res.status(400).json({
         success: false,
-        error: 'Please enter a valid Tracking Number or Order Number'
+        error: 'Please enter a valid Tracking Number or Order Number.'
       })
     }
 
@@ -503,7 +668,35 @@ export const trackOrder = async (req: Request, res: Response) => {
     if (!order) {
       return res.status(404).json({
         success: false,
-        error: `No shipment found matching "${rawIdentifier}". Please verify your Tracking Number (e.g. TRK-DFE-...) or Order Number (e.g. DFE-...).`
+        error: 'No shipment found matching that tracking or order number. Please check your confirmation email and try again.'
+      })
+    }
+
+    const isOwnerOrAdmin =
+      req.user?.role === 'ADMIN' ||
+      Boolean(req.user?.id && order.userId && order.userId === req.user.id)
+
+    const queryEmail = String(req.query.email || '').trim().toLowerCase()
+    const queryZip = String(req.query.zip || '').trim().toLowerCase()
+    const guestMeta = extractGuestMetadataFromNotes(order.notes)
+
+    const knownEmails = [
+      ...(order.user?.email ? [order.user.email.toLowerCase()] : []),
+      ...guestMeta.emails
+    ]
+    const knownZips = [
+      ...(order.shippingAddress?.zipCode ? [order.shippingAddress.zipCode.toLowerCase()] : []),
+      ...guestMeta.zips
+    ]
+
+    const matchesEmail = Boolean(queryEmail && knownEmails.includes(queryEmail))
+    const matchesZip = Boolean(queryZip && knownZips.includes(queryZip))
+
+    if (!isOwnerOrAdmin && !matchesEmail && !matchesZip) {
+      return res.status(403).json({
+        success: false,
+        requiresVerification: true,
+        error: 'Please enter the order email address or delivery postal code to view full shipment details.'
       })
     }
 
@@ -515,7 +708,7 @@ export const trackOrder = async (req: Request, res: Response) => {
 
     const addr = order.shippingAddress
     const destinationSummary = addr
-      ? `${addr.city || ''}${addr.state ? `, ${addr.state}` : ''} ${addr.zipCode || ''}, ${addr.country || 'United States'}`.replace(/^,\s*/, '').trim()
+      ? `${addr.city || ''}${addr.state ? `, ${addr.state}` : ''} ${addr.zipCode || ''}, ${addr.country || ''}`.replace(/^,\s*/, '').trim()
       : 'Customer Delivery Address on File'
 
     const statusOrder = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED']
@@ -527,8 +720,8 @@ export const trackOrder = async (req: Request, res: Response) => {
         step: 1,
         key: 'ORDER_CONFIRMED',
         title: 'Order Confirmed & Payment Verified',
-        location: 'Austin, Texas HQ / Payment Gateway',
-        description: `Order #${order.orderNumber} logged and assigned Tracking #${order.trackingNumber}.`,
+        location: 'DriveFlyElectric Order Desk',
+        description: `Order #${order.orderNumber} verified and assigned Tracking #${order.trackingNumber}.`,
         completed: !isCancelledOrRefunded && currentIdx >= 0,
         active: !isCancelledOrRefunded && currentIdx === 0,
         timestamp: new Date(createdMs).toISOString()
@@ -536,9 +729,9 @@ export const trackOrder = async (req: Request, res: Response) => {
       {
         step: 2,
         key: 'WAREHOUSE_QC',
-        title: 'Chassis QC Inspection & Steel Crating',
-        location: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
-        description: 'Engineering quality control, battery/powertrain diagnostics, and reinforced export crate sealing.',
+        title: 'Quality Control & Protective Crating',
+        location: 'DriveFlyElectric Fulfillment & QC Hub',
+        description: 'Engineering inspection, battery & powertrain diagnostics, and reinforced export packaging.',
         completed: !isCancelledOrRefunded && currentIdx >= 1,
         active: !isCancelledOrRefunded && currentIdx === 1,
         timestamp: new Date(createdMs + 2 * 60 * 60 * 1000).toISOString()
@@ -547,8 +740,8 @@ export const trackOrder = async (req: Request, res: Response) => {
         step: 3,
         key: 'INTERNATIONAL_TRANSIT',
         title: 'International Express Freight & Customs Clearance',
-        location: 'Global Air/Sea Express Logistics Corridor',
-        description: 'Dispatched with priority customs documentation and live freight telemetry.',
+        location: 'Global Air & Sea Freight Network',
+        description: 'Dispatched with priority customs documentation and live freight monitoring.',
         completed: !isCancelledOrRefunded && currentIdx >= 2,
         active: !isCancelledOrRefunded && currentIdx === 2,
         timestamp: currentIdx >= 2 ? new Date(updatedMs).toISOString() : null
@@ -558,7 +751,7 @@ export const trackOrder = async (req: Request, res: Response) => {
         key: 'FINAL_DELIVERY',
         title: 'Delivered to Destination',
         location: destinationSummary,
-        description: 'Signed and delivered directly to recipient doorstep.',
+        description: 'Delivered directly to the recipient address.',
         completed: !isCancelledOrRefunded && currentIdx >= 3,
         active: !isCancelledOrRefunded && currentIdx === 3,
         timestamp: currentIdx >= 3 ? new Date(updatedMs).toISOString() : null
@@ -579,12 +772,12 @@ export const trackOrder = async (req: Request, res: Response) => {
         tax: order.tax,
         shipping: order.shipping,
         carrier: 'DriveFlyExpress Global Freight',
-        dispatchWarehouse: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
+        dispatchWarehouse: 'DriveFlyElectric International Fulfillment Center',
         destination: destinationSummary,
         estimatedDelivery,
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
-        items: (order.items || []).map(item => ({
+        items: (order.items || []).map((item) => ({
           id: item.id,
           productId: item.productId,
           name: item.product?.name || 'DriveFlyElectric Performance Vehicle',
@@ -601,7 +794,7 @@ export const trackOrder = async (req: Request, res: Response) => {
     console.error('Error tracking order:', error)
     return res.status(500).json({
       success: false,
-      error: 'Unable to retrieve tracking status right now'
+      error: 'Unable to retrieve tracking status right now.'
     })
   }
 }

@@ -3,14 +3,14 @@
 -- Production-Ready Schema with Full RLS & USD Store Catalog
 -- Official Domain: https://driveflyelectric.shop
 -- =====================================================
--- Safe to execute directly in the Supabase SQL Editor.
+-- Safe to execute directly in the Supabase SQL Editor (fresh or existing DB).
 
 -- Enable cryptographic extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- =====================================================
--- 1. PRODUCTION TABLES CREATION
+-- 1. PRODUCTION TABLES CREATION (Topologically ordered)
 -- =====================================================
 
 -- Users Table
@@ -41,11 +41,13 @@ CREATE TABLE IF NOT EXISTS public.products (
     brand TEXT,
     is_active BOOLEAN DEFAULT true,
     is_new BOOLEAN DEFAULT false,
+    is_coming_soon BOOLEAN DEFAULT false,
+    coming_soon_release TEXT,
     shipping_required BOOLEAN DEFAULT true,
-    average_delivery_time TEXT DEFAULT '2-4 business days',
+    average_delivery_time TEXT DEFAULT '12-20 business days',
     weight DECIMAL(8,2),
     dimensions TEXT,
-    rating DECIMAL(3,2) DEFAULT 4.90,
+    rating DECIMAL(3,2) DEFAULT 0,
     reviews INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -98,10 +100,10 @@ CREATE TABLE IF NOT EXISTS public.addresses (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Orders Table
+-- Orders Table (user_id nullable for verified guest checkouts)
 CREATE TABLE IF NOT EXISTS public.orders (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-    user_id TEXT REFERENCES public.users(id) ON DELETE CASCADE,
+    user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
     order_number TEXT UNIQUE NOT NULL,
     tracking_number TEXT UNIQUE,
     status TEXT CHECK (status IN ('PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED')) DEFAULT 'PENDING',
@@ -112,7 +114,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
     discount DECIMAL(10,2) DEFAULT 0,
     payment_method TEXT CHECK (payment_method IN ('STRIPE', 'PAYPAL')) NOT NULL,
     payment_status TEXT CHECK (payment_status IN ('PENDING', 'COMPLETED', 'FAILED', 'REFUNDED')) DEFAULT 'PENDING',
+    payment_verified BOOLEAN DEFAULT false,
     payment_id TEXT,
+    receipt_token TEXT,
     shipping_address_id TEXT REFERENCES public.addresses(id),
     billing_address_id TEXT REFERENCES public.addresses(id),
     notes TEXT,
@@ -142,6 +146,23 @@ CREATE TABLE IF NOT EXISTS public.product_reviews (
     comment TEXT NOT NULL,
     images TEXT[] DEFAULT '{}',
     verified_purchase BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Product Pre-Bookings Table ("Book Now" for Coming Soon Vehicles)
+CREATE TABLE IF NOT EXISTS public.product_bookings (
+    id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    product_id TEXT REFERENCES public.products(id) ON DELETE CASCADE NOT NULL,
+    user_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT,
+    country TEXT DEFAULT 'United States',
+    quantity INTEGER CHECK (quantity >= 1 AND quantity <= 50) DEFAULT 1,
+    notes TEXT,
+    status TEXT CHECK (status IN ('PENDING', 'CONFIRMED', 'NOTIFIED', 'CANCELLED')) DEFAULT 'PENDING',
+    booking_reference TEXT UNIQUE NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -191,27 +212,245 @@ CREATE TABLE IF NOT EXISTS public.support_messages (
 );
 
 -- =====================================================
--- 2. ENSURE MISSING COLUMNS (Idempotent updates)
+-- 2. ENSURE MISSING COLUMNS & LEGACY RENAMES ACROSS ALL TABLES
 -- =====================================================
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'original_price') THEN
-        ALTER TABLE public.products ADD COLUMN original_price DECIMAL(10,2);
+    -- [users]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'firstName')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'first_name') THEN
+        ALTER TABLE public.users RENAME COLUMN "firstName" TO first_name;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'lastName')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'last_name') THEN
+        ALTER TABLE public.users RENAME COLUMN "lastName" TO last_name;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'isActive')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'is_active') THEN
+        ALTER TABLE public.users RENAME COLUMN "isActive" TO is_active;
+    END IF;
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS first_name TEXT;
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_name TEXT;
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS phone TEXT;
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'CUSTOMER';
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true;
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [products]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'originalPrice')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'original_price') THEN
+        ALTER TABLE public.products RENAME COLUMN "originalPrice" TO original_price;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'isComingSoon')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'is_coming_soon') THEN
+        ALTER TABLE public.products RENAME COLUMN "isComingSoon" TO is_coming_soon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'comingSoonRelease')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'coming_soon_release') THEN
+        ALTER TABLE public.products RENAME COLUMN "comingSoonRelease" TO coming_soon_release;
+    END IF;
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS original_price DECIMAL(10,2);
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS rating DECIMAL(3,2) DEFAULT 0;
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS reviews INTEGER DEFAULT 0;
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS is_coming_soon BOOLEAN DEFAULT false;
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS coming_soon_release TEXT;
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS average_delivery_time TEXT DEFAULT '12-20 business days';
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.products ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [product_variants]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_variants' AND column_name = 'productId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_variants' AND column_name = 'product_id') THEN
+        ALTER TABLE public.product_variants RENAME COLUMN "productId" TO product_id;
+    END IF;
+    ALTER TABLE public.product_variants ADD COLUMN IF NOT EXISTS product_id TEXT;
+
+    -- [carts]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'carts' AND column_name = 'userId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'carts' AND column_name = 'user_id') THEN
+        ALTER TABLE public.carts RENAME COLUMN "userId" TO user_id;
+    END IF;
+    ALTER TABLE public.carts ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE public.carts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.carts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [cart_items]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'cart_items' AND column_name = 'cartId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'cart_items' AND column_name = 'cart_id') THEN
+        ALTER TABLE public.cart_items RENAME COLUMN "cartId" TO cart_id;
+    END IF;
+    ALTER TABLE public.cart_items ADD COLUMN IF NOT EXISTS cart_id TEXT;
+    ALTER TABLE public.cart_items ADD COLUMN IF NOT EXISTS product_id TEXT;
+
+    -- [addresses]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'addresses' AND column_name = 'userId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'addresses' AND column_name = 'user_id') THEN
+        ALTER TABLE public.addresses RENAME COLUMN "userId" TO user_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'addresses' AND column_name = 'postal_code')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'addresses' AND column_name = 'zip_code') THEN
+        ALTER TABLE public.addresses RENAME COLUMN postal_code TO zip_code;
+    END IF;
+    ALTER TABLE public.addresses ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE public.addresses ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'United States';
+    ALTER TABLE public.addresses ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT false;
+    ALTER TABLE public.addresses ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.addresses ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [orders]
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'user_id' AND is_nullable = 'NO'
+    ) THEN
+        ALTER TABLE public.orders ALTER COLUMN user_id DROP NOT NULL;
+    END IF;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS tracking_number TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_verified BOOLEAN DEFAULT false;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_id TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS receipt_token TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS shipping_address_id TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS billing_address_id TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public' AND table_name = 'orders' AND constraint_name = 'orders_shipping_address_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.orders
+                ADD CONSTRAINT orders_shipping_address_id_fkey
+                FOREIGN KEY (shipping_address_id) REFERENCES public.addresses(id) NOT VALID;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Skipped orders_shipping_address_id_fkey: %', SQLERRM;
+        END;
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'rating') THEN
-        ALTER TABLE public.products ADD COLUMN rating DECIMAL(3,2) DEFAULT 4.90;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = 'public' AND table_name = 'orders' AND constraint_name = 'orders_billing_address_id_fkey'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.orders
+                ADD CONSTRAINT orders_billing_address_id_fkey
+                FOREIGN KEY (billing_address_id) REFERENCES public.addresses(id) NOT VALID;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Skipped orders_billing_address_id_fkey: %', SQLERRM;
+        END;
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'products' AND column_name = 'reviews') THEN
-        ALTER TABLE public.products ADD COLUMN reviews INTEGER DEFAULT 0;
+    -- [order_items]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_items' AND column_name = 'orderId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'order_items' AND column_name = 'order_id') THEN
+        ALTER TABLE public.order_items RENAME COLUMN "orderId" TO order_id;
     END IF;
+    ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS order_id TEXT;
+    ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS product_id TEXT;
 
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'orders' AND column_name = 'tracking_number') THEN
-        ALTER TABLE public.orders ADD COLUMN tracking_number TEXT;
+    -- [product_reviews]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_reviews' AND column_name = 'productId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_reviews' AND column_name = 'product_id') THEN
+        ALTER TABLE public.product_reviews RENAME COLUMN "productId" TO product_id;
+    END IF;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS product_id TEXT;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS reviewer_name TEXT DEFAULT 'Verified Customer';
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS reviewer_email TEXT;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS rating INTEGER DEFAULT 5;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS title TEXT;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS comment TEXT;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS images TEXT[] DEFAULT '{}';
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS verified_purchase BOOLEAN DEFAULT true;
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.product_reviews ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [product_bookings]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_bookings' AND column_name = 'productId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'product_bookings' AND column_name = 'product_id') THEN
+        ALTER TABLE public.product_bookings RENAME COLUMN "productId" TO product_id;
+    END IF;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS product_id TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS full_name TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS email TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS phone TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS country TEXT DEFAULT 'United States';
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING';
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS booking_reference TEXT;
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.product_bookings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [events]
+    ALTER TABLE public.events ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+    ALTER TABLE public.events ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'upcoming';
+    ALTER TABLE public.events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [support_sessions]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_sessions' AND column_name = 'visitorId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_sessions' AND column_name = 'visitor_id') THEN
+        ALTER TABLE public.support_sessions RENAME COLUMN "visitorId" TO visitor_id;
+    END IF;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS visitor_id TEXT;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS visitor_name TEXT DEFAULT 'Store Visitor';
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS visitor_email TEXT;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS visitor_phone TEXT;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS topic TEXT DEFAULT 'General Inquiry';
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS selected_products JSONB DEFAULT '[]'::jsonb;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'OPEN';
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS is_online BOOLEAN DEFAULT true;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS unread_admin_count INTEGER DEFAULT 0;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS unread_client_count INTEGER DEFAULT 0;
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE public.support_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- [support_messages]
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'sessionId')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'session_id') THEN
+        ALTER TABLE public.support_messages RENAME COLUMN "sessionId" TO session_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'support_session_id')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'session_id') THEN
+        ALTER TABLE public.support_messages RENAME COLUMN support_session_id TO session_id;
+    END IF;
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS session_id TEXT;
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS sender_role TEXT DEFAULT 'CLIENT';
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS sender_name TEXT DEFAULT 'Visitor';
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS content TEXT DEFAULT '';
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+    ALTER TABLE public.support_messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name = 'support_messages'
+          AND kcu.column_name = 'session_id'
+    ) THEN
+        BEGIN
+            ALTER TABLE public.support_messages
+                ADD CONSTRAINT support_messages_session_id_fkey
+                FOREIGN KEY (session_id) REFERENCES public.support_sessions(id) ON DELETE CASCADE NOT VALID;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Skipped support_messages_session_id_fkey: %', SQLERRM;
+        END;
     END IF;
 END $$;
+
+UPDATE public.support_sessions SET visitor_id = id WHERE visitor_id IS NULL;
+UPDATE public.orders SET tracking_number = 'TRK-' || order_number WHERE tracking_number IS NULL AND order_number IS NOT NULL;
+UPDATE public.orders SET payment_id = NULL WHERE payment_id = '';
 
 -- =====================================================
 -- 3. HIGH-PERFORMANCE INDEXES
@@ -222,6 +461,7 @@ CREATE INDEX IF NOT EXISTS idx_users_role ON public.users(role);
 CREATE INDEX IF NOT EXISTS idx_products_category ON public.products(category);
 CREATE INDEX IF NOT EXISTS idx_products_sku ON public.products(sku);
 CREATE INDEX IF NOT EXISTS idx_products_active ON public.products(is_active);
+CREATE INDEX IF NOT EXISTS idx_products_coming_soon ON public.products(is_coming_soon);
 CREATE INDEX IF NOT EXISTS idx_products_created_at ON public.products(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_carts_user_id ON public.carts(user_id);
 CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON public.cart_items(cart_id);
@@ -230,13 +470,20 @@ CREATE INDEX IF NOT EXISTS idx_addresses_type ON public.addresses(type);
 CREATE INDEX IF NOT EXISTS idx_orders_user_id ON public.orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_tracking_number ON public.orders(tracking_number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_id_unique ON public.orders(payment_id) WHERE payment_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON public.orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON public.order_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_product_reviews_product_id ON public.product_reviews(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_reviews_created_at ON public.product_reviews(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_product_bookings_product_id ON public.product_bookings(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_bookings_email ON public.product_bookings(email);
+CREATE INDEX IF NOT EXISTS idx_product_bookings_created_at ON public.product_bookings(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_category ON public.events(category);
+CREATE INDEX IF NOT EXISTS idx_events_updated_at ON public.events(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_support_sessions_visitor_id ON public.support_sessions(visitor_id);
 CREATE INDEX IF NOT EXISTS idx_support_sessions_updated_at ON public.support_sessions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_support_messages_session_id ON public.support_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_support_messages_created_at ON public.support_messages(created_at ASC);
 
 -- =====================================================
 -- 4. ROW LEVEL SECURITY (RLS) POLICIES
@@ -251,147 +498,94 @@ ALTER TABLE public.addresses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.order_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.product_reviews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.product_bookings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.support_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.support_messages ENABLE ROW LEVEL SECURITY;
 
--- Product Reviews: Public read & submit, Admins full access
+-- Service-role only policies for PII/transactional/API-guarded tables (backend enforces JWT, RBAC & Zod validation)
 DROP POLICY IF EXISTS "Public can view product reviews" ON public.product_reviews;
-CREATE POLICY "Public can view product reviews" ON public.product_reviews
-    FOR SELECT USING (true);
-
 DROP POLICY IF EXISTS "Anyone can submit product reviews" ON public.product_reviews;
-CREATE POLICY "Anyone can submit product reviews" ON public.product_reviews
-    FOR INSERT WITH CHECK (true);
-
 DROP POLICY IF EXISTS "Admins can manage product reviews" ON public.product_reviews;
-CREATE POLICY "Admins can manage product reviews" ON public.product_reviews
-    FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Service role manages product reviews" ON public.product_reviews;
+CREATE POLICY "Service role manages product reviews" ON public.product_reviews
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Support Sessions & Messages: Service & visitors can create/read/update their sessions, Admins manage all
+DROP POLICY IF EXISTS "Service role manages product bookings" ON public.product_bookings;
+CREATE POLICY "Service role manages product bookings" ON public.product_bookings
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
+
 DROP POLICY IF EXISTS "Support sessions accessible to service and clients" ON public.support_sessions;
-CREATE POLICY "Support sessions accessible to service and clients" ON public.support_sessions
-    FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Service role manages support sessions" ON public.support_sessions;
+CREATE POLICY "Service role manages support sessions" ON public.support_sessions
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
 DROP POLICY IF EXISTS "Support messages accessible to service and clients" ON public.support_messages;
-CREATE POLICY "Support messages accessible to service and clients" ON public.support_messages
-    FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Service role manages support messages" ON public.support_messages;
+CREATE POLICY "Service role manages support messages" ON public.support_messages
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Events: Public read, Admins manage
+-- Events: Service-role manages backend events; no raw anon exposure of review/chat records
+DROP POLICY IF EXISTS "Events readable by service and admins" ON public.events;
+DROP POLICY IF EXISTS "Events insertable by system" ON public.events;
 DROP POLICY IF EXISTS "Public can view events" ON public.events;
-CREATE POLICY "Public can view events" ON public.events
-    FOR SELECT USING (true);
-
 DROP POLICY IF EXISTS "Admins can manage events" ON public.events;
-CREATE POLICY "Admins can manage events" ON public.events
-    FOR ALL USING (
-        EXISTS (
-            SELECT 1 FROM public.users
-            WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
+DROP POLICY IF EXISTS "Service role manages events" ON public.events;
+CREATE POLICY "Service role manages events" ON public.events
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Products: Public read active items, Admins manage all
+-- Products: Public read active items, Service-role/Admins manage all
 DROP POLICY IF EXISTS "Public can view active products" ON public.products;
 CREATE POLICY "Public can view active products" ON public.products
     FOR SELECT USING (is_active = true);
 
 DROP POLICY IF EXISTS "Admins can manage products" ON public.products;
 CREATE POLICY "Admins can manage products" ON public.products
-    FOR ALL USING (
-        EXISTS (
-            SELECT 1 FROM public.users
-            WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Product Variants: Public read, Admins manage
+-- Product Variants: Public read, Service-role manages
 DROP POLICY IF EXISTS "Public can view product variants" ON public.product_variants;
 CREATE POLICY "Public can view product variants" ON public.product_variants
     FOR SELECT USING (true);
 
 DROP POLICY IF EXISTS "Admins can manage product variants" ON public.product_variants;
 CREATE POLICY "Admins can manage product variants" ON public.product_variants
-    FOR ALL USING (
-        EXISTS (
-            SELECT 1 FROM public.users
-            WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Users: Users can read/update their own profile, Admins full access
+-- Users, Carts, Addresses, Orders & Order Items: Service-role guarded via Express JWT & ownership checks
 DROP POLICY IF EXISTS "Users can view their own profile" ON public.users;
-CREATE POLICY "Users can view their own profile" ON public.users
-    FOR SELECT USING (
-        auth.uid()::text = id OR EXISTS (
-            SELECT 1 FROM public.users WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
-
 DROP POLICY IF EXISTS "Users can update their own profile" ON public.users;
-CREATE POLICY "Users can update their own profile" ON public.users
-    FOR UPDATE USING (
-        auth.uid()::text = id OR EXISTS (
-            SELECT 1 FROM public.users WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
-
 DROP POLICY IF EXISTS "Users can insert their own profile" ON public.users;
-CREATE POLICY "Users can insert their own profile" ON public.users
-    FOR INSERT WITH CHECK (true);
+DROP POLICY IF EXISTS "Service role manages users" ON public.users;
+CREATE POLICY "Service role manages users" ON public.users
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Carts: Users manage their own cart
 DROP POLICY IF EXISTS "Users can manage their own cart" ON public.carts;
-CREATE POLICY "Users can manage their own cart" ON public.carts
-    FOR ALL USING (auth.uid()::text = user_id);
+DROP POLICY IF EXISTS "Service role manages carts" ON public.carts;
+CREATE POLICY "Service role manages carts" ON public.carts
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Cart Items: Users manage their own cart items
 DROP POLICY IF EXISTS "Users can manage their own cart items" ON public.cart_items;
-CREATE POLICY "Users can manage their own cart items" ON public.cart_items
-    FOR ALL USING (
-        EXISTS (
-            SELECT 1 FROM public.carts
-            WHERE id = cart_id AND user_id = auth.uid()::text
-        )
-    );
+DROP POLICY IF EXISTS "Service role manages cart items" ON public.cart_items;
+CREATE POLICY "Service role manages cart items" ON public.cart_items
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Addresses: Users manage their own addresses
 DROP POLICY IF EXISTS "Users can manage their own addresses" ON public.addresses;
-CREATE POLICY "Users can manage their own addresses" ON public.addresses
-    FOR ALL USING (auth.uid()::text = user_id);
+DROP POLICY IF EXISTS "Service role manages addresses" ON public.addresses;
+CREATE POLICY "Service role manages addresses" ON public.addresses
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Orders: Users view/create their orders, Admins manage all
 DROP POLICY IF EXISTS "Users can view their own orders" ON public.orders;
-CREATE POLICY "Users can view their own orders" ON public.orders
-    FOR SELECT USING (
-        auth.uid()::text = user_id OR EXISTS (
-            SELECT 1 FROM public.users WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
-
 DROP POLICY IF EXISTS "Users can create their own orders" ON public.orders;
-CREATE POLICY "Users can create their own orders" ON public.orders
-    FOR INSERT WITH CHECK (auth.uid()::text = user_id);
-
 DROP POLICY IF EXISTS "Admins can manage all orders" ON public.orders;
-CREATE POLICY "Admins can manage all orders" ON public.orders
-    FOR ALL USING (
-        EXISTS (
-            SELECT 1 FROM public.users WHERE id = auth.uid()::text AND role = 'ADMIN'
-        )
-    );
+DROP POLICY IF EXISTS "Service role manages orders" ON public.orders;
+CREATE POLICY "Service role manages orders" ON public.orders
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
--- Order Items
 DROP POLICY IF EXISTS "Users can view their own order items" ON public.order_items;
-CREATE POLICY "Users can view their own order items" ON public.order_items
-    FOR SELECT USING (
-        EXISTS (
-            SELECT 1 FROM public.orders
-            WHERE id = order_id AND (user_id = auth.uid()::text OR EXISTS (
-                SELECT 1 FROM public.users WHERE id = auth.uid()::text AND role = 'ADMIN'
-            ))
-        )
-    );
+DROP POLICY IF EXISTS "Service role manages order items" ON public.order_items;
+CREATE POLICY "Service role manages order items" ON public.order_items
+    FOR ALL USING (auth.role() = 'service_role') WITH CHECK (auth.role() = 'service_role');
 
 -- =====================================================
 -- 5. AUTOMATED TIMESTAMP & TRIGGER FUNCTIONS
@@ -425,34 +619,48 @@ DROP TRIGGER IF EXISTS update_orders_updated_at ON public.orders;
 CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON public.orders
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_product_reviews_updated_at ON public.product_reviews;
+CREATE TRIGGER update_product_reviews_updated_at BEFORE UPDATE ON public.product_reviews
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_product_bookings_updated_at ON public.product_bookings;
+CREATE TRIGGER update_product_bookings_updated_at BEFORE UPDATE ON public.product_bookings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_events_updated_at ON public.events;
+CREATE TRIGGER update_events_updated_at BEFORE UPDATE ON public.events
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_support_sessions_updated_at ON public.support_sessions;
+CREATE TRIGGER update_support_sessions_updated_at BEFORE UPDATE ON public.support_sessions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- =====================================================
 -- 6. PRODUCTION SEED DATA (DRIVEFLYELECTRIC USD CATALOG)
 -- =====================================================
 
--- Admin User (configured via .env / create-admin.js)
-INSERT INTO public.users (id, email, password, first_name, last_name, role, is_active)
-VALUES (
-    'admin_driveflyelectric_001',
-    'jame@eurotopagent.eurotopmobility.shop',
-    '$2a$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi',
-    'DriveFlyElectric',
-    'Admin',
-    'ADMIN',
-    true
-)
-ON CONFLICT (email) DO UPDATE SET
-    role = 'ADMIN',
-    is_active = true,
-    updated_at = NOW();
+-- Admin User should be provisioned securely via `.env` and `npm run admin:create` (never hardcoded SQL hashes).
 
 -- Remove any legacy mock/Unsplash placeholder products
 DELETE FROM public.products
 WHERE id IN ('prod_001', 'prod_002', 'prod_003', 'prod_004', 'prod_005', 'prod_006')
-   OR array_to_string(images, ',') LIKE '%unsplash.com%';
+   OR brand = 'Trendstore'
+   OR array_to_string(images, ',') ILIKE '%unsplash.com%';
+
+-- Clean any legacy warehouse strings on existing records
+UPDATE public.products
+SET average_delivery_time = REGEXP_REPLACE(
+        average_delivery_time,
+        '\s*\([^)]*(Shenzhen|China Warehouse)[^)]*\)',
+        ' (Global Express Crated Freight)',
+        'gi'
+    ),
+    updated_at = NOW()
+WHERE average_delivery_time ~* '(Shenzhen|China Warehouse)';
 
 -- Curated USD DriveFlyElectric Fleet: MiniHeliCopters, Microcars, Go Karts, Trikes & Dirtbikes
 INSERT INTO public.products (
-    id, name, description, price, original_price, sku, stock, category, brand, images, is_active, is_new, rating, reviews, shipping_required, average_delivery_time, weight, dimensions
+    id, name, description, price, original_price, sku, stock, category, brand, images, is_active, is_new, is_coming_soon, coming_soon_release, rating, reviews, shipping_required, average_delivery_time, weight, dimensions
 )
 VALUES
     (
@@ -468,10 +676,12 @@ VALUES
         ARRAY['/images/MicroHelicpter.jpeg'],
         true,
         true,
-        4.98,
-        42,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '14-21 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '14-21 business days (Global Express Crated Freight)',
         115.0,
         '420x165x215 cm'
     ),
@@ -488,10 +698,12 @@ VALUES
         ARRAY['/images/MicroHelicpter.jpeg'],
         true,
         true,
-        4.99,
-        29,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '14-21 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '14-21 business days (Global Express Crated Freight)',
         132.0,
         '445x175x225 cm'
     ),
@@ -508,10 +720,12 @@ VALUES
         ARRAY['/images/MicroCCar.jpg', '/images/mercedes1100.mp4'],
         true,
         true,
-        4.95,
-        68,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         320.0,
         '225x118x152 cm'
     ),
@@ -528,10 +742,12 @@ VALUES
         ARRAY['/images/jw1501-200cc-adult-mini-jeep-willys.webp'],
         true,
         true,
-        4.94,
-        54,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         210.0,
         '210x110x120 cm'
     ),
@@ -548,10 +764,12 @@ VALUES
         ARRAY['/images/GC2009 Off-Road Go Kart - $1200.webp', '/images/GC2009 Off-Road Go Kart 2 - $1200.webp'],
         true,
         true,
-        4.96,
-        77,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         185.0,
         '215x135x140 cm'
     ),
@@ -568,10 +786,12 @@ VALUES
         ARRAY['/images/200cc 4-Seater Off-Road Go Kart 1 - $550.webp', '/images/200cc 4-Seater Off-Road Go Kart 3 - $550.webp.webp'],
         true,
         false,
-        4.92,
-        61,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         230.0,
         '260x140x148 cm'
     ),
@@ -588,10 +808,12 @@ VALUES
         ARRAY['/images/3000w-electric-drift-trike.webp', '/images/mm1.webp', '/images/mm2.webp'],
         true,
         true,
-        4.95,
-        89,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         38.5,
         '140x95x65 cm'
     ),
@@ -608,10 +830,12 @@ VALUES
         ARRAY['/images/6000w-electric-dirt-bike.webp', '/images/b5 - $280.webp'],
         true,
         true,
-        4.93,
-        72,
+        false,
+        NULL,
+        0.00,
+        0,
         true,
-        '12-20 business days (Nanshan, Shenzhen, Guangdong Province, China Warehouse)',
+        '12-20 business days (Global Express Crated Freight)',
         58.0,
         '185x78x105 cm'
     )
@@ -624,21 +848,25 @@ ON CONFLICT (sku) DO UPDATE SET
     category = EXCLUDED.category,
     brand = EXCLUDED.brand,
     images = EXCLUDED.images,
+    average_delivery_time = EXCLUDED.average_delivery_time,
     is_active = true,
     updated_at = NOW();
 
 -- =====================================================
--- 7. PERMISSIONS & CONFIRMATION
+-- 7. PERMISSIONS, POSTGREST RELOAD & CONFIRMATION
 -- =====================================================
 
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM anon, authenticated;
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
-GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+GRANT SELECT ON public.products, public.product_variants TO anon, authenticated;
+
+NOTIFY pgrst, 'reload schema';
 
 DO $$
 BEGIN
-    RAISE NOTICE 'DriveFlyElectric USD database configuration applied successfully!';
-    RAISE NOTICE 'Tables active: users, products, product_variants, carts, cart_items, addresses, orders, order_items, events';
-    RAISE NOTICE 'Categories active: mini-helicopter, Microcars, Go karts, trikes, Dirtbikes';
+    RAISE NOTICE 'DriveFlyElectric hardened USD database configuration applied successfully!';
+    RAISE NOTICE 'Tables active: users, products, product_variants, carts, cart_items, addresses, orders, order_items, product_reviews, product_bookings, events, support_sessions, support_messages';
+    RAISE NOTICE 'Categories active: mini-helicopter, Microcars, Go karts, trikes, Dirtbikes (+ is_coming_soon pre-booking)';
     RAISE NOTICE 'Store Currency: USD ($)';
 END $$;

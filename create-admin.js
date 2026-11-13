@@ -28,10 +28,15 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 })
 
 async function createOrUpdateAdmin() {
-    const adminEmail = process.env.ADMIN_EMAIL || 'admin@driveflyelectric.shop'
-    const adminPassword = process.env.ADMIN_PASSWORD || 'admin123456'
+    const adminEmail = (process.env.ADMIN_EMAIL || '').trim()
+    const adminPassword = (process.env.ADMIN_PASSWORD || '').trim()
     const adminFirstName = process.env.ADMIN_FIRST_NAME || 'DriveFlyElectric'
     const adminLastName = process.env.ADMIN_LAST_NAME || 'Admin'
+
+    if (!adminEmail || !adminPassword || adminPassword.length < 12) {
+        console.error('❌ ADMIN_EMAIL and a strong ADMIN_PASSWORD (minimum 12 characters) must be set in .env')
+        process.exit(1)
+    }
 
     console.log(`🔐 Configuring DriveFlyElectric administrator account for: ${adminEmail}`)
 

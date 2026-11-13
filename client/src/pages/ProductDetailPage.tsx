@@ -18,11 +18,16 @@ import {
   Upload,
   CheckCircle2,
   MessageSquare,
-  ZoomIn
+  ZoomIn,
+  CalendarClock,
+  Sparkles
 } from 'lucide-react'
 import { useProducts } from '../contexts/ProductContext'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
+import { ShareProductButton } from '../components/ShareProductButton'
+import { BookComingSoonModal } from '../components/BookComingSoonModal'
+import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
 // Safe URL encoder for filenames with spaces or special characters
 const getSafeMediaUrl = (url?: string) => {
@@ -63,6 +68,7 @@ export const ProductDetailPage = () => {
   const [quantity, setQuantity] = useState(1)
   const [isSaved, setIsSaved] = useState(false)
   const [addedNotice, setAddedNotice] = useState(false)
+  const [isBookingModalOpen, setIsBookingModalOpen] = useState(false)
 
   // Media Lightbox Modal state
   const [isLightboxOpen, setIsLightboxOpen] = useState(false)
@@ -125,7 +131,7 @@ export const ProductDetailPage = () => {
       : `Buy ${currentProduct.name} (${currentProduct.sku}) at DriveFlyElectric with free express shipping.`
     const rawPrimaryImage = currentProduct.images && currentProduct.images.length > 0 ? currentProduct.images[0] : '/images/hero1.jpeg'
     const fullImageUrl = rawPrimaryImage.startsWith('http') ? rawPrimaryImage : `${origin}${getSafeMediaUrl(rawPrimaryImage)}`
-    const canonicalUrl = `${origin}/products/${currentProduct.id}`
+    const canonicalUrl = `${origin}/product/${currentProduct.id}`
 
     document.title = pageTitle
 
@@ -156,7 +162,8 @@ export const ProductDetailPage = () => {
       document.head.appendChild(scriptEl)
     }
 
-    const productSchema = {
+    const reviewCountVal = Math.max(0, Number(currentProduct.reviews || 0))
+    const productSchema: Record<string, any> = {
       '@context': 'https://schema.org',
       '@type': 'Product',
       name: currentProduct.name,
@@ -170,22 +177,28 @@ export const ProductDetailPage = () => {
         '@type': 'Brand',
         name: currentProduct.brand || 'DriveFlyElectric'
       },
-      aggregateRating: {
-        '@type': 'AggregateRating',
-        ratingValue: String(currentProduct.rating || 4.9),
-        reviewCount: String(Math.max(currentProduct.reviews || 0, 5))
-      },
       offers: {
         '@type': 'Offer',
         url: canonicalUrl,
         priceCurrency: 'USD',
         price: Number(currentProduct.price || 0).toFixed(2),
-        availability: currentProduct.stock > 0 ? 'https://schema.org/InStock' : 'https://schema.org/OutOfStock',
+        availability: currentProduct.isComingSoon
+          ? 'https://schema.org/PreOrder'
+          : currentProduct.stock > 0
+          ? 'https://schema.org/InStock'
+          : 'https://schema.org/OutOfStock',
         itemCondition: 'https://schema.org/NewCondition',
         seller: {
           '@type': 'Organization',
           name: 'DriveFlyElectric'
         }
+      }
+    }
+    if (reviewCountVal > 0 && Number(currentProduct.rating || 0) > 0) {
+      productSchema.aggregateRating = {
+        '@type': 'AggregateRating',
+        ratingValue: String(currentProduct.rating),
+        reviewCount: String(reviewCountVal)
       }
     }
 
@@ -246,6 +259,8 @@ export const ProductDetailPage = () => {
 
   const handleDownloadSpecs = () => {
     if (!currentProduct) return
+    const supportPhone = formatSupportPhone()
+    const whatsAppDigits = getSupportWhatsAppDigits()
     const specSheet = `DRIVEFLYELECTRIC — OFFICIAL SPECIFICATION SHEET
 ======================================================
 Product: ${currentProduct.name}
@@ -254,7 +269,7 @@ SKU: ${currentProduct.sku}
 Price: $${currentProduct.price}
 Selected Color: ${selectedVariant}
 Warranty: 1 Year Manufacturer Warranty Included
-Dispatch: Nanshan, Shenzhen, Guangdong Province, China Warehouse (Fast Delivery 21 -35 Days)
+Dispatch: Austin, Texas HQ • Worldwide Express Fulfillment
 
 OVERVIEW:
 ${currentProduct.description || 'Precision engineered electric ride & aircraft built for performance, reliability, and extreme adventure.'}
@@ -269,7 +284,7 @@ KEY TECHNICAL SPECIFICATIONS:
 
 Official Website: https://driveflyelectric.shop
 Customer Support: info-eurotopmobility@driveflyelectric.shop
-WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
+WhatsApp Support: ${supportPhone} (https://wa.me/${whatsAppDigits})
 ======================================================`
     const blob = new Blob([specSheet], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -472,9 +487,15 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
           <div className="lg:col-span-6 space-y-6">
 
             {/* Tagline with vertical accent bar */}
-            <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold text-gray-700 dark:text-gray-300">
+            <div className="flex items-center gap-2.5 text-xs sm:text-sm font-bold text-gray-700 dark:text-gray-300 flex-wrap">
               <span className="w-1 h-5 bg-creamy-500 dark:bg-creamy-400 rounded-full inline-block flex-shrink-0"></span>
               <span className="font-semibold">{getProductTagline()}</span>
+              {currentProduct.isComingSoon && (
+                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-400 text-black text-[10px] font-black uppercase tracking-widest">
+                  <Sparkles className="w-3 h-3" />
+                  <span>Coming Soon {currentProduct.comingSoonRelease ? `• ${currentProduct.comingSoonRelease}` : ''}</span>
+                </span>
+              )}
             </div>
 
             {/* Product Title */}
@@ -490,11 +511,11 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
             {/* Rating Stars */}
             {(() => {
               const allReviews = getReviewsForProduct(currentProduct)
+              const reviewCount = Math.max(currentProduct.reviews || 0, allReviews.length)
               const avgRating =
                 allReviews.length > 0
-                  ? allReviews.reduce((sum, r) => sum + (Number(r.rating) || 5), 0) / allReviews.length
-                  : currentProduct.rating || 4.9
-              const reviewCount = Math.max(currentProduct.reviews || 0, allReviews.length)
+                  ? allReviews.reduce((sum, r) => sum + (Number(r.rating) || 0), 0) / allReviews.length
+                  : Number(currentProduct.rating || 0)
 
               return (
                 <a
@@ -506,10 +527,10 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                   className="inline-flex items-center gap-2.5 group"
                 >
                   <div className="flex items-center gap-0.5">
-                    {renderStars(avgRating)}
+                    {renderStars(avgRating > 0 ? avgRating : 0)}
                   </div>
                   <span className="text-xs font-bold text-gray-600 dark:text-gray-400 group-hover:text-creamy-500 transition-colors">
-                    {avgRating.toFixed(1)} ({reviewCount} verified reviews)
+                    {reviewCount > 0 ? `${avgRating.toFixed(1)} (${reviewCount} verified reviews)` : 'Be the first to review'}
                   </span>
                 </a>
               )
@@ -562,63 +583,82 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
               </div>
             </div>
 
-            {/* Quantity Selector */}
-            <div className="flex items-center gap-4 pt-1">
-              <span className="text-xs font-extrabold uppercase tracking-wider text-gray-600 dark:text-gray-400">
-                Quantity:
-              </span>
-              <div className="flex items-center border border-gray-300 dark:border-white/15 rounded-xl overflow-hidden bg-white dark:bg-[#16181e]">
-                <button
-                  onClick={() => setQuantity(Math.max(1, quantity - 1))}
-                  className="px-3 py-1.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-800 font-bold transition-colors"
-                >
-                  -
-                </button>
-                <span className="px-4 py-1.5 text-xs font-black min-w-[2.5rem] text-center">
-                  {quantity}
+            {/* Quantity Selector (hidden for Coming Soon pre-book items) */}
+            {!currentProduct.isComingSoon && (
+              <div className="flex items-center gap-4 pt-1">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-gray-600 dark:text-gray-400">
+                  Quantity:
                 </span>
-                <button
-                  onClick={() => setQuantity(quantity + 1)}
-                  className="px-3 py-1.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-800 font-bold transition-colors"
-                >
-                  +
-                </button>
+                <div className="flex items-center border border-gray-300 dark:border-white/15 rounded-xl overflow-hidden bg-white dark:bg-[#16181e]">
+                  <button
+                    onClick={() => setQuantity(Math.max(1, quantity - 1))}
+                    className="px-3 py-1.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-800 font-bold transition-colors"
+                  >
+                    -
+                  </button>
+                  <span className="px-4 py-1.5 text-xs font-black min-w-[2.5rem] text-center">
+                    {quantity}
+                  </span>
+                  <button
+                    onClick={() => setQuantity(quantity + 1)}
+                    className="px-3 py-1.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-800 font-bold transition-colors"
+                  >
+                    +
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
 
-            {/* Action Buttons Row matching reference screenshot: BUY NOW, ADD TO CART, SAVE */}
-            <div className="flex flex-col sm:flex-row items-stretch gap-3 pt-2">
-              {/* BUY NOW (Creamy green filled) */}
-              <button
-                onClick={handleBuyNow}
-                disabled={currentProduct.stock <= 0}
-                className="flex-1 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
-              >
-                <span>Buy Now</span>
-              </button>
+            {/* Action Buttons Row: BOOK NOW (for Coming Soon) OR BUY NOW + ADD TO CART, plus SAVE & SHARE */}
+            <div className="flex flex-col sm:flex-row sm:flex-wrap items-stretch gap-3 pt-2">
+              {currentProduct.isComingSoon ? (
+                <button
+                  onClick={() => setIsBookingModalOpen(true)}
+                  className="flex-1 min-w-[200px] bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-lg shadow-creamy-500/20 transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
+                >
+                  <CalendarClock className="w-4 h-4" />
+                  <span>Book Now — Reserve Priority Slot</span>
+                </button>
+              ) : (
+                <>
+                  {/* BUY NOW (Creamy green filled) */}
+                  <button
+                    onClick={handleBuyNow}
+                    disabled={currentProduct.stock <= 0}
+                    className="flex-1 min-w-[140px] bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
+                  >
+                    <span>Buy Now</span>
+                  </button>
 
-              {/* ADD TO CART (Dark bordered button) */}
-              <button
-                onClick={handleAddToCart}
-                disabled={currentProduct.stock <= 0}
-                className="flex-1 bg-white hover:bg-gray-100 dark:bg-[#16181e] dark:hover:bg-[#1f222a] border border-gray-300 dark:border-white/20 text-gray-900 dark:text-white font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-md disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
-              >
-                <ShoppingCart className="w-4 h-4 text-creamy-500" />
-                <span>Add to Cart</span>
-              </button>
+                  {/* ADD TO CART (Dark bordered button) */}
+                  <button
+                    onClick={handleAddToCart}
+                    disabled={currentProduct.stock <= 0}
+                    className="flex-1 min-w-[140px] bg-white hover:bg-gray-100 dark:bg-[#16181e] dark:hover:bg-[#1f222a] border border-gray-300 dark:border-white/20 text-gray-900 dark:text-white font-black uppercase tracking-wider py-4 px-6 rounded-xl shadow-md disabled:cursor-not-allowed transition-all text-xs sm:text-sm text-center flex items-center justify-center gap-2 active:scale-[0.98]"
+                  >
+                    <ShoppingCart className="w-4 h-4 text-creamy-500" />
+                    <span>Add to Cart</span>
+                  </button>
+                </>
+              )}
 
-              {/* SAVE / WISHLIST button */}
-              <button
-                onClick={() => setIsSaved(!isSaved)}
-                className={`px-5 py-4 rounded-xl border font-black uppercase tracking-wider text-xs flex items-center justify-center gap-1.5 transition-all ${isSaved
-                  ? 'bg-red-500/10 border-red-500 text-red-500 shadow-md'
-                  : 'bg-white dark:bg-[#16181e] border-gray-300 dark:border-white/20 text-gray-700 dark:text-gray-300 hover:border-red-400 hover:text-red-400'
-                  }`}
-                title="Save to favorites"
-              >
-                <Heart className={`w-4 h-4 ${isSaved ? 'fill-red-500 text-red-500' : ''}`} />
-                <span>Save</span>
-              </button>
+              <div className="flex items-stretch gap-2.5">
+                {/* SAVE / WISHLIST button */}
+                <button
+                  onClick={() => setIsSaved(!isSaved)}
+                  className={`flex-1 sm:flex-none px-5 py-4 rounded-xl border font-black uppercase tracking-wider text-xs flex items-center justify-center gap-1.5 transition-all ${isSaved
+                    ? 'bg-red-500/10 border-red-500 text-red-500 shadow-md'
+                    : 'bg-white dark:bg-[#16181e] border-gray-300 dark:border-white/20 text-gray-700 dark:text-gray-300 hover:border-red-400 hover:text-red-400'
+                    }`}
+                  title="Save to favorites"
+                >
+                  <Heart className={`w-4 h-4 ${isSaved ? 'fill-red-500 text-red-500' : ''}`} />
+                  <span>Save</span>
+                </button>
+
+                {/* SHARE LINK / SOCIAL button */}
+                <ShareProductButton product={currentProduct} variant="detail" className="flex-1 sm:flex-none" />
+              </div>
             </div>
 
             {/* Download Product Information Card matching reference screenshot */}
@@ -634,7 +674,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                   Download Product Information
                 </h4>
                 <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">
-                  Full specification, colours and delivery details (PDF)
+                  Full specification sheet, colour options &amp; delivery details (.txt)
                 </p>
               </div>
             </div>
@@ -684,8 +724,20 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                     </div>
                     <div className="p-3 bg-white dark:bg-[#16181e] border border-gray-200 dark:border-white/10 rounded-xl">
                       <span className="text-[10px] uppercase font-bold text-gray-400 block">Availability</span>
-                      <span className={`font-extrabold mt-0.5 block ${currentProduct.stock > 0 ? 'text-emerald-500' : 'text-red-500'}`}>
-                        {currentProduct.stock > 0 ? `In Stock (${currentProduct.stock})` : 'Pre-order'}
+                      <span
+                        className={`font-extrabold mt-0.5 block ${
+                          currentProduct.isComingSoon
+                            ? 'text-amber-500'
+                            : currentProduct.stock > 0
+                            ? 'text-emerald-500'
+                            : 'text-red-500'
+                        }`}
+                      >
+                        {currentProduct.isComingSoon
+                          ? `Coming Soon (${currentProduct.comingSoonRelease || 'Pre-Book'})`
+                          : currentProduct.stock > 0
+                          ? `In Stock (${currentProduct.stock})`
+                          : 'Pre-order'}
                       </span>
                     </div>
                   </div>
@@ -701,14 +753,14 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
               </div>
               <div className="flex items-center gap-2">
                 <Truck className="w-4 h-4 text-creamy-500 flex-shrink-0" />
-                <span>Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Dispatch</span>
+                <span>Worldwide Express Freight Dispatch</span>
               </div>
             </div>
 
           </div>
         </div>
 
-        {/* CUSTOMER REVIEWS & MULTI-IMAGE UPLOAD SECTION (CONSTANTLY VISIBLE 5+ REVIEWS BELOW ITEM LISTING) */}
+        {/* CUSTOMER REVIEWS & MULTI-IMAGE UPLOAD SECTION */}
         {(() => {
           const allReviews = getReviewsForProduct(currentProduct)
           const visibleReviews = showAllReviews ? allReviews : allReviews.slice(0, 5)
@@ -716,10 +768,12 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
           const avgRating =
             allReviews.length > 0
               ? (
-                  allReviews.reduce((acc, item) => acc + (Number(item.rating) || 5), 0) /
+                  allReviews.reduce((acc, item) => acc + (Number(item.rating) || 0), 0) /
                   allReviews.length
                 ).toFixed(1)
-              : '4.9'
+              : Number(currentProduct.rating || 0) > 0
+              ? Number(currentProduct.rating).toFixed(1)
+              : '—'
 
           const handlePhotoSelection = (e: React.ChangeEvent<HTMLInputElement>) => {
             const picked = Array.from(e.target.files || [])
@@ -794,8 +848,7 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                     Customer Reviews &amp; Delivery Photos
                   </h2>
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Showing {Math.min(5, visibleReviews.length)} constantly visible verified reviews below{' '}
-                    {currentProduct.name}. Upload your own delivery or action photos below.
+                    Verified owner feedback &amp; delivery gallery for {currentProduct.name}. Upload your own delivery or action photos below.
                   </p>
                 </div>
 
@@ -999,7 +1052,14 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
                   </div>
 
                   <div className="space-y-3.5">
-                    {visibleReviews.map((review) => (
+                    {visibleReviews.length === 0 ? (
+                      <div className="bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl p-6 text-center space-y-2">
+                        <p className="text-sm font-bold text-gray-900 dark:text-white">No Customer Reviews Yet</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                          Purchased this model? Share your unboxing, range, or riding photos using the review form.
+                        </p>
+                      </div>
+                    ) : visibleReviews.map((review) => (
                       <article
                         key={review.id}
                         className="bg-white dark:bg-[#17171c] border border-gray-200 dark:border-white/10 rounded-2xl p-4 sm:p-5 shadow-sm space-y-2.5"
@@ -1220,6 +1280,12 @@ WhatsApp Support: +1 (909) 308-8313 (https://wa.me/19093088313)
           )}
         </div>
       )}
+
+      <BookComingSoonModal
+        product={currentProduct}
+        isOpen={isBookingModalOpen}
+        onClose={() => setIsBookingModalOpen(false)}
+      />
     </div>
   )
 }

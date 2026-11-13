@@ -7,11 +7,15 @@ import cookieParser from 'cookie-parser'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
+import { z } from 'zod'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-// Import database connection
+// Load environment variables before reading config
+dotenv.config()
+
+// Import database connection & helpers
 import { supabase } from './utils/supabase.js'
 import { databaseService } from './services/databaseService.js'
 import { emailService } from './utils/emailService.js'
@@ -24,7 +28,14 @@ import adminRoutes from './routes/admin.js'
 import eventsRoutes from './routes/events.js'
 import paymentRoutes from './routes/payments.js'
 import cartRoutes from './routes/cart.js'
-import { protect } from './middleware/auth.js'
+import { optionalAuth, protect } from './middleware/auth.js'
+import {
+  createRateLimiter,
+  isAllowedOrigin,
+  signSupportVisitorToken,
+  validateStartupEnvironment,
+  verifySupportVisitorToken
+} from './middleware/security.js'
 import {
   getProfile,
   updateProfile,
@@ -40,87 +51,128 @@ import {
 import { errorHandler } from './middleware/errorHandler.js'
 import { notFound } from './middleware/notFound.js'
 
-// Load environment variables
-dotenv.config()
+// Enforce required security environment configuration on boot
+validateStartupEnvironment()
 
 const app = express()
 const PORT = process.env.PORT || process.env.BACKEND_PORT || 5000
 
-// Security middleware - disable restrictive CSP so client assets load seamlessly
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false
-}))
-
-// CORS configuration supporting development and production shop domains
-const allowedOrigins = [
-  process.env.CLIENT_URL,
-  process.env.PRODUCTION_url,
-  'https://driveflyelectric.shop',
-  'http://driveflyelectric.shop',
-  'https://www.driveflyelectric.shop',
-  'http://www.driveflyelectric.shop',
-  'http://localhost:3000',
-  'http://localhost:5000',
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1:5000'
-].filter(Boolean) as string[]
-
-app.use(cors({
-  origin: (origin, callback) => {
-    // Allow server-to-server, curl, mobile, or requests with no origin
-    if (!origin) return callback(null, true)
-    if (
-      allowedOrigins.includes(origin) ||
-      origin.endsWith('.driveflyelectric.shop')
-    ) {
-      return callback(null, true)
+// Security middleware with tailored CSP supporting Stripe Elements & PayPal SDK / Card Fields
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          "'unsafe-inline'",
+          'https://js.stripe.com',
+          'https://www.paypal.com',
+          'https://*.paypal.com',
+          'https://www.sandbox.paypal.com',
+          'https://*.paypalobjects.com'
+        ],
+        styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+        fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+        imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+        mediaSrc: ["'self'", 'blob:', 'https:'],
+        connectSrc: [
+          "'self'",
+          'https://api.stripe.com',
+          'https://*.stripe.com',
+          'https://www.paypal.com',
+          'https://*.paypal.com',
+          'https://api-m.paypal.com',
+          'https://api-m.sandbox.paypal.com',
+          'https://*.paypalobjects.com',
+          'https://*.supabase.co',
+          'wss://*.supabase.co'
+        ],
+        frameSrc: [
+          "'self'",
+          'https://js.stripe.com',
+          'https://hooks.stripe.com',
+          'https://www.paypal.com',
+          'https://*.paypal.com',
+          'https://www.sandbox.paypal.com'
+        ],
+        objectSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'", 'https://www.paypal.com', 'https://*.paypal.com']
+      }
     }
-    // Allow dynamic origins in production
-    return callback(null, true)
-  },
-  credentials: true
-}))
+  })
+)
+
+// Strict origin allowlist CORS policy
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        return callback(null, true)
+      }
+      return callback(new Error('CORS origin not allowed'))
+    },
+    credentials: true
+  })
+)
 
 // Body parsing middleware
-app.use(express.json({ limit: '10mb' }))
-app.use(express.urlencoded({ extended: true }))
+app.use(express.json({ limit: '5mb' }))
+app.use(express.urlencoded({ extended: true, limit: '5mb' }))
 app.use(cookieParser())
 
 // Logging middleware
 app.use(morgan('combined'))
 
-// Static file serving: product images & media
+// Static file serving: product images & media with nosniff defense
 const clientPublicPath = path.resolve(__dirname, '../../client/public')
 const distPath = path.resolve(__dirname, '../../dist')
+const setMediaHeaders = (res: express.Response) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+}
 
-app.use('/images', express.static(path.join(clientPublicPath, 'images'), {
-  maxAge: '1d',
-  fallthrough: true
-}))
+app.use(
+  '/images',
+  express.static(path.join(clientPublicPath, 'images'), {
+    maxAge: '1d',
+    fallthrough: true,
+    setHeaders: setMediaHeaders
+  })
+)
 
 if (fs.existsSync(path.join(distPath, 'images'))) {
-  app.use('/images', express.static(path.join(distPath, 'images'), {
-    maxAge: '1d',
-    fallthrough: true
-  }))
+  app.use(
+    '/images',
+    express.static(path.join(distPath, 'images'), {
+      maxAge: '1d',
+      fallthrough: true,
+      setHeaders: setMediaHeaders
+    })
+  )
 }
 
 // Serve Vite production build static assets (JS, CSS, fonts)
 if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath, {
-    maxAge: '1d',
-    index: false
-  }))
+  app.use(
+    express.static(distPath, {
+      maxAge: '1d',
+      index: false
+    })
+  )
 }
 
 // Also serve client public folder
-app.use(express.static(clientPublicPath, {
-  maxAge: '1d'
-}))
+app.use(
+  express.static(clientPublicPath, {
+    maxAge: '1d'
+  })
+)
 
 // Serve favicon.ico
-app.get('/favicon.ico', (req, res) => {
+app.get('/favicon.ico', (_req, res) => {
   const faviconDist = path.join(distPath, 'favicon.ico')
   const faviconPublic = path.join(clientPublicPath, 'favicon.ico')
   if (fs.existsSync(faviconDist)) return res.sendFile(faviconDist)
@@ -128,18 +180,21 @@ app.get('/favicon.ico', (req, res) => {
   res.status(204).end()
 })
 
+const getCanonicalSiteUrl = () =>
+  (process.env.PRODUCTION_URL || process.env.PRODUCTION_url || 'https://driveflyelectric.shop').replace(/\/+$/, '')
+
 // SEO: robots.txt
-app.get('/robots.txt', (req, res) => {
-  const siteUrl = process.env.PRODUCTION_url || 'https://driveflyelectric.shop'
+app.get('/robots.txt', (_req, res) => {
+  const siteUrl = getCanonicalSiteUrl()
   res.type('text/plain').send(
-    `User-agent: *\nAllow: /\nAllow: /products/\nAllow: /images/\nDisallow: /api/\nDisallow: /admin\nSitemap: ${siteUrl}/sitemap.xml\n`
+    `User-agent: *\nAllow: /\nAllow: /product/\nAllow: /products/\nAllow: /images/\nDisallow: /api/\nDisallow: /admin\nSitemap: ${siteUrl}/sitemap.xml\n`
   )
 })
 
 // SEO: Dynamic XML Sitemap including all categories and listed database items
-app.get('/sitemap.xml', async (req, res) => {
+app.get('/sitemap.xml', async (_req, res) => {
   try {
-    const siteUrl = (process.env.PRODUCTION_url || 'https://driveflyelectric.shop').replace(/\/$/, '')
+    const siteUrl = getCanonicalSiteUrl()
     const products = await databaseService.findProducts({ limit: 500, offset: 0 })
     const nowIso = new Date().toISOString()
 
@@ -173,12 +228,15 @@ app.get('/sitemap.xml', async (req, res) => {
     }
 
     for (const p of products) {
-      const prodUrl = `${siteUrl}/products/${encodeURIComponent(p.id)}`
+      const prodUrl = `${siteUrl}/product/${encodeURIComponent(p.id)}`
       const lastMod = p.updatedAt ? new Date(p.updatedAt).toISOString() : nowIso
       const primaryImg = p.images && p.images.length > 0 ? p.images[0] : '/images/hero1.jpeg'
       const fullImgUrl = primaryImg.startsWith('http')
         ? primaryImg
-        : `${siteUrl}${primaryImg.startsWith('/') ? '' : '/'}${primaryImg.split('/').map((seg: string, i: number) => i === 0 && seg === '' ? '' : encodeURIComponent(decodeURIComponent(seg))).join('/')}`
+        : `${siteUrl}${primaryImg.startsWith('/') ? '' : '/'}${primaryImg
+            .split('/')
+            .map((seg: string, i: number) => (i === 0 && seg === '' ? '' : encodeURIComponent(decodeURIComponent(seg))))
+            .join('/')}`
 
       xml += `  <url>\n`
       xml += `    <loc>${escapeXml(prodUrl)}</loc>\n`
@@ -201,32 +259,20 @@ app.get('/sitemap.xml', async (req, res) => {
 })
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'OK',
-    message: 'DriveFlyElectric API is running',
     currency: 'USD',
-    headOffice: 'Texas, USA',
     timestamp: new Date().toISOString()
   })
 })
 
-// API documentation / status endpoint
-app.get('/api', (req, res) => {
+// Minimal API status endpoint
+app.get('/api', (_req, res) => {
   res.status(200).json({
     success: true,
-    message: 'DriveFlyElectric API Server - Electric Microcars, MiniHeliCopters & Rides',
-    version: '1.0.0',
-    headOffice: 'Austin, Texas, United States',
+    service: 'DriveFlyElectric API',
     currency: 'USD',
-    endpoints: {
-      health: '/health',
-      products: '/api/products',
-      auth: '/api/auth',
-      cart: '/api/cart',
-      orders: '/api/orders',
-      payments: '/api/payments'
-    },
     timestamp: new Date().toISOString()
   })
 })
@@ -250,20 +296,106 @@ app.post('/api/addresses', protect, createAddress)
 app.put('/api/addresses/:id', protect, updateAddress)
 app.delete('/api/addresses/:id', protect, deleteAddress)
 
-// Public Real-Time Client LiveChat & Support Routes
-app.post('/api/support/session', async (req, res) => {
+// Public Real-Time Client LiveChat & Support Routes (rate-limited + visitor session token protected)
+const supportRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyPrefix: 'support-chat',
+  message: 'Too many support chat requests. Please wait a moment.'
+})
+
+const supportSelectedProductSchema = z.object({
+  id: z.string().trim().min(1).max(120),
+  name: z.string().trim().min(1).max(200),
+  sku: z.string().trim().max(120).optional().default(''),
+  price: z.coerce.number().finite().min(0).max(10000000),
+  category: z.string().trim().max(120).optional().default(''),
+  image: z.string().trim().max(500).optional().default('')
+})
+
+const supportSelectedProductItemSchema = z.union([
+  supportSelectedProductSchema,
+  z.string().trim().min(1).max(120).transform((id) => ({
+    id,
+    name: id,
+    sku: '',
+    price: 0,
+    category: '',
+    image: ''
+  }))
+])
+
+const supportSessionInitSchema = z.object({
+  id: z.string().trim().max(120).optional(),
+  sessionId: z.string().trim().max(120).optional(),
+  visitorId: z.string().trim().max(120).optional(),
+  topic: z.string().trim().max(200).optional(),
+  selectedProducts: z.array(supportSelectedProductItemSchema).max(20).optional(),
+  visitorName: z.string().trim().max(120).optional(),
+  visitorEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
+  visitorPhone: z.string().trim().max(40).optional()
+})
+
+const supportMessageSchema = z.object({
+  content: z.string().trim().min(1, 'Message content is required.').max(2000),
+  topic: z.string().trim().max(200).optional(),
+  selectedProducts: z.array(supportSelectedProductItemSchema).max(20).optional(),
+  visitorName: z.string().trim().max(120).optional(),
+  visitorEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
+  visitorPhone: z.string().trim().max(40).optional()
+})
+
+function hasSupportSessionAccess(req: express.Request, sessionId: string): boolean {
+  if (req.user?.role === 'ADMIN') return true
+  const token = String(
+    (req.headers['x-support-token'] as string) || (req.query.token as string) || ''
+  ).trim()
+  return verifySupportVisitorToken(sessionId, token)
+}
+
+app.post('/api/support/session', supportRateLimit, optionalAuth, async (req, res) => {
   try {
-    const session = await databaseService.upsertSupportSession(req.body || {})
-    res.status(200).json({ success: true, data: session })
+    const parsed = supportSessionInitSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid support session payload.'
+      })
+    }
+
+    const requestedId = parsed.data.id || parsed.data.sessionId || parsed.data.visitorId
+    if (requestedId) {
+      const existing = await databaseService.getSupportSession(requestedId)
+      if (existing && !hasSupportSessionAccess(req, requestedId)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Support session token mismatch. Please start a new chat session.'
+        })
+      }
+    }
+
+    const session = await databaseService.upsertSupportSession({
+      ...parsed.data,
+      userId: req.user?.id
+    })
+    const visitorToken = signSupportVisitorToken(session.id)
+    res.status(200).json({ success: true, data: session, visitorToken })
   } catch (err) {
     console.error('Support session init error:', err)
     res.status(500).json({ success: false, error: 'Failed to initialize support session' })
   }
 })
 
-app.get('/api/support/session/:id', async (req, res) => {
+app.get('/api/support/session/:id', supportRateLimit, optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
+    if (!hasSupportSessionAccess(req, sessionId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to access this support session.'
+      })
+    }
+
     await databaseService.updateSupportPresence(sessionId, true)
     if (req.query.open === 'true') {
       await databaseService.markSupportSessionRead(sessionId, 'CLIENT')
@@ -279,33 +411,47 @@ app.get('/api/support/session/:id', async (req, res) => {
   }
 })
 
-app.post('/api/support/session/:id/messages', async (req, res) => {
+app.post('/api/support/session/:id/messages', supportRateLimit, optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
-    const { content, topic, selectedProducts, visitorName, visitorEmail, visitorPhone } = req.body || {}
-    if (!content || !String(content).trim()) {
-      return res.status(400).json({ success: false, error: 'Message content is required' })
+    const parsed = supportMessageSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Message content is required.'
+      })
     }
+
+    const existing = await databaseService.getSupportSession(sessionId)
+    if (existing && !hasSupportSessionAccess(req, sessionId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not authorized to post to this support session.'
+      })
+    }
+
+    const { content, topic, selectedProducts, visitorName, visitorEmail, visitorPhone } = parsed.data
     const result = await databaseService.appendSupportMessage(sessionId, {
       senderRole: 'CLIENT',
       senderName: visitorName || 'Store Visitor',
-      content: String(content).trim(),
+      content,
       topic,
       selectedProducts,
       visitorName,
-      visitorEmail,
+      visitorEmail: visitorEmail || undefined,
       visitorPhone
     })
 
-    // Stream client support inquiry to Real-Time System Activity feed & SMTP system alert
     emailService
-      .sendSupportInquiryAlert(result.session, String(content).trim())
+      .sendSupportInquiryAlert(result.session, content)
       .catch((err) => console.error('Support inquiry alert error:', err))
 
+    const visitorToken = signSupportVisitorToken(result.session.id)
     res.status(200).json({
       success: true,
       data: result.session,
-      newMessages: result.newMessages
+      newMessages: result.newMessages,
+      visitorToken
     })
   } catch (err) {
     console.error('Support message send error:', err)
@@ -313,13 +459,16 @@ app.post('/api/support/session/:id/messages', async (req, res) => {
   }
 })
 
-app.post('/api/support/session/:id/heartbeat', async (req, res) => {
+app.post('/api/support/session/:id/heartbeat', supportRateLimit, optionalAuth, async (req, res) => {
   try {
     const sessionId = req.params.id
+    if (!hasSupportSessionAccess(req, sessionId)) {
+      return res.status(403).json({ success: false })
+    }
     const isOnline = req.body?.isOnline !== undefined ? Boolean(req.body.isOnline) : true
     const session = await databaseService.updateSupportPresence(sessionId, isOnline, req.body)
     res.status(200).json({ success: true, data: session })
-  } catch (err) {
+  } catch {
     res.status(200).json({ success: false })
   }
 })
@@ -333,11 +482,9 @@ app.get('*', (req, res, next) => {
   if (fs.existsSync(indexPath)) {
     return res.sendFile(indexPath)
   }
-  res.status(200).json({
-    success: true,
-    message: 'DriveFlyElectric API Server - Electric Microcars, MiniHeliCopters & Rides',
-    status: 'API running. Run `npm run build` to build and serve client frontend bundle.',
-    timestamp: new Date().toISOString()
+  res.status(404).json({
+    success: false,
+    error: 'Application bundle not found.'
   })
 })
 
@@ -376,8 +523,8 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`🚀 DriveFlyElectric server is running on port ${PORT}`)
-    console.log(`📱 Client URL: ${process.env.CLIENT_URL || 'https://driveflyelectric.shop'}`)
-    console.log(`🗄️  Database: Connected to Supabase PostgreSQL (DriveFlyElectric Catalog)`)
+    console.log(`📱 Storefront URL: ${getCanonicalSiteUrl()}`)
+    console.log('🗄️  Database: Connected to Supabase PostgreSQL')
   })
 }
 

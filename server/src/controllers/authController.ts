@@ -1,17 +1,47 @@
-import { Request, Response, NextFunction } from 'express'
+import { Request, Response } from 'express'
 import bcrypt from 'bcryptjs'
-import jwt, { Secret } from 'jsonwebtoken'
+import jwt from 'jsonwebtoken'
+import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
+import { getJwtSecret } from '../middleware/security.js'
 
-// Generate JWT token
+const registerSchema = z.object({
+  email: z.string().trim().email('Please provide a valid email address.').max(254),
+  password: z
+    .string()
+    .min(8, 'Password must be at least 8 characters long.')
+    .max(128, 'Password must be 128 characters or fewer.'),
+  firstName: z.string().trim().min(1, 'First name is required.').max(100),
+  lastName: z.string().trim().min(1, 'Last name is required.').max(100),
+  phone: z.string().trim().max(40).optional()
+})
+
+const loginSchema = z.object({
+  email: z.string().trim().email('Please provide a valid email address.').max(254),
+  password: z.string().min(1, 'Password is required.').max(128)
+})
+
+const updateProfileSchema = z.object({
+  firstName: z.string().trim().min(1, 'First name is required.').max(100),
+  lastName: z.string().trim().min(1, 'Last name is required.').max(100),
+  phone: z.string().trim().max(40).optional().nullable()
+})
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required.').max(128),
+  newPassword: z
+    .string()
+    .min(8, 'New password must be at least 8 characters long.')
+    .max(128, 'New password must be 128 characters or fewer.')
+})
+
+const updateUserStatusSchema = z.object({
+  isActive: z.boolean()
+})
+
 const generateToken = (userId: string, email: string, role: string): string => {
-  const secret = process.env.JWT_SECRET
-  if (!secret) {
-    throw new Error('JWT_SECRET environment variable is not set')
-  }
-
-  // Use type assertion to bypass strict typing issues
+  const secret = getJwtSecret()
   return (jwt as any).sign(
     { id: userId, email, role },
     secret,
@@ -19,40 +49,65 @@ const generateToken = (userId: string, email: string, role: string): string => {
   )
 }
 
+const setAuthCookie = (res: Response, token: string) => {
+  res.cookie('token', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 30 * 24 * 60 * 60 * 1000
+  })
+}
+
+const sanitizeUser = (user: any) => ({
+  id: user.id,
+  email: user.email,
+  firstName: user.firstName,
+  lastName: user.lastName,
+  phone: user.phone,
+  role: user.role,
+  isActive: user.isActive,
+  createdAt: user.createdAt
+})
+
 // @desc    Register user
 // @route   POST /api/auth/register
 // @access  Public
 export const register = async (req: Request, res: Response) => {
   try {
-    const { email, password, firstName, lastName, phone } = req.body
+    const parsed = registerSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid registration data.'
+      })
+    }
 
-    // Check if user already exists
+    const email = parsed.data.email.toLowerCase()
+    const { password, firstName, lastName, phone } = parsed.data
+
     const existingUser = await databaseService.findUserByEmail(email)
     if (existingUser) {
       return res.status(400).json({
         success: false,
-        error: 'User already exists with this email'
+        error: 'An account with this email already exists.'
       })
     }
 
-    // Hash password
-    const salt = await bcrypt.genSalt(10)
+    const salt = await bcrypt.genSalt(12)
     const hashedPassword = await bcrypt.hash(password, salt)
 
-    // Create user
     const user = await databaseService.createUser({
       email,
       password: hashedPassword,
       firstName,
       lastName,
-      phone,
-      role: 'CUSTOMER' // Default role
+      phone: phone || undefined,
+      role: 'CUSTOMER'
     })
 
-    // Generate token
     const token = generateToken(user.id, user.email, user.role)
+    setAuthCookie(res, token)
 
-    // Dispatch real-time account creation emails (welcome email to user + system activity alert to admin mail)
     emailService
       .sendAccountRegistrationNotifications(user, 'Account Registration')
       .catch((err) => console.error('Registration notification error:', err))
@@ -62,20 +117,14 @@ export const register = async (req: Request, res: Response) => {
       message: 'User registered successfully',
       data: {
         token,
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          role: user.role
-        }
+        user: sanitizeUser(user)
       }
     })
   } catch (error) {
     console.error('Error registering user:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to complete registration right now. Please try again.'
     })
   }
 }
@@ -85,9 +134,17 @@ export const register = async (req: Request, res: Response) => {
 // @access  Public
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body
+    const parsed = loginSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Please enter your email and password.'
+      })
+    }
 
-    // Check if user exists
+    const email = parsed.data.email.toLowerCase()
+    const { password } = parsed.data
+
     const user = await databaseService.findUserByEmail(email)
     if (!user) {
       return res.status(401).json({
@@ -96,7 +153,6 @@ export const login = async (req: Request, res: Response) => {
       })
     }
 
-    // Check if user is active
     if (!user.isActive) {
       return res.status(401).json({
         success: false,
@@ -104,13 +160,13 @@ export const login = async (req: Request, res: Response) => {
       })
     }
 
-    // Check password
     if (!user.password) {
       return res.status(401).json({
         success: false,
         error: 'Incorrect email or password. Please check your credentials and try again.'
       })
     }
+
     const isPasswordValid = await bcrypt.compare(password, user.password)
     if (!isPasswordValid) {
       return res.status(401).json({
@@ -119,8 +175,8 @@ export const login = async (req: Request, res: Response) => {
       })
     }
 
-    // Generate token
     const token = generateToken(user.id, user.email, user.role)
+    setAuthCookie(res, token)
 
     emailService.recordActivity({
       type: 'USER_LOGIN',
@@ -136,22 +192,31 @@ export const login = async (req: Request, res: Response) => {
       message: 'Login successful',
       data: {
         token,
-        user: {
-          id: user.id,
-          email: user.email,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          role: user.role
-        }
+        user: sanitizeUser(user)
       }
     })
   } catch (error) {
     console.error('Error logging in user:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to sign in right now. Please try again.'
     })
   }
+}
+
+// @desc    Logout user (clear HttpOnly cookie)
+// @route   POST /api/auth/logout
+// @access  Public
+export const logout = async (_req: Request, res: Response) => {
+  res.clearCookie('token', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax'
+  })
+  res.status(200).json({
+    success: true,
+    message: 'Signed out successfully'
+  })
 }
 
 // @desc    Get current user profile
@@ -170,22 +235,13 @@ export const getProfile = async (req: Request, res: Response) => {
 
     res.status(200).json({
       success: true,
-      data: {
-        id: user.id,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        phone: user.phone,
-        role: user.role,
-        isActive: user.isActive,
-        createdAt: user.createdAt
-      }
+      data: sanitizeUser(user)
     })
   } catch (error) {
     console.error('Error fetching user profile:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load profile.'
     })
   }
 }
@@ -195,31 +251,30 @@ export const getProfile = async (req: Request, res: Response) => {
 // @access  Private
 export const updateProfile = async (req: Request, res: Response) => {
   try {
-    const { firstName, lastName, phone } = req.body
+    const parsed = updateProfileSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid profile update payload.'
+      })
+    }
 
     const updatedUser = await databaseService.updateUser(req.user!.id, {
-      firstName,
-      lastName,
-      phone
+      firstName: parsed.data.firstName,
+      lastName: parsed.data.lastName,
+      phone: parsed.data.phone ?? undefined
     })
 
     res.status(200).json({
       success: true,
       message: 'Profile updated successfully',
-      data: {
-        id: updatedUser.id,
-        email: updatedUser.email,
-        firstName: updatedUser.firstName,
-        lastName: updatedUser.lastName,
-        phone: updatedUser.phone,
-        role: updatedUser.role
-      }
+      data: sanitizeUser(updatedUser)
     })
   } catch (error) {
     console.error('Error updating user profile:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update profile.'
     })
   }
 }
@@ -229,9 +284,15 @@ export const updateProfile = async (req: Request, res: Response) => {
 // @access  Private
 export const changePassword = async (req: Request, res: Response) => {
   try {
-    const { currentPassword, newPassword } = req.body
+    const parsed = changePasswordSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid password change payload.'
+      })
+    }
 
-    // Get user with password
+    const { currentPassword, newPassword } = parsed.data
     const user = await databaseService.findUserById(req.user!.id)
 
     if (!user) {
@@ -241,13 +302,13 @@ export const changePassword = async (req: Request, res: Response) => {
       })
     }
 
-    // Check current password
     if (!user.password) {
       return res.status(400).json({
         success: false,
         error: 'Current password is not set'
       })
     }
+
     const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password)
     if (!isCurrentPasswordValid) {
       return res.status(400).json({
@@ -256,11 +317,9 @@ export const changePassword = async (req: Request, res: Response) => {
       })
     }
 
-    // Hash new password
-    const salt = await bcrypt.genSalt(10)
+    const salt = await bcrypt.genSalt(12)
     const hashedNewPassword = await bcrypt.hash(newPassword, salt)
 
-    // Update password
     await databaseService.updateUser(req.user!.id, {
       password: hashedNewPassword
     })
@@ -273,7 +332,7 @@ export const changePassword = async (req: Request, res: Response) => {
     console.error('Error changing password:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update password.'
     })
   }
 }
@@ -281,19 +340,19 @@ export const changePassword = async (req: Request, res: Response) => {
 // @desc    Admin: Get all users
 // @route   GET /api/auth/users
 // @access  Private/Admin
-export const getUsers = async (req: Request, res: Response) => {
+export const getUsers = async (_req: Request, res: Response) => {
   try {
     const users = await databaseService.findUsers()
 
     res.status(200).json({
       success: true,
-      data: users
+      data: users.map(sanitizeUser)
     })
   } catch (error) {
     console.error('Error fetching users:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to fetch users.'
     })
   }
 }
@@ -303,23 +362,36 @@ export const getUsers = async (req: Request, res: Response) => {
 // @access  Private/Admin
 export const updateUserStatus = async (req: Request, res: Response) => {
   try {
-    const { isActive } = req.body
+    const parsed = updateUserStatusSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'isActive must be a boolean.'
+      })
+    }
+
     const userId = req.params.id
+    if (req.user && req.user.id === userId && !parsed.data.isActive) {
+      return res.status(400).json({
+        success: false,
+        error: 'Administrators cannot deactivate their own account.'
+      })
+    }
 
     const updatedUser = await databaseService.updateUser(userId, {
-      isActive
+      isActive: parsed.data.isActive
     })
 
     res.status(200).json({
       success: true,
-      message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
-      data: updatedUser
+      message: `User ${parsed.data.isActive ? 'activated' : 'deactivated'} successfully`,
+      data: sanitizeUser(updatedUser)
     })
   } catch (error) {
     console.error('Error updating user status:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update user status.'
     })
   }
 }

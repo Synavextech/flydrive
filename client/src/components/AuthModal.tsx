@@ -62,6 +62,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           setLocalError('First and last name are required.')
           return
         }
+        if (formData.password.length < 8) {
+          setLocalError('Password must be at least 8 characters long.')
+          return
+        }
         await register({
           firstName: formData.firstName,
           lastName: formData.lastName,
@@ -105,7 +109,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               <span className="text-xl font-anton text-creamy-500 uppercase tracking-wide">
                 DRIVEFLY<span className="text-gray-900 dark:text-white">ELECTRIC</span>
               </span>
-              <span className="text-[10px] bg-creamy-100 dark:bg-creamy-500/20 text-creamy-800 dark:text-creamy-400 font-bold px-2 py-0.5 rounded-full uppercase">Fast Checkout</span>
+              <span className="text-[10px] bg-creamy-100 dark:bg-creamy-500/20 text-creamy-800 dark:text-creamy-400 font-bold px-2 py-0.5 rounded-full uppercase">Member Access</span>
             </div>
             <p className="text-sm text-gray-600 dark:text-gray-300">
               {message}
@@ -257,7 +261,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
             <div className="pt-2 text-center text-xs text-gray-500 dark:text-gray-400 flex items-center justify-center gap-1.5">
               <CheckCircle className="w-3.5 h-3.5 text-green-500" />
-              <span>Instant checkout & auto-synced cart items</span>
+              <span>Fast checkout &amp; saved order tracking</span>
             </div>
           </form>
         </div>

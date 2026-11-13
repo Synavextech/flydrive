@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import {
   CheckCircle,
@@ -19,12 +19,17 @@ import { useAuth } from '../contexts/AuthContext'
 import {
   OrderReceiptData,
   generateReceiptText,
-  downloadReceiptPdf
+  downloadReceiptPdf,
+  formatSupportPhone,
+  getSupportWhatsAppDigits
 } from '../utils/receiptPdf'
+import { resolveClientCountryIso2 } from '../data/countries'
 
 export type { OrderReceiptData }
 
 interface LocationState {
+  orderId?: string
+  receiptToken?: string
   orderNumber?: string
   trackingNumber?: string
   total?: number
@@ -40,9 +45,14 @@ const OrderSuccessPage = () => {
   const { clearCart } = useCart()
 
   const state = (location.state as LocationState) || {}
+  const payPalTokenFromUrl = searchParams.get('token')
+  const isReturningFromPayPal = Boolean(
+    payPalTokenFromUrl && localStorage.getItem('pending_paypal_order') && !state.orderNumber
+  )
 
-  // Restore cached receipt if page was refreshed
+  // Restore cached receipt if page was refreshed (ignored during a fresh PayPal return flow)
   const getCachedReceipt = (): OrderReceiptData | null => {
+    if (isReturningFromPayPal) return null
     try {
       const saved = localStorage.getItem('latest_order_receipt')
       return saved ? JSON.parse(saved) : null
@@ -52,6 +62,7 @@ const OrderSuccessPage = () => {
   }
 
   const initialReceipt = state.receiptData || getCachedReceipt()
+  const processedPayPalTokenRef = useRef<string | null>(null)
 
   const [receipt, setReceipt] = useState<OrderReceiptData | null>(initialReceipt)
   const [orderNumber, setOrderNumber] = useState<string>(
@@ -72,14 +83,20 @@ const OrderSuccessPage = () => {
     state.total || (initialReceipt?.finalCost ? parseFloat(initialReceipt.finalCost.replace(/[^0-9.]/g, '')) : null)
   )
 
+  const [copied, setCopied] = useState(false)
   const [loadingPayPal, setLoadingPayPal] = useState(false)
   const [payPalError, setPayPalError] = useState<string | null>(null)
+
+  const supportPhone = formatSupportPhone()
+  const whatsAppDigits = getSupportWhatsAppDigits()
+  const apiUrl = (import.meta as any).env?.VITE_API_URL || '/api'
 
   useEffect(() => {
     const payPalToken = searchParams.get('token')
     const pendingData = localStorage.getItem('pending_paypal_order')
 
-    if (payPalToken && pendingData && !orderNumber) {
+    if (payPalToken && pendingData && !orderNumber && processedPayPalTokenRef.current !== payPalToken) {
+      processedPayPalTokenRef.current = payPalToken
       const processPayPalReturn = async () => {
         setLoadingPayPal(true)
         setPayPalError(null)
@@ -107,12 +124,13 @@ const OrderSuccessPage = () => {
               address2: parsed.shippingData?.address2 || '',
               city: parsed.shippingData?.city || '',
               state: parsed.shippingData?.state || '',
-              postalCode: parsed.shippingData?.zipCode || '',
-              country: parsed.shippingData?.country || 'United States'
+              postalCode: parsed.shippingData?.postalCode || parsed.shippingData?.zipCode || '',
+              country: parsed.shippingData?.country || 'United States',
+              countryCode: resolveClientCountryIso2(parsed.shippingData?.country)
             },
             createAccount: parsed.createAccount,
             password: parsed.accountPassword,
-            notes: `Nanshan, Shenzhen, Guangdong Province, China(${captureRes.data.paymentId})`
+            notes: `Dispatch to ${parsed.shippingData?.city || 'Destination'}, ${parsed.shippingData?.country || 'United States'} (${captureRes.data.paymentId})`
           }
 
           // 2. Finalize and settle order in database
@@ -129,7 +147,7 @@ const OrderSuccessPage = () => {
             setOrderNumber(confirmedOrderNumber)
             setTrackingNumber(confirmedTrackingNumber)
             setPaymentMethod('PAYPAL')
-            const finalTotal = Number(parsed.grandTotal || parsed.total || createRes.data.total || 0)
+            const finalTotal = Number(createRes.data.total || parsed.grandTotal || parsed.total || 0)
             setTotal(finalTotal)
 
             const orderDateStr = new Date().toLocaleDateString('en-US', {
@@ -137,9 +155,12 @@ const OrderSuccessPage = () => {
               month: 'short',
               day: 'numeric'
             })
-            const fullAddress = `${parsed.shippingData?.address1 || ''}${parsed.shippingData?.address2 ? `, ${parsed.shippingData.address2}` : ''}, ${parsed.shippingData?.city || ''}, ${parsed.shippingData?.state || ''} ${parsed.shippingData?.zipCode || ''}, ${parsed.shippingData?.country || 'United States'}`
+            const zipVal = parsed.shippingData?.postalCode || parsed.shippingData?.zipCode || ''
+            const fullAddress = `${parsed.shippingData?.address1 || ''}${parsed.shippingData?.address2 ? `, ${parsed.shippingData.address2}` : ''}, ${parsed.shippingData?.city || ''}, ${parsed.shippingData?.state || ''} ${zipVal}, ${parsed.shippingData?.country || 'United States'}`
 
             const ppReceipt: OrderReceiptData = {
+              orderId: createRes.data.id,
+              receiptToken: createRes.data.receiptToken,
               date: orderDateStr,
               orderDate: orderDateStr,
               orderNumber: confirmedOrderNumber,
@@ -148,7 +169,7 @@ const OrderSuccessPage = () => {
               userName: `${parsed.shippingData?.firstName || ''} ${parsed.shippingData?.lastName || ''}`.trim() || 'Valued Customer',
               address: fullAddress,
               paymentSource: 'PayPal Express',
-              initialCharge: `$${Number(parsed.subtotal || parsed.grandTotal || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+              initialCharge: `$${Number(parsed.subtotal || finalTotal || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               finalCost: `$${finalTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
               totalRefund: '$0.00',
               refundTrans: 'N/A',
@@ -194,7 +215,7 @@ const OrderSuccessPage = () => {
           }
         } catch (err: any) {
           console.error('PayPal return error:', err)
-          setPayPalError(err.message || 'Payment capture failed. Please contact support.')
+          setPayPalError(err.message || 'Payment verification failed. Please contact support.')
         } finally {
           setLoadingPayPal(false)
         }
@@ -204,13 +225,67 @@ const OrderSuccessPage = () => {
     }
   }, [searchParams, orderNumber, setAuthenticatedUser])
 
+  const hasVerifiedOrder = Boolean(orderNumber || receipt?.orderNumber)
+  const displayOrderNumber = orderNumber || receipt?.orderNumber || ''
+  const displayTrackingNumber =
+    trackingNumber || receipt?.trackingNumber || (displayOrderNumber ? `TRK-${displayOrderNumber}` : '')
+  const formattedTotal = total
+    ? `$${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : null
+
+  const activeReceipt: OrderReceiptData | null = receipt
+    ? {
+        ...receipt,
+        orderId: receipt.orderId || state.orderId,
+        receiptToken: receipt.receiptToken || state.receiptToken,
+        trackingNumber: receipt.trackingNumber || displayTrackingNumber
+      }
+    : displayOrderNumber
+    ? {
+        orderId: state.orderId,
+        receiptToken: state.receiptToken,
+        date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+        orderDate: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
+        orderNumber: displayOrderNumber,
+        trackingNumber: displayTrackingNumber,
+        transactionId: 'Verified Settlement',
+        userName: 'Valued Customer',
+        address: state.shippingAddress || 'Express Shipping to Destination on File',
+        paymentSource:
+          paymentMethod === 'STRIPE'
+            ? 'Credit / Debit Card (Stripe)'
+            : paymentMethod === 'PAYPAL'
+              ? 'PayPal Express'
+              : paymentMethod,
+        initialCharge: formattedTotal || '$0.00',
+        finalCost: formattedTotal || '$0.00',
+        totalRefund: '$0.00',
+        refundTrans: 'N/A'
+      }
+    : null
+
+  // Automatically generate and download PDF receipt once when a verified purchase completes
+  useEffect(() => {
+    if (!loadingPayPal && !payPalError && hasVerifiedOrder && activeReceipt?.orderNumber) {
+      const autoKey = `auto_pdf_receipt_${activeReceipt.orderNumber}`
+      if (!sessionStorage.getItem(autoKey)) {
+        sessionStorage.setItem(autoKey, 'true')
+        try {
+          downloadReceiptPdf(activeReceipt)
+        } catch {
+          // Ignore automatic download block if browser restricts popup/download
+        }
+      }
+    }
+  }, [loadingPayPal, payPalError, hasVerifiedOrder, activeReceipt?.orderNumber])
+
   if (loadingPayPal) {
     return (
-      <div className="pt-20 min-h-screen bg-gray-50 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
-        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center border border-gray-100">
-          <Loader2 className="w-12 h-12 text-primary-600 animate-spin mx-auto mb-4" />
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Finalizing PayPal Payment...</h2>
-          <p className="text-gray-600 text-sm">Please do not refresh or close this window while we secure your order.</p>
+      <div className="pt-20 min-h-screen bg-gray-50 dark:bg-[#0e1014] flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
+        <div className="max-w-md w-full bg-white dark:bg-[#16181e] rounded-2xl shadow-xl p-8 text-center border border-gray-100 dark:border-neutral-800">
+          <Loader2 className="w-12 h-12 text-creamy-500 animate-spin mx-auto mb-4" />
+          <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-2">Finalizing PayPal Payment...</h2>
+          <p className="text-gray-600 dark:text-gray-400 text-sm">Please do not refresh or close this window while we secure your order.</p>
         </div>
       </div>
     )
@@ -218,23 +293,23 @@ const OrderSuccessPage = () => {
 
   if (payPalError) {
     return (
-      <div className="pt-20 min-h-screen bg-gray-50 flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
-        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 text-center border border-red-100">
-          <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4 text-red-600">
+      <div className="pt-20 min-h-screen bg-gray-50 dark:bg-[#0e1014] flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
+        <div className="max-w-md w-full bg-white dark:bg-[#16181e] rounded-2xl shadow-xl p-8 text-center border border-red-100 dark:border-red-900/40">
+          <div className="w-16 h-16 bg-red-100 dark:bg-red-950/50 rounded-full flex items-center justify-center mx-auto mb-4 text-red-600 dark:text-red-400">
             <AlertCircle className="w-8 h-8" />
           </div>
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Payment Verification Error</h2>
-          <p className="text-red-600 text-sm mb-6">{payPalError}</p>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-2">Payment Verification Error</h2>
+          <p className="text-red-600 dark:text-red-400 text-sm mb-6">{payPalError}</p>
           <div className="space-y-3">
             <Link
               to="/checkout"
-              className="w-full flex items-center justify-center px-6 py-3 border border-transparent text-sm font-semibold rounded-xl text-white bg-primary-600 hover:bg-primary-700 shadow-md transition duration-200"
+              className="w-full flex items-center justify-center px-6 py-3 border border-transparent text-sm font-black uppercase tracking-wider rounded-xl text-black bg-creamy-500 hover:bg-creamy-400 shadow-md transition duration-200"
             >
               Return to Checkout
             </Link>
             <Link
               to="/"
-              className="w-full flex items-center justify-center px-6 py-3 border border-gray-300 text-sm font-medium rounded-xl text-gray-700 bg-white hover:bg-gray-50 transition duration-200"
+              className="w-full flex items-center justify-center px-6 py-3 border border-gray-300 dark:border-neutral-700 text-sm font-medium rounded-xl text-gray-700 dark:text-gray-200 bg-white dark:bg-[#1a1d24] hover:bg-gray-50 dark:hover:bg-neutral-800 transition duration-200"
             >
               Return Home
             </Link>
@@ -244,30 +319,42 @@ const OrderSuccessPage = () => {
     )
   }
 
-  const [copied, setCopied] = useState(false)
-  const [showReceiptPreview, setShowReceiptPreview] = useState(true)
-
-  const displayOrderNumber = orderNumber || `DFE-${Math.floor(100000 + Math.random() * 900000)}`
-  const displayTrackingNumber =
-    trackingNumber || receipt?.trackingNumber || `TRK-${displayOrderNumber}`
-  const formattedTotal = total ? `$${total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : null
-
-  const activeReceipt: OrderReceiptData = receipt
-    ? { ...receipt, trackingNumber: receipt.trackingNumber || displayTrackingNumber }
-    : {
-        date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-        orderDate: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }),
-        orderNumber: displayOrderNumber,
-        trackingNumber: displayTrackingNumber,
-        transactionId: `TXN-${Math.floor(100000 + Math.random() * 900000)}`,
-        userName: 'Valued Customer',
-        address: 'Express Shipping to Destination on File',
-        paymentSource: paymentMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : paymentMethod === 'PAYPAL' ? 'PayPal Express' : paymentMethod,
-        initialCharge: formattedTotal || '$0.00',
-        finalCost: formattedTotal || '$0.00',
-        totalRefund: '$0.00',
-        refundTrans: 'N/A'
-      }
+  if (!activeReceipt) {
+    return (
+      <div className="pt-24 pb-20 min-h-screen bg-gray-50 dark:bg-[#0e1014] text-gray-900 dark:text-white flex items-center justify-center px-4">
+        <div className="max-w-lg w-full bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-8 text-center space-y-5">
+          <div className="w-16 h-16 bg-creamy-500/10 text-creamy-500 border border-creamy-500/30 rounded-full flex items-center justify-center mx-auto">
+            <Package className="w-8 h-8" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-black uppercase tracking-tight font-anton text-gray-900 dark:text-white">
+              Looking For Your Order Receipt?
+            </h1>
+            <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 mt-2 leading-relaxed">
+              No active confirmation is loaded in this browser session. Enter your order or tracking number in the live tracker, or return to the store catalog.
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new CustomEvent('dfe:open-track-order', { detail: {} }))}
+              className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs rounded-xl transition-all"
+            >
+              <Truck className="w-4 h-4" />
+              <span>Track Existing Order</span>
+            </button>
+            <Link
+              to="/"
+              className="flex-1 inline-flex items-center justify-center gap-2 px-5 py-3 bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 text-gray-900 dark:text-white font-bold text-xs rounded-xl border border-gray-200 dark:border-neutral-700 transition-all"
+            >
+              <Home className="w-4 h-4" />
+              <span>Return to Store</span>
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   const handleCopyTrackingNumber = async () => {
     try {
@@ -287,22 +374,31 @@ const OrderSuccessPage = () => {
     )
   }
 
-  // Automatically generate and download PDF receipt once when purchase completes
-  useEffect(() => {
-    if (!loadingPayPal && !payPalError && activeReceipt?.orderNumber) {
-      const autoKey = `auto_pdf_receipt_${activeReceipt.orderNumber}`
-      if (!sessionStorage.getItem(autoKey)) {
-        sessionStorage.setItem(autoKey, 'true')
-        try {
-          downloadReceiptPdf(activeReceipt)
-        } catch (e) {
-          console.warn('Auto PDF receipt download skipped:', e)
+  const handleDownloadReceipt = async () => {
+    if (activeReceipt.orderId && (activeReceipt.receiptToken || localStorage.getItem('token'))) {
+      try {
+        const token = localStorage.getItem('token')
+        const qs = activeReceipt.receiptToken ? `?token=${encodeURIComponent(activeReceipt.receiptToken)}` : ''
+        const res = await fetch(`${apiUrl}/orders/${encodeURIComponent(activeReceipt.orderId)}/receipt.pdf${qs}`, {
+          credentials: 'include',
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        })
+        if (res.ok) {
+          const blob = await res.blob()
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a')
+          a.href = url
+          a.download = `Receipt-${activeReceipt.orderNumber}.pdf`
+          document.body.appendChild(a)
+          a.click()
+          document.body.removeChild(a)
+          setTimeout(() => URL.revokeObjectURL(url), 1000)
+          return
         }
+      } catch {
+        // Fallback to local PDF generation
       }
     }
-  }, [loadingPayPal, payPalError, activeReceipt.orderNumber])
-
-  const handleDownloadReceipt = () => {
     downloadReceiptPdf(activeReceipt)
   }
 
@@ -338,7 +434,7 @@ const OrderSuccessPage = () => {
             Order Confirmed!
           </h1>
           <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 max-w-xl mx-auto mt-2 font-medium">
-            Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been placed and registered for express dispatch from our Nanshan, Shenzhen, Guangdong Province, China Warehouse.
+            Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been placed and scheduled for Worldwide Express Dispatch.
           </p>
 
           <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3 bg-gray-50 dark:bg-[#1a1d24] rounded-xl p-4 border border-gray-200 dark:border-neutral-800 text-left">
@@ -514,21 +610,18 @@ const OrderSuccessPage = () => {
               </div>
               <div className="grid grid-cols-12 gap-2">
                 <span className="col-span-4 sm:col-span-3 text-gray-500 dark:text-neutral-400">Refund Trans   :</span>
-                <span className="col-span-8 sm:col-span-9 text-gray-800 dark:text-neutral-200">N/A</span>
-              </div>
-              <div className="text-gray-500 dark:text-neutral-400">
-                N/A
+                <span className="col-span-8 sm:col-span-9 text-gray-800 dark:text-neutral-200">{activeReceipt.refundTrans || 'N/A'}</span>
               </div>
             </div>
 
             <div className="pt-2 border-t border-gray-200 dark:border-neutral-800 space-y-2 text-gray-600 dark:text-neutral-400 text-[10px] sm:text-[11px]">
-              <p className="font-semibold text-gray-900 dark:text-white">Full details for this order have been reviewed by user</p>
+              <p className="font-semibold text-gray-900 dark:text-white">Full details for this order have been reviewed by customer</p>
               <p className="font-semibold text-gray-800 dark:text-neutral-300">Additional Transaction Details:</p>
               <p>
-                If you've purchased a this item, it means you know the item you purchased and have agreed with our terms and conditions that says payment is non-refundable.
+                If you&apos;ve purchased this item, it means you have reviewed the selected model specifications and agreed with our terms and conditions applying to order settlement.
               </p>
               <p>
-                Feel free to contact our Customer Service via email (<span className="text-creamy-500 font-semibold underline">info-eurotopmobility@driveflyelectric.shop</span>) or WhatsApp (<a href="https://wa.me/19093088313" target="_blank" rel="noopener noreferrer" className="text-creamy-500 font-semibold underline">+1 909 308-8313</a>) if you have any questions or concerns. They're available 24/7.
+                Feel free to contact our Customer Service via email (<span className="text-creamy-500 font-semibold underline">info-eurotopmobility@driveflyelectric.shop</span>) or WhatsApp (<a href={`https://wa.me/${whatsAppDigits}`} target="_blank" rel="noopener noreferrer" className="text-creamy-500 font-semibold underline">{supportPhone}</a>) if you have any questions or concerns. We&apos;re available 24/7.
               </p>
               <p className="pt-1">Regards,<br />DriveFlyElectric Team<br /><a href="https://driveflyelectric.shop/" target="_blank" rel="noreferrer" className="text-creamy-500 font-semibold hover:underline">https://driveflyelectric.shop/</a></p>
             </div>

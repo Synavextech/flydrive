@@ -1,3 +1,5 @@
+import { getFormattedSupportWhatsApp } from '../middleware/security.js'
+
 export interface ServerOrderReceiptData {
   date: string
   orderDate: string
@@ -54,7 +56,7 @@ export const buildReceiptDataFromOrder = (
   } else if (ord.notes && ord.notes.includes('Delivery to ')) {
     const match = ord.notes.match(/Delivery to ([^.]+)/)
     if (match?.[1]) {
-      formattedAddress = `${match[1]}, United States`
+      formattedAddress = match[1].trim()
     }
   }
 
@@ -150,8 +152,8 @@ export const generateReceiptText = (r: ServerOrderReceiptData): string => {
   lines.push(
     `Full details for this order have been reviewed by user`,
     `Additional Transaction Details:`,
-    `If you've purchased a this item, it means you know the item you purchased and have agreed with our terms and conditions that says payment is non-refundable.`,
-    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (+1 978 523-6630) if you have any questions or concerns. They're available 24/7.`,
+    `If you purchased this item, it means you know the item you purchased and have agreed with our terms and conditions regarding payment and delivery.`,
+    `Feel free to contact our Customer Service via email (info-eurotopmobility@driveflyelectric.shop) or WhatsApp (${getFormattedSupportWhatsApp()}) if you have any questions or concerns.`,
     `Regards,`,
     `DriveFlyElectric Team`,
     `https://driveflyelectric.shop/`

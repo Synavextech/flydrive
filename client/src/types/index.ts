@@ -38,6 +38,8 @@ export interface Product {
   brand?: string
   isActive: boolean
   isNew: boolean
+  isComingSoon?: boolean
+  comingSoonRelease?: string | null
   shippingRequired: boolean
   averageDeliveryTime?: string
   weight?: number
@@ -146,6 +148,7 @@ export interface Order {
   paymentMethod: 'STRIPE' | 'PAYPAL'
   paymentStatus: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
   paymentId?: string
+  receiptToken?: string
   shippingAddressId?: string
   billingAddressId?: string
   notes?: string
@@ -197,11 +200,31 @@ export interface TrackedOrderDetails {
   timeline: OrderTrackingTimelineStep[]
 }
 
+export interface ProductBooking {
+  id: string
+  productId: string
+  userId?: string | null
+  fullName: string
+  email: string
+  phone?: string | null
+  country: string
+  quantity: number
+  notes?: string | null
+  status: 'PENDING' | 'CONFIRMED' | 'NOTIFIED' | 'CANCELLED'
+  bookingReference: string
+  createdAt: string
+  updatedAt?: string
+  product?: Product
+}
+
 // API Response types
 export interface ApiResponse<T> {
   success: boolean
+  message?: string
   data?: T
   error?: string
+  requiresVerification?: boolean
+  visitorToken?: string
   count?: number
   pagination?: {
     currentPage: number

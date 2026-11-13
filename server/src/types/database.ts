@@ -38,6 +38,8 @@ export interface Product {
   brand: string | null
   isActive: boolean
   isNew: boolean
+  isComingSoon?: boolean
+  comingSoonRelease?: string | null
   shippingRequired: boolean
   averageDeliveryTime: string | null
   weight: number | null
@@ -109,9 +111,26 @@ export interface ProductReview {
   updatedAt: Date
 }
 
+export interface ProductBooking {
+  id: string
+  productId: string
+  userId?: string | null
+  fullName: string
+  email: string
+  phone?: string | null
+  country: string
+  quantity: number
+  notes?: string | null
+  status: 'PENDING' | 'CONFIRMED' | 'NOTIFIED' | 'CANCELLED'
+  bookingReference: string
+  createdAt: Date
+  updatedAt: Date
+  product?: Product
+}
+
 export interface Order {
   id: string
-  userId: string
+  userId: string | null
   orderNumber: string
   trackingNumber: string
   status: OrderStatus
@@ -122,7 +141,9 @@ export interface Order {
   discount: number
   paymentMethod: PaymentMethod
   paymentStatus: PaymentStatus
+  paymentVerified?: boolean
   paymentId: string | null
+  receiptToken?: string | null
   shippingAddressId: string | null
   billingAddressId: string | null
   notes: string | null

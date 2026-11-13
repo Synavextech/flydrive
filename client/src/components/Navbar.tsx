@@ -54,6 +54,8 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
   // Persistent Order Tracking Modal state
   const [isTrackModalOpen, setIsTrackModalOpen] = useState(false)
   const [trackingInput, setTrackingInput] = useState('')
+  const [verificationInput, setVerificationInput] = useState('')
+  const [requiresVerification, setRequiresVerification] = useState(false)
   const [isTrackingLoading, setIsTrackingLoading] = useState(false)
   const [trackingError, setTrackingError] = useState<string | null>(null)
   const [trackedOrder, setTrackedOrder] = useState<TrackedOrderDetails | null>(null)
@@ -124,101 +126,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
     return list
   }, [isAuthenticated])
 
-  const buildLocalFallbackTrackedOrder = (identifier: string): TrackedOrderDetails | null => {
-    const clean = identifier.trim().replace(/^#/, '').toUpperCase()
-    try {
-      const savedList = JSON.parse(localStorage.getItem('dfe_recent_trackings') || '[]')
-      const latestReceipt = JSON.parse(localStorage.getItem('latest_order_receipt') || 'null')
-      const candidates = [...(Array.isArray(savedList) ? savedList : []), ...(latestReceipt ? [latestReceipt] : [])]
-
-      for (const c of candidates) {
-        const ordNum = String(c.orderNumber || '').toUpperCase()
-        const trkNum = String(c.trackingNumber || (ordNum ? `TRK-${ordNum}` : '')).toUpperCase()
-        if (ordNum === clean || trkNum === clean || `TRK-${ordNum}` === clean) {
-          const nowIso = new Date().toISOString()
-          const estStart = new Date(Date.now() + 12 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-          const estEnd = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-          const rawTotal = typeof c.total === 'number'
-            ? c.total
-            : c.finalCost
-            ? parseFloat(String(c.finalCost).replace(/[^0-9.]/g, '')) || 0
-            : 0
-
-          return {
-            id: ordNum,
-            orderNumber: c.orderNumber,
-            trackingNumber: c.trackingNumber || `TRK-${c.orderNumber}`,
-            status: c.status || 'PROCESSING',
-            paymentStatus: 'COMPLETED',
-            paymentMethod: 'STRIPE',
-            total: rawTotal,
-            carrier: 'DriveFlyExpress Global Freight',
-            dispatchWarehouse: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
-            destination: c.destination || c.address || 'Verified Customer Delivery Address',
-            estimatedDelivery: `${estStart} – ${estEnd}`,
-            createdAt: nowIso,
-            updatedAt: nowIso,
-            items: Array.isArray(c.items)
-              ? c.items.map((it: any, idx: number) => ({
-                  id: `item_${idx}`,
-                  name: it.name || 'DriveFlyElectric Performance Vehicle',
-                  quantity: Number(it.quantity || 1),
-                  price: typeof it.price === 'number' ? it.price : parseFloat(String(it.price || '0').replace(/[^0-9.]/g, '')) || 0,
-                  total: typeof it.total === 'number' ? it.total : parseFloat(String(it.total || '0').replace(/[^0-9.]/g, '')) || 0
-                }))
-              : [],
-            timeline: [
-              {
-                step: 1,
-                key: 'ORDER_CONFIRMED',
-                title: 'Order Confirmed & Payment Verified',
-                location: 'Austin, Texas HQ / Payment Gateway',
-                description: `Order #${c.orderNumber} logged and assigned Tracking #${c.trackingNumber || `TRK-${c.orderNumber}`}.`,
-                completed: true,
-                active: false,
-                timestamp: nowIso
-              },
-              {
-                step: 2,
-                key: 'WAREHOUSE_QC',
-                title: 'Chassis QC Inspection & Steel Crating',
-                location: 'Nanshan, Shenzhen, Guangdong Province, China Warehouse',
-                description: 'Engineering quality control, battery/powertrain diagnostics, and reinforced export crate sealing.',
-                completed: true,
-                active: true,
-                timestamp: nowIso
-              },
-              {
-                step: 3,
-                key: 'INTERNATIONAL_TRANSIT',
-                title: 'International Express Freight & Customs Clearance',
-                location: 'Global Air/Sea Express Logistics Corridor',
-                description: 'Dispatched with priority customs documentation and live freight telemetry.',
-                completed: false,
-                active: false,
-                timestamp: null
-              },
-              {
-                step: 4,
-                key: 'FINAL_DELIVERY',
-                title: 'Delivered to Destination',
-                location: c.destination || c.address || 'Customer Delivery Address',
-                description: 'Signed and delivered directly to recipient doorstep.',
-                completed: false,
-                active: false,
-                timestamp: null
-              }
-            ]
-          }
-        }
-      }
-    } catch {
-      // Ignore
-    }
-    return null
-  }
-
-  const executeTrackLookup = useCallback(async (identifierToTrack: string) => {
+  const executeTrackLookup = useCallback(async (identifierToTrack: string, overrideVerify?: string) => {
     const clean = identifierToTrack.trim()
     if (!clean) {
       setTrackingError('Please enter your Tracking Number (e.g. TRK-DFE-...) or Order Number (e.g. DFE-...).')
@@ -229,28 +137,42 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
     setTrackingError(null)
 
     try {
-      const res = await orderApi.trackOrder(clean)
+      const verifyValue = (overrideVerify ?? verificationInput).trim()
+      const savedReceiptEmail = (() => {
+        try {
+          const raw = localStorage.getItem('latest_order_receipt')
+          return raw ? JSON.parse(raw)?.customerEmail || '' : ''
+        } catch {
+          return ''
+        }
+      })()
+      const effectiveVerify = verifyValue || user?.email || savedReceiptEmail || ''
+      const verification = effectiveVerify
+        ? effectiveVerify.includes('@')
+          ? { email: effectiveVerify }
+          : { zip: effectiveVerify }
+        : undefined
+
+      const res = await orderApi.trackOrder(clean, verification)
       if (res.success && res.data) {
+        setRequiresVerification(false)
         setTrackedOrder(res.data)
         setTrackingInput(res.data.trackingNumber || clean)
         return
       }
     } catch (err: any) {
-      const fallback = buildLocalFallbackTrackedOrder(clean)
-      if (fallback) {
-        setTrackedOrder(fallback)
-        setTrackingInput(fallback.trackingNumber)
-        return
-      }
       setTrackedOrder(null)
+      if (err?.requiresVerification) {
+        setRequiresVerification(true)
+      }
       setTrackingError(
         err?.message ||
-          `No shipment found matching "${clean}". Please check your Tracking Number (TRK-DFE-...) or Order Number (DFE-...).`
+          'No matching shipment was found. Please verify your Tracking Number or Order Number and try again.'
       )
     } finally {
       setIsTrackingLoading(false)
     }
-  }, [])
+  }, [verificationInput, user?.email])
 
   const openTrackModal = useCallback(
     async (initialTrackingNum?: string) => {
@@ -305,7 +227,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
           <div className="flex items-center">
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">By management! All users should create an account to track their order progress.</span>
+              <span className="whitespace-nowrap font-extrabold">Create an account to save addresses & follow live order tracking anytime</span>
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
@@ -313,18 +235,18 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">SECURE CARD & PAYPAL CHECKOUT</span>
+              <span className="whitespace-nowrap font-extrabold">SECURE PAYPAL & CARD CHECKOUT</span>
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">HEADQUARTERS & DISPATCH: Nanshan, Shenzhen, Guangdong Province, China</span>
+              <span className="whitespace-nowrap font-extrabold">AUSTIN, TEXAS HQ • WORLDWIDE EXPRESS DISPATCH</span>
             </span>
           </div>
           {/* Duplicate track for seamless continuous loop */}
           <div className="flex items-center" aria-hidden="true">
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">By management! All users should create an account to track their order progress.</span>
+              <span className="whitespace-nowrap font-extrabold">Create an account to save addresses & follow live order tracking anytime</span>
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
@@ -332,11 +254,11 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">SECURE CARD & PAYPAL CHECKOUT</span>
+              <span className="whitespace-nowrap font-extrabold">SECURE PAYPAL & CARD CHECKOUT</span>
             </span>
             <span className="inline-flex items-center gap-6 px-6">
               <span className="h-1.5 w-1.5 shrink-0 rotate-45 bg-black/60" />
-              <span className="whitespace-nowrap font-extrabold">HEADQUARTERS & DISPATCH: Nanshan, Shenzhen, Guangdong Province, China</span>
+              <span className="whitespace-nowrap font-extrabold">AUSTIN, TEXAS HQ • WORLDWIDE EXPRESS DISPATCH</span>
             </span>
           </div>
         </div>
@@ -857,7 +779,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                   e.preventDefault()
                   executeTrackLookup(trackingInput)
                 }}
-                className="space-y-2"
+                className="space-y-2.5"
               >
                 <label className="block text-xs font-extrabold uppercase tracking-wider text-gray-600 dark:text-gray-300">
                   Enter Tracking Number or Order Number
@@ -891,6 +813,17 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                     )}
                   </button>
                 </div>
+                {(requiresVerification || !isAuthenticated) && (
+                  <div>
+                    <input
+                      type="text"
+                      value={verificationInput}
+                      onChange={(e) => setVerificationInput(e.target.value)}
+                      placeholder="Verification: Enter order email OR delivery postal/ZIP code"
+                      className="w-full px-4 py-2.5 rounded-xl bg-gray-50 dark:bg-[#1b1e28] border border-gray-300 dark:border-neutral-700 text-xs font-medium text-gray-900 dark:text-white placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-creamy-500"
+                    />
+                  </div>
+                )}
               </form>
 
               {/* Recent Tracking Numbers Quick-Select */}

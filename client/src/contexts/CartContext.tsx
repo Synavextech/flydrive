@@ -218,6 +218,7 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
           try {
             await fetch(`${API_URL}/cart/items`, {
               method: 'POST',
+              credentials: 'include',
               headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${token}`,
@@ -246,6 +247,7 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
     try {
       const token = localStorage.getItem('token')
       const response = await fetch(`${API_URL}/cart`, {
+        credentials: 'include',
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -264,16 +266,20 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
       if (response.ok && data?.data) {
         dispatch({ type: 'CART_LOADED', payload: data.data })
       } else {
-        const errMessage = data?.error || data?.message || `Failed to load cart (${response.status})`
+        const errMessage = data?.error || data?.message || 'Unable to load your saved cart right now.'
         throw new Error(errMessage)
       }
     } catch (error) {
-      dispatch({ type: 'CART_ERROR', payload: error instanceof Error ? error.message : 'Failed to load cart' })
+      dispatch({ type: 'CART_ERROR', payload: error instanceof Error ? error.message : 'Unable to load cart right now.' })
     }
   }
 
   // Add item to cart
   const addToCart = async (product: Product, quantity = 1) => {
+    if (product?.isComingSoon) {
+      dispatch({ type: 'CART_ERROR', payload: 'This upcoming model is available by reservation request only.' })
+      return
+    }
     dispatch({ type: 'ADD_ITEM', payload: { product, quantity } })
 
     // Sync with backend if user is authenticated
@@ -282,6 +288,7 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
         const token = localStorage.getItem('token')
         const response = await fetch(`${API_URL}/cart/items`, {
           method: 'POST',
+          credentials: 'include',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
@@ -310,6 +317,7 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
         const token = localStorage.getItem('token')
         await fetch(`${API_URL}/cart/items/${itemId}`, {
           method: 'DELETE',
+          credentials: 'include',
           headers: {
             Authorization: `Bearer ${token}`,
           },
@@ -335,6 +343,7 @@ export const CartProvider: React.FC<CartProviderProps> = ({ children }) => {
         const token = localStorage.getItem('token')
         await fetch(`${API_URL}/cart/items/${itemId}`, {
           method: 'PUT',
+          credentials: 'include',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,

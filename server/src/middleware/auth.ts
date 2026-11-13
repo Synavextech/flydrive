@@ -10,6 +10,14 @@ export interface AuthUser {
   lastName?: string | null
 }
 
+function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET
+  if (!secret || secret.length < 32) {
+    throw new Error('JWT_SECRET environment variable must be configured with at least 32 characters')
+  }
+  return secret
+}
+
 declare global {
   namespace Express {
     interface Request {
@@ -35,7 +43,7 @@ export const protect = async (req: Request, res: Response, next: NextFunction) =
   }
 
   try {
-    const secret = process.env.JWT_SECRET || 'your_jwt_secret_here'
+    const secret = getJwtSecret()
     const decoded = jwt.verify(token, secret) as { id: string; email: string; role: string }
 
     const user = await databaseService.findUserById(decoded.id)
@@ -89,7 +97,7 @@ export const optionalAuth = async (req: Request, res: Response, next: NextFuncti
   }
 
   try {
-    const secret = process.env.JWT_SECRET || 'your_jwt_secret_here'
+    const secret = getJwtSecret()
     const decoded = jwt.verify(token, secret) as { id: string; email: string; role: string }
     const user = await databaseService.findUserById(decoded.id)
     if (user && user.isActive) {

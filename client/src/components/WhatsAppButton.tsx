@@ -19,6 +19,7 @@ import { useProducts } from '../contexts/ProductContext'
 import { useAuth } from '../contexts/AuthContext'
 import { supportApi } from '../services/api'
 import { SupportSession, SupportSelectedProduct, SupportTopic } from '../types'
+import { getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
 const SUPPORT_TOPICS: Array<{ id: SupportTopic; label: string; icon: any }> = [
   { id: 'Item Purchase', label: 'Item Purchase', icon: ShoppingBag },
@@ -63,18 +64,12 @@ export const WhatsAppButton: React.FC = () => {
   const [visitorPhone, setVisitorPhone] = useState<string>(() => localStorage.getItem('dfe_visitor_phone') || '')
   const [messageInput, setMessageInput] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const [chatError, setChatError] = useState<string | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // Retrieve configured WhatsApp phone number
-  const rawNumber = (import.meta as any).env?.VITE_WHATSAPP_NUMBER || '19785236630'
-  let cleanNumber = String(rawNumber).replace(/\D/g, '')
-  if (!cleanNumber || cleanNumber.includes('9785236630') || cleanNumber.includes('5128903450')) {
-    cleanNumber = '19093088313'
-  }
-  if (cleanNumber.length === 10 && cleanNumber.startsWith('909')) {
-    cleanNumber = '1' + cleanNumber
-  }
+  const cleanNumber = getSupportWhatsAppDigits()
 
   // Ensure products are loaded so the catalogue picker is always populated
   useEffect(() => {
@@ -215,6 +210,7 @@ export const WhatsAppButton: React.FC = () => {
         }
       ]
     setSelectedProducts(nextList)
+    setChatError(null)
     try {
       const res = await supportApi.initSession({
         sessionId,
@@ -226,15 +222,20 @@ export const WhatsAppButton: React.FC = () => {
         topic: selectedTopic,
         selectedProducts: nextList
       })
-      if (res.success && res.data) setSession(res.data)
-    } catch {
-      // Ignore
+      if (res.success && res.data) {
+        setSession(res.data)
+      } else {
+        setChatError(res.error || 'Could not update selected items in chat session.')
+      }
+    } catch (err: any) {
+      setChatError(err?.message || 'Unable to sync selected items right now.')
     }
   }
 
   // Handle topic pill selection
   const handleSelectTopic = async (topic: SupportTopic) => {
     setSelectedTopic(topic)
+    setChatError(null)
     try {
       const res = await supportApi.initSession({
         sessionId,
@@ -246,9 +247,13 @@ export const WhatsAppButton: React.FC = () => {
         topic,
         selectedProducts
       })
-      if (res.success && res.data) setSession(res.data)
-    } catch {
-      // Ignore
+      if (res.success && res.data) {
+        setSession(res.data)
+      } else {
+        setChatError(res.error || 'Could not update inquiry topic.')
+      }
+    } catch (err: any) {
+      setChatError(err?.message || 'Unable to update inquiry topic right now.')
     }
   }
 
@@ -261,6 +266,7 @@ export const WhatsAppButton: React.FC = () => {
         ? `I am interested in [${selectedTopic}] regarding: ${selectedProducts.map(p => `${p.name} ($${Number(p.price).toLocaleString()})`).join(', ')}. Can you share availability, specs, and purchase details?`
         : `I need assistance with: ${selectedTopic}.`)
 
+    setChatError(null)
     setIsSending(true)
     try {
       const res = await supportApi.sendMessage(sessionId, {
@@ -274,9 +280,11 @@ export const WhatsAppButton: React.FC = () => {
       if (res.success && res.data) {
         setSession(res.data)
         setIsCatalogueOpen(false)
+      } else {
+        setChatError(res.error || 'Unable to submit inquiry. Please check your details and try again.')
       }
-    } catch {
-      // Ignore
+    } catch (err: any) {
+      setChatError(err?.message || 'Unable to submit inquiry. Please try again.')
     } finally {
       setIsSending(false)
     }
@@ -292,7 +300,7 @@ export const WhatsAppButton: React.FC = () => {
     if (visitorEmail) localStorage.setItem('dfe_visitor_email', visitorEmail)
     if (visitorPhone) localStorage.setItem('dfe_visitor_phone', visitorPhone)
 
-    setMessageInput('')
+    setChatError(null)
     setIsSending(true)
     try {
       const res = await supportApi.sendMessage(sessionId, {
@@ -305,9 +313,12 @@ export const WhatsAppButton: React.FC = () => {
       })
       if (res.success && res.data) {
         setSession(res.data)
+        setMessageInput('')
+      } else {
+        setChatError(res.error || 'Failed to send message. Please try again.')
       }
-    } catch {
-      // Ignore
+    } catch (err: any) {
+      setChatError(err?.message || 'Failed to send message. Please check your connection and try again.')
     } finally {
       setIsSending(false)
     }
@@ -348,7 +359,7 @@ export const WhatsAppButton: React.FC = () => {
                   </span>
                 </div>
                 <p className="text-[10px] text-gray-400">
-                  Product Inquiry, Order & System Support
+                  Order &amp; Vehicle Support
                 </p>
               </div>
             </div>
@@ -450,6 +461,7 @@ export const WhatsAppButton: React.FC = () => {
                       if (visitorName) localStorage.setItem('dfe_visitor_name', visitorName)
                       if (visitorEmail) localStorage.setItem('dfe_visitor_email', visitorEmail)
                       if (visitorPhone) localStorage.setItem('dfe_visitor_phone', visitorPhone)
+                      setChatError(null)
                       supportApi.initSession({
                         sessionId,
                         visitorId: sessionId,
@@ -460,9 +472,15 @@ export const WhatsAppButton: React.FC = () => {
                         topic: selectedTopic,
                         selectedProducts
                       }).then(res => {
-                        if (res.success && res.data) setSession(res.data)
-                      }).catch(() => { })
-                      setIsContactOpen(false)
+                        if (res.success && res.data) {
+                          setSession(res.data)
+                          setIsContactOpen(false)
+                        } else {
+                          setChatError(res.error || 'Please enter a valid email address.')
+                        }
+                      }).catch((err: any) => {
+                        setChatError(err?.message || 'Unable to save contact details right now.')
+                      })
                     }}
                     className="px-2.5 py-1 bg-creamy-500 text-black font-bold text-xs rounded-lg"
                   >
@@ -618,7 +636,7 @@ export const WhatsAppButton: React.FC = () => {
                     )}
                     {msg.senderRole === 'AI_ASSISTANT' && (
                       <span className="text-[8px] font-black uppercase px-1.5 py-0.2 rounded bg-creamy-500/20 text-creamy-500">
-                        Intelligent Concierge
+                        DriveFlyElectric Concierge
                       </span>
                     )}
                     <span className="text-[9px] text-gray-400">
@@ -640,6 +658,20 @@ export const WhatsAppButton: React.FC = () => {
             })}
             <div ref={messagesEndRef} />
           </div>
+
+          {chatError && (
+            <div className="px-3.5 py-2 bg-red-500/15 border-t border-red-500/30 flex items-center justify-between gap-2 text-[11px] font-semibold text-red-600 dark:text-red-300">
+              <span>{chatError}</span>
+              <button
+                type="button"
+                onClick={() => setChatError(null)}
+                className="p-0.5 hover:opacity-75"
+                aria-label="Dismiss chat error"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
 
           {/* Message Input Footer */}
           <form
@@ -727,7 +759,7 @@ export const WhatsAppButton: React.FC = () => {
                 }`}
             >
               <span className="w-2 h-2 rounded-full bg-creamy-400 animate-pulse" />
-              <span>LiveChat: Product & System Support</span>
+              <span>LiveChat: Order &amp; Vehicle Support</span>
             </div>
           )}
 
@@ -736,8 +768,8 @@ export const WhatsAppButton: React.FC = () => {
             onClick={() => setIsChatOpen(!isChatOpen)}
             onMouseEnter={() => setHoveredBtn('livechat')}
             onMouseLeave={() => setHoveredBtn(null)}
-            aria-label="Open Product & System Support LiveChat"
-            title="LiveChat — Product & System Support"
+            aria-label="Open Order & Vehicle Support LiveChat"
+            title="LiveChat — Order & Vehicle Support"
             className="relative flex items-center justify-center w-14 h-14 rounded-full bg-creamy-500 hover:bg-creamy-400 text-black shadow-xl shadow-creamy-500/30 hover:shadow-creamy-500/50 transition-all duration-300 hover:scale-105 active:scale-95 focus:outline-none border-2 border-white dark:border-[#13151b]"
           >
             {/* Unread Reply Or Active Indicator */}

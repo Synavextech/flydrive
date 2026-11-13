@@ -192,7 +192,7 @@ export const QuickCartDrawer: React.FC<QuickCartDrawerProps> = ({
 
               {!isAuthenticated && (
                 <div className="p-2.5 bg-creamy-500/10 border border-creamy-500/30 rounded-lg text-xs text-creamy-700 dark:text-creamy-300 flex items-center justify-between">
-                  <span>By management! Create an account to track order.</span>
+                  <span>Sign in or create an account to sync your cart & track orders.</span>
                   <span className="font-extrabold underline cursor-pointer hover:text-creamy-800 dark:hover:text-white" onClick={onPromptAuth}>Sign In</span>
                 </div>
               )}

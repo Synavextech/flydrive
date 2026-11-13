@@ -1,7 +1,8 @@
 import React, { useState } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
-import { Eye, EyeOff, LogIn, AlertCircle } from 'lucide-react'
+import { Eye, EyeOff, LogIn, AlertCircle, X, Mail, MessageSquare } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
+import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
 
 const LoginPage = () => {
   const navigate = useNavigate()
@@ -13,6 +14,10 @@ const LoginPage = () => {
     password: '',
   })
   const [showPassword, setShowPassword] = useState(false)
+  const [isForgotOpen, setIsForgotOpen] = useState(false)
+
+  const supportPhone = formatSupportPhone()
+  const whatsAppDigits = getSupportWhatsAppDigits()
 
   const from = (location.state as any)?.from?.pathname || '/'
 
@@ -129,9 +134,13 @@ const LoginPage = () => {
                 />
                 <span>Remember me</span>
               </label>
-              <a href="#forgot" className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors">
+              <button
+                type="button"
+                onClick={() => setIsForgotOpen(true)}
+                className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors"
+              >
                 Forgot password?
-              </a>
+              </button>
             </div>
 
             <div>
@@ -147,6 +156,52 @@ const LoginPage = () => {
           </form>
         </div>
       </div>
+
+      {/* Password Recovery Support Modal */}
+      {isForgotOpen && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setIsForgotOpen(false)}>
+          <div
+            className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 text-left"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-gray-200 dark:border-neutral-800 pb-3">
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-creamy-500">Account Recovery</p>
+                <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">Reset Your Password</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsForgotOpen(false)}
+                className="p-1.5 rounded-lg text-gray-400 hover:text-gray-700 dark:hover:text-white"
+                aria-label="Close recovery modal"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-gray-600 dark:text-gray-300 leading-relaxed">
+              For account security, password resets are verified through Customer Support. Reach us with your registered email address and our team will assist right away.
+            </p>
+            <div className="space-y-2.5 pt-1">
+              <a
+                href={`mailto:info-eurotopmobility@driveflyelectric.shop?subject=${encodeURIComponent('Password Reset Request — DriveFlyElectric')}&body=${encodeURIComponent(`Registered Email: ${formData.email || '(enter your email)'}`)}`}
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-xs transition-colors"
+              >
+                <Mail className="w-4 h-4" />
+                <span>Email Support (info-eurotopmobility@driveflyelectric.shop)</span>
+              </a>
+              <a
+                href={`https://wa.me/${whatsAppDigits}?text=${encodeURIComponent(`Hello DriveFlyElectric Support, I need help resetting the password for my account (${formData.email || 'email on file'}).`)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-gray-100 dark:bg-neutral-800 hover:bg-gray-200 dark:hover:bg-neutral-700 text-gray-900 dark:text-white font-bold text-xs border border-gray-200 dark:border-neutral-700 transition-colors"
+              >
+                <MessageSquare className="w-4 h-4 text-[#25D366]" />
+                <span>WhatsApp Support ({supportPhone})</span>
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

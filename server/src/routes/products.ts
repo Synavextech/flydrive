@@ -1,5 +1,6 @@
 import express from 'express'
 import multer from 'multer'
+import crypto from 'crypto'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
@@ -11,14 +12,37 @@ import {
   deleteProduct,
   getAllProductReviews,
   getProductReviews,
-  createProductReview
+  createProductReview,
+  createProductBooking
 } from '../controllers/productController.js'
 import { protect, authorize, optionalAuth } from '../middleware/auth.js'
+import { createRateLimiter, isAllowedMediaExtension, validateUploadedFiles } from '../middleware/security.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const router = express.Router()
+
+const reviewUploadRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  keyPrefix: 'review-upload',
+  message: 'Too many image uploads. Please wait a few minutes before uploading more.'
+})
+
+const reviewSubmitRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyPrefix: 'review-submit',
+  message: 'Too many review submissions. Please try again later.'
+})
+
+const bookingRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyPrefix: 'product-booking',
+  message: 'Too many booking requests from this network. Please wait a few minutes.'
+})
 
 // Configure Multer storage for customer review image uploads with dual-write into client/public/images and dist/images
 const clientImagesDir = path.resolve(__dirname, '../../../client/public/images')
@@ -36,29 +60,44 @@ const reviewStorage = multer.diskStorage({
     cb(null, clientImagesDir)
   },
   filename: (_req, file, cb) => {
-    const safeName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_')
-    cb(null, `rev_${Date.now()}_${safeName}`)
+    const ext = path.extname(file.originalname || '').toLowerCase()
+    const safeExt = ['.jpg', '.jpeg', '.png', '.webp', '.gif'].includes(ext) ? ext : '.jpg'
+    cb(null, `rev_${Date.now()}_${crypto.randomBytes(6).toString('hex')}${safeExt}`)
   }
 })
 
 const reviewUpload = multer({
   storage: reviewStorage,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB per review photo
+  limits: { fileSize: 10 * 1024 * 1024, files: 4 },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
+    if (isAllowedMediaExtension(file.originalname, file.mimetype, false)) {
       cb(null, true)
     } else {
-      cb(new Error('Only image files are allowed for review uploads.'))
+      cb(new Error('Only JPG, PNG, WEBP, or GIF images are allowed for review uploads.'))
     }
   }
 })
 
 // Public review routes (placed before /:id)
 router.get('/reviews/all', getAllProductReviews)
-router.post('/reviews/upload', reviewUpload.any(), (req, res) => {
+router.post('/reviews/upload', reviewUploadRateLimit, reviewUpload.any(), (req, res) => {
   const files = (req.files as Express.Multer.File[]) || (req.file ? [req.file] : [])
   if (!files || files.length === 0) {
     return res.status(400).json({ success: false, error: 'No review image uploaded' })
+  }
+
+  if (files.length > 4) {
+    for (const f of files) {
+      if (f.path && fs.existsSync(f.path)) {
+        try { fs.unlinkSync(f.path) } catch {}
+      }
+    }
+    return res.status(400).json({ success: false, error: 'Maximum of 4 review images allowed.' })
+  }
+
+  const validation = validateUploadedFiles(files, { allowVideos: false })
+  if (!validation.valid) {
+    return res.status(400).json({ success: false, error: validation.error })
   }
 
   const urls: string[] = []
@@ -90,10 +129,11 @@ router.post('/reviews/upload', reviewUpload.any(), (req, res) => {
   })
 })
 
-// Public product & per-product review routes
+// Public product, review & coming-soon reservation routes
 router.get('/', getProducts)
 router.get('/:id/reviews', getProductReviews)
-router.post('/:id/reviews', optionalAuth, createProductReview)
+router.post('/:id/reviews', reviewSubmitRateLimit, optionalAuth, createProductReview)
+router.post('/:id/book', bookingRateLimit, optionalAuth, createProductBooking)
 router.get('/:id', getProduct)
 
 // Protected Admin routes

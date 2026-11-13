@@ -9,10 +9,11 @@ import {
   useStripe,
   useElements
 } from '@stripe/react-stripe-js'
-import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, ShieldCheck } from 'lucide-react'
+import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, ShieldCheck, Globe, Search } from 'lucide-react'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
 import { orderApi, paymentApi, addressApi } from '../services/api'
+import { COUNTRIES, POPULAR_COUNTRY_CODES, resolveClientCountryIso2 } from '../data/countries'
 
 // Safe URL encoder for filenames with spaces or special characters
 const getSafeMediaUrl = (url?: string) => {
@@ -71,18 +72,29 @@ const CheckoutForm: React.FC = () => {
   const [createAccount, setCreateAccount] = useState(false)
   const [accountPassword, setAccountPassword] = useState('')
 
-  // Supported payment modes: Direct Card (Stripe Hosted Fields) or PayPal (Smart Button + PayPal Hosted Card Fields)
-  const [paymentMethod, setPaymentMethod] = useState<'STRIPE' | 'PAYPAL'>('STRIPE')
+  // Supported payment modes: PayPal Primary (Hosted Card Fields + Express Wallet) or Stripe Secondary Card
+  const [paymentMethod, setPaymentMethod] = useState<'PAYPAL' | 'STRIPE'>('PAYPAL')
   const [cardholderName, setCardholderName] = useState('')
+  const [countrySearch, setCountrySearch] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
   const [processingStep, setProcessingStep] = useState<string>('')
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const errorRef = useRef<HTMLDivElement>(null)
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() =>
+    typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+  )
 
-  // PayPal JS SDK state
+  // PayPal JS SDK state & container refs
   const [paypalSdkReady, setPaypalSdkReady] = useState(false)
+  const [paypalSdkStatus, setPaypalSdkStatus] = useState<'loading' | 'ready' | 'error'>('loading')
   const [paypalCardFieldsEligible, setPaypalCardFieldsEligible] = useState(false)
+  const [paypalCardFallbackReady, setPaypalCardFallbackReady] = useState(false)
   const paypalButtonsContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardFallbackContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardNameContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardNumberContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardExpiryContainerRef = useRef<HTMLDivElement>(null)
+  const paypalCardCvvContainerRef = useRef<HTMLDivElement>(null)
   const paypalCardFieldsInstanceRef = useRef<any>(null)
 
   const [shippingData, setShippingData] = useState<ShippingFormData>({
@@ -167,19 +179,49 @@ const CheckoutForm: React.FC = () => {
             }))
           }
         }
-      }).catch(() => {})
+      }).catch(() => { })
     }
   }, [user, isAuthenticated])
 
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return
+    const syncDark = () => setIsDarkMode(document.documentElement.classList.contains('dark'))
+    syncDark()
+    const observer = new MutationObserver(syncDark)
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+
+  const buildPaymentRequestPayload = useCallback(() => {
+    const { items: currentItems, shippingData: sd } = latestCheckoutRef.current
+    return {
+      items: currentItems.map(i => ({ productId: i.productId, quantity: i.quantity })),
+      customerEmail: sd.email,
+      shippingAddress: {
+        firstName: sd.firstName,
+        lastName: sd.lastName,
+        email: sd.email,
+        phone: sd.phone,
+        address1: sd.address1,
+        address2: sd.address2,
+        city: sd.city,
+        state: sd.state,
+        zipCode: sd.zipCode,
+        country: sd.country,
+        countryCode: resolveClientCountryIso2(sd.country),
+      },
+    }
+  }, [])
+
   const validateShippingBeforeCheckout = useCallback((): boolean => {
     const { shippingData: sd, isAuthenticated: isAuth, createAccount: ca, accountPassword: pwd } = latestCheckoutRef.current
-    if (!sd.firstName || !sd.lastName || !sd.email || !sd.address1 || !sd.city || !sd.zipCode) {
-      setErrorMessage('Please fill in all required delivery destination fields (First Name, Last Name, Email, Street Address, City, ZIP Code) before completing payment.')
+    if (!sd.firstName || !sd.lastName || !sd.email || !sd.address1 || !sd.city || !sd.zipCode || !sd.country) {
+      setErrorMessage('Please fill in all required delivery destination fields (First Name, Last Name, Email, Street Address, City, Postal/ZIP Code, and Country) before completing payment.')
       setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
       return false
     }
-    if (!isAuth && ca && (!pwd || pwd.length < 6)) {
-      setErrorMessage('Please provide an account password with at least 6 characters.')
+    if (!isAuth && ca && (!pwd || pwd.length < 8)) {
+      setErrorMessage('Please provide an account password with at least 8 characters.')
       setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
       return false
     }
@@ -187,7 +229,7 @@ const CheckoutForm: React.FC = () => {
     return true
   }, [])
 
-  // Unified Order Settlement Handler (Used by Stripe Card Fields, PayPal Smart Buttons, and PayPal Hosted Card Fields)
+  // Unified Order Settlement Handler (Used by PayPal Hosted Card Fields, PayPal Smart Buttons, and Stripe Card Fields)
   const finalizeSettledOrder = useCallback(async (
     settledMethod: 'STRIPE' | 'PAYPAL',
     paymentRecordId: string,
@@ -203,6 +245,7 @@ const CheckoutForm: React.FC = () => {
       estimatedTax: taxAmt
     } = latestCheckoutRef.current
 
+    const countryCode = resolveClientCountryIso2(sd.country)
     setIsProcessing(true)
     setProcessingStep('Securing your settled order & generating official PDF receipt...')
 
@@ -221,34 +264,40 @@ const CheckoutForm: React.FC = () => {
         city: sd.city,
         state: sd.state,
         postalCode: sd.zipCode,
-        country: sd.country
+        country: sd.country,
+        countryCode
       },
       createAccount: ca,
       password: ca ? pwd : undefined,
-      notes: `Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Delivery to ${sd.city}, ${sd.state} (${sd.zipCode}). Paid & Settled via ${settledMethod} (${paymentRecordId})`
+      notes: `Express Worldwide Dispatch to ${sd.city}${sd.state ? `, ${sd.state}` : ''}, ${sd.country} (${sd.zipCode}). Paid & Settled via ${settledMethod} (${paymentRecordId})`
     } as any)
 
     if ((orderRes as any).token && (orderRes as any).user) {
       setAuthenticatedUser((orderRes as any).user, (orderRes as any).token)
     }
 
-    const orderNumber = orderRes.data?.orderNumber || `DFE-${Math.floor(100000 + Math.random() * 900000)}`
+    const orderId = orderRes.data?.id || ''
+    const receiptToken = (orderRes.data as any)?.receiptToken || undefined
+    const orderNumber = orderRes.data?.orderNumber || ''
     const trackingNumber =
       orderRes.data?.trackingNumber ||
-      `TRK-DFE-${orderNumber.replace(/^DFE-?/i, '').slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`
+      (orderNumber ? `TRK-${orderNumber}` : '')
     const formattedOrderDate = new Date().toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric'
     })
-    const fullAddressString = `${sd.address1}${sd.address2 ? `, ${sd.address2}` : ''}, ${sd.city}, ${sd.state} ${sd.zipCode}, ${sd.country}`
+    const locationPart = [sd.city, sd.state, sd.zipCode].filter(Boolean).join(', ')
+    const fullAddressString = `${sd.address1}${sd.address2 ? `, ${sd.address2}` : ''}, ${locationPart}, ${sd.country}`
 
     const receiptData = {
+      orderId,
+      receiptToken,
       date: formattedOrderDate,
       orderDate: formattedOrderDate,
       orderNumber,
       trackingNumber,
-      transactionId: paymentRecordId || `TXN-${Date.now()}`,
+      transactionId: paymentRecordId,
       userName: `${sd.firstName} ${sd.lastName}`.trim() || 'Valued Customer',
       address: fullAddressString,
       paymentSource: paymentSourceLabel || (settledMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : 'PayPal Express'),
@@ -274,7 +323,7 @@ const CheckoutForm: React.FC = () => {
         trackingNumber,
         date: formattedOrderDate,
         total: finalTotal,
-        destination: `${sd.city}, ${sd.state} ${sd.zipCode}, ${sd.country}`,
+        destination: `${locationPart}, ${sd.country}`,
         status: 'PROCESSING',
         items: receiptData.items
       }
@@ -287,6 +336,8 @@ const CheckoutForm: React.FC = () => {
 
     navigate('/order-success', {
       state: {
+        orderId,
+        receiptToken,
         orderNumber,
         trackingNumber,
         total: finalTotal,
@@ -297,13 +348,28 @@ const CheckoutForm: React.FC = () => {
     })
   }, [clearCart, navigate, setAuthenticatedUser])
 
-  // Load PayPal JavaScript SDK (Smart Buttons + Expanded Checkout Hosted Card Fields)
+  // Load PayPal JavaScript SDK (Smart Buttons + Integrated Card Fields)
   useEffect(() => {
     let isMounted = true
 
+    const handleLoaded = () => {
+      if (!isMounted) return
+      if ((window as any).paypal) {
+        setPaypalSdkStatus('ready')
+        setPaypalSdkReady(true)
+      } else {
+        setPaypalSdkStatus('error')
+      }
+    }
+
+    const handleFailed = () => {
+      if (!isMounted) return
+      setPaypalSdkStatus('error')
+    }
+
     const loadPayPalSdk = async () => {
       if ((window as any).paypal) {
-        if (isMounted) setPaypalSdkReady(true)
+        handleLoaded()
         return
       }
 
@@ -317,52 +383,194 @@ const CheckoutForm: React.FC = () => {
           if (cfgRes.data.paypalClientToken) clientToken = cfgRes.data.paypalClientToken
         }
       } catch {
-        // Use fallback clientId
+        // Use fallback clientId from client environment
       }
 
       const existingScript = document.getElementById('dfe-paypal-js-sdk') as HTMLScriptElement | null
       if (existingScript) {
-        existingScript.addEventListener('load', () => {
-          if (isMounted) setPaypalSdkReady(true)
-        })
+        existingScript.addEventListener('load', handleLoaded)
+        existingScript.addEventListener('error', handleFailed)
+        return
+      }
+
+      if (!clientId) {
+        handleFailed()
         return
       }
 
       const script = document.createElement('script')
       script.id = 'dfe-paypal-js-sdk'
-      script.src = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=USD&intent=capture&components=buttons,card-fields&enable-funding=paylater,venmo`
+      script.src = `https://www.paypal.com/sdk/js?client-id=${encodeURIComponent(clientId)}&currency=USD&intent=capture&components=buttons,card-fields&enable-funding=paylater,venmo,card`
       script.async = true
       if (clientToken) {
         script.setAttribute('data-client-token', clientToken)
       }
-      script.onload = () => {
-        if (isMounted) setPaypalSdkReady(true)
-      }
-      script.onerror = () => {
-        console.warn('PayPal JS SDK script could not be loaded; fallback redirect remains active.')
-      }
+      script.addEventListener('load', handleLoaded)
+      script.addEventListener('error', handleFailed)
       document.body.appendChild(script)
     }
 
     loadPayPalSdk()
     return () => {
       isMounted = false
+      const existingScript = document.getElementById('dfe-paypal-js-sdk') as HTMLScriptElement | null
+      if (existingScript) {
+        existingScript.removeEventListener('load', handleLoaded)
+        existingScript.removeEventListener('error', handleFailed)
+      }
     }
   }, [])
 
-  // Render PayPal Smart Buttons ("Pay with PayPal") & Expanded Checkout Hosted Card Fields when SDK is ready
+  // Mount PayPal Integrated Card Fields + Smart Buttons when SDK is ready
+  // All container divs stay mounted (CSS visibility toggles when switching tabs) so iframes never orphan or fail to render.
   useEffect(() => {
     const paypal = (window as any).paypal
     if (!paypalSdkReady || !paypal || items.length === 0) return
 
-    // 1. Render "Pay with PayPal" Smart Button
+    let cancelled = false
+    const closables: Array<{ close?: () => Promise<void> }> = []
+
+    const createOrderFromCart = async (validateFirst = false) => {
+      if (validateFirst && !validateShippingBeforeCheckout()) {
+        throw new Error('VALIDATION_HANDLED')
+      }
+      setProcessingStep('Creating encrypted PayPal USD order...')
+      const res = await paymentApi.createPayPalOrder(buildPaymentRequestPayload())
+      if (!res.success || !res.data?.orderId) {
+        throw new Error(res.error || 'Could not initialize PayPal order.')
+      }
+      return res.data.orderId
+    }
+
+    const captureAndSettle = async (orderID: string, sourceLabel: string) => {
+      try {
+        setIsProcessing(true)
+        setProcessingStep('Capturing & verifying PayPal settlement...')
+        const capRes = await paymentApi.capturePayPalPayment(orderID)
+        if (!capRes.success) {
+          throw new Error(capRes.error || 'Failed to capture PayPal payment.')
+        }
+        const txId = capRes.data?.paymentId || orderID
+        await finalizeSettledOrder('PAYPAL', txId, sourceLabel)
+      } catch (err: any) {
+        setIsProcessing(false)
+        setErrorMessage(err?.message || 'PayPal payment capture failed.')
+        setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      }
+    }
+
+    // 1. Mount PayPal Integrated Hosted Card Fields if eligible on merchant account
+    let hostedCardFieldsActive = false
+    if (paypal.CardFields) {
+      try {
+        const cardFields = paypal.CardFields({
+          style: {
+            input: {
+              'font-size': '14px',
+              'font-family': 'Inter, system-ui, sans-serif',
+              color: '#111827',
+              padding: '8px 6px'
+            },
+            '.invalid': {
+              color: '#dc2626'
+            }
+          },
+          createOrder: () => createOrderFromCart(true),
+          onApprove: (data: any) => captureAndSettle(data.orderID, 'Card via PayPal Card Fields'),
+          onError: (err: any) => {
+            setIsProcessing(false)
+            const msg = String(err?.message || err || '')
+            if (msg.includes('VALIDATION_HANDLED')) return
+            setErrorMessage(msg || 'Card authorization failed. Please review your card details and try again.')
+            setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+          }
+        })
+
+        if (cardFields && cardFields.isEligible()) {
+          hostedCardFieldsActive = true
+          setPaypalCardFieldsEligible(true)
+          paypalCardFieldsInstanceRef.current = cardFields
+
+          const mountTargets = [
+            { field: cardFields.NameField({ placeholder: 'Name on card' }), el: paypalCardNameContainerRef.current },
+            { field: cardFields.NumberField({ placeholder: '1234 5678 9012 3456' }), el: paypalCardNumberContainerRef.current },
+            { field: cardFields.ExpiryField({ placeholder: 'MM / YY' }), el: paypalCardExpiryContainerRef.current },
+            { field: cardFields.CVVField({ placeholder: 'CVV' }), el: paypalCardCvvContainerRef.current },
+          ]
+
+          mountTargets.forEach(({ field, el }) => {
+            if (el && field) {
+              el.innerHTML = ''
+              field.render(el).catch((renderErr: any) => {
+                console.warn('PayPal CardField render notice:', renderErr)
+              })
+            }
+          })
+        } else {
+          setPaypalCardFieldsEligible(false)
+          paypalCardFieldsInstanceRef.current = null
+        }
+      } catch (e) {
+        console.warn('PayPal CardFields initialization notice:', e)
+        setPaypalCardFieldsEligible(false)
+        paypalCardFieldsInstanceRef.current = null
+      }
+    } else {
+      setPaypalCardFieldsEligible(false)
+    }
+
+    // 2. If Advanced CardFields isn't merchant-eligible, render PayPal's native inline Card Funding Button
+    if (!hostedCardFieldsActive && paypal.Buttons && paypalCardFallbackContainerRef.current) {
+      paypalCardFallbackContainerRef.current.innerHTML = ''
+      try {
+        const cardFundingSource = paypal.FUNDING?.CARD
+        if (cardFundingSource) {
+          const cardButton = paypal.Buttons({
+            fundingSource: cardFundingSource,
+            style: {
+              layout: 'vertical',
+              color: 'black',
+              shape: 'rect',
+              height: 44
+            },
+            onClick: (_data: any, actions: any) => {
+              if (!validateShippingBeforeCheckout()) {
+                return actions.reject()
+              }
+              return actions.resolve()
+            },
+            createOrder: () => createOrderFromCart(false),
+            onApprove: (data: any) => captureAndSettle(data.orderID, 'Debit / Credit Card (PayPal)'),
+            onError: (err: any) => {
+              setIsProcessing(false)
+              if (err?.message && !String(err.message).includes('VALIDATION_HANDLED')) {
+                setErrorMessage(err.message)
+              }
+            }
+          })
+          if (cardButton.isEligible() && !cancelled) {
+            closables.push(cardButton)
+            setPaypalCardFallbackReady(true)
+            cardButton.render(paypalCardFallbackContainerRef.current).catch(() => { })
+          } else {
+            setPaypalCardFallbackReady(false)
+          }
+        }
+      } catch (e) {
+        console.warn('PayPal Card Button fallback notice:', e)
+        setPaypalCardFallbackReady(false)
+      }
+    }
+
+    // 3. Render PayPal Express Wallet Button ("Pay with PayPal") cleanly without duplicating the Card button
     if (paypal.Buttons && paypalButtonsContainerRef.current) {
       paypalButtonsContainerRef.current.innerHTML = ''
       try {
-        const buttons = paypal.Buttons({
+        const walletButton = paypal.Buttons({
+          ...(paypal.FUNDING?.PAYPAL ? { fundingSource: paypal.FUNDING.PAYPAL } : {}),
           style: {
             layout: 'vertical',
-            color: 'silver',
+            color: 'gold',
             shape: 'rect',
             label: 'paypal',
             height: 44
@@ -373,192 +581,98 @@ const CheckoutForm: React.FC = () => {
             }
             return actions.resolve()
           },
-          createOrder: async () => {
-            const { grandTotal: totalToCharge, shippingData: sd } = latestCheckoutRef.current
-            setProcessingStep('Creating PayPal USD order...')
-            const res = await paymentApi.createPayPalOrder(totalToCharge, sd.email)
-            if (!res.success || !res.data?.orderId) {
-              throw new Error(res.error || 'Could not initialize PayPal order.')
-            }
-            return res.data.orderId
-          },
-          onApprove: async (data: any) => {
-            try {
-              setIsProcessing(true)
-              setProcessingStep('Capturing PayPal payment...')
-              const capRes = await paymentApi.capturePayPalPayment(data.orderID)
-              if (!capRes.success) {
-                throw new Error(capRes.error || 'Failed to capture PayPal order.')
-              }
-              const txId = capRes.data?.paymentId || data.orderID
-              await finalizeSettledOrder('PAYPAL', txId, 'PayPal Express (JS SDK)')
-            } catch (err: any) {
-              setIsProcessing(false)
-              setErrorMessage(err.message || 'PayPal payment capture failed.')
-            }
-          },
+          createOrder: () => createOrderFromCart(false),
+          onApprove: (data: any) => captureAndSettle(data.orderID, 'PayPal Express Wallet'),
           onError: (err: any) => {
-            console.warn('PayPal Buttons notice:', err)
+            console.warn('PayPal Express notice:', err)
           }
         })
-        if (buttons.isEligible()) {
-          buttons.render(paypalButtonsContainerRef.current).catch(() => {})
+        if (walletButton.isEligible() && !cancelled) {
+          closables.push(walletButton)
+          walletButton.render(paypalButtonsContainerRef.current).catch(() => { })
         }
       } catch (e) {
-        console.warn('PayPal Buttons render notice:', e)
+        console.warn('PayPal Wallet button notice:', e)
       }
     }
 
-    // 2. Render PayPal Expanded Checkout Hosted Card Fields if eligible on merchant account
-    if (paypal.CardFields) {
-      try {
-        const cardFields = paypal.CardFields({
-          createOrder: async () => {
-            if (!validateShippingBeforeCheckout()) {
-              throw new Error('Missing required shipping address fields.')
-            }
-            const { grandTotal: totalToCharge, shippingData: sd } = latestCheckoutRef.current
-            const res = await paymentApi.createPayPalOrder(totalToCharge, sd.email)
-            if (!res.success || !res.data?.orderId) {
-              throw new Error(res.error || 'Failed to create order for CardFields.')
-            }
-            return res.data.orderId
-          },
-          onApprove: async (data: any) => {
-            try {
-              setIsProcessing(true)
-              setProcessingStep('Capturing card payment via PayPal Expanded Checkout...')
-              const capRes = await paymentApi.capturePayPalPayment(data.orderID)
-              if (!capRes.success) {
-                throw new Error(capRes.error || 'Card capture failed.')
-              }
-              const txId = capRes.data?.paymentId || data.orderID
-              await finalizeSettledOrder('PAYPAL', txId, 'Card via PayPal Expanded Checkout')
-            } catch (err: any) {
-              setIsProcessing(false)
-              setErrorMessage(err.message || 'Card payment capture failed.')
-            }
-          },
-          onError: (err: any) => {
-            setIsProcessing(false)
-            setErrorMessage(err?.message || 'Card authorization failed.')
-          }
-        })
-
-        if (cardFields.isEligible()) {
-          setPaypalCardFieldsEligible(true)
-          paypalCardFieldsInstanceRef.current = cardFields
-          const nameContainer = document.getElementById('paypal-card-name-container')
-          const numberContainer = document.getElementById('paypal-card-number-container')
-          const expiryContainer = document.getElementById('paypal-card-expiry-container')
-          const cvvContainer = document.getElementById('paypal-card-cvv-container')
-          if (nameContainer && numberContainer && expiryContainer && cvvContainer) {
-            nameContainer.innerHTML = ''
-            numberContainer.innerHTML = ''
-            expiryContainer.innerHTML = ''
-            cvvContainer.innerHTML = ''
-            cardFields.NameField().render('#paypal-card-name-container').catch(() => {})
-            cardFields.NumberField().render('#paypal-card-number-container').catch(() => {})
-            cardFields.ExpiryField().render('#paypal-card-expiry-container').catch(() => {})
-            cardFields.CVVField().render('#paypal-card-cvv-container').catch(() => {})
-          }
+    return () => {
+      cancelled = true
+      closables.forEach((instance) => {
+        if (instance && typeof instance.close === 'function') {
+          instance.close().catch(() => { })
         }
-      } catch {
-        setPaypalCardFieldsEligible(false)
-      }
+      })
+      paypalCardFieldsInstanceRef.current = null
+        ;[
+          paypalCardNameContainerRef.current,
+          paypalCardNumberContainerRef.current,
+          paypalCardExpiryContainerRef.current,
+          paypalCardCvvContainerRef.current,
+          paypalCardFallbackContainerRef.current,
+          paypalButtonsContainerRef.current,
+        ].forEach((el) => {
+          if (el) el.innerHTML = ''
+        })
     }
-  }, [paypalSdkReady, items.length, validateShippingBeforeCheckout, finalizeSettledOrder])
+  }, [paypalSdkReady, items.length, validateShippingBeforeCheckout, buildPaymentRequestPayload, finalizeSettledOrder])
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target
     if (errorMessage) setErrorMessage(null)
-    setShippingData(prev => ({
-      ...prev,
-      [name]: value
-    }))
+    setShippingData(prev => {
+      if (name === 'country') {
+        if (value !== 'United States' && prev.state === 'TX') {
+          return { ...prev, country: value, state: '' }
+        }
+        if (value === 'United States' && !prev.state) {
+          return { ...prev, country: value, state: 'TX' }
+        }
+      }
+      return {
+        ...prev,
+        [name]: value
+      }
+    })
   }
 
-  // Primary Submit Handler supporting Direct Card (Stripe Hosted Fields), PayPal Hosted Card Fields, and PayPal Redirect Fallback
+  // Primary Submit Handler supporting PayPal Integrated Card Fields, PayPal Portal Redirect, and Stripe Card Elements
   const handlePayment = async () => {
     if (!validateShippingBeforeCheckout()) return
+
+    const countryCode = resolveClientCountryIso2(shippingData.country)
+    const paymentPayload = buildPaymentRequestPayload()
 
     setErrorMessage(null)
     setIsProcessing(true)
 
     try {
-      if (paymentMethod === 'STRIPE') {
-        if (!stripe || !elements) {
-          throw new Error('Stripe Card Gateway is initializing. Please wait a moment and try again.')
-        }
-
-        const cardNumberElement = elements.getElement(CardNumberElement)
-        if (!cardNumberElement) {
-          throw new Error('Card input fields are not ready. Please refresh the page.')
-        }
-
-        setProcessingStep('Initializing secure USD card transaction with Stripe...')
-        const intentRes = await paymentApi.createStripePaymentIntent(grandTotal, shippingData.email)
-        if (!intentRes.success || !intentRes.data?.clientSecret) {
-          throw new Error(intentRes.error || 'Failed to initialize card payment with Stripe.')
-        }
-
-        const clientSecret = intentRes.data.clientSecret
-
-        setProcessingStep('Authorizing card with your bank (3D-Secure)...')
-        const confirmResult = await stripe.confirmCardPayment(clientSecret, {
-          payment_method: {
-            card: cardNumberElement,
-            billing_details: {
-              name: cardholderName.trim() || `${shippingData.firstName} ${shippingData.lastName}`.trim(),
-              email: shippingData.email,
-              phone: shippingData.phone || undefined,
-              address: {
-                line1: shippingData.address1,
-                line2: shippingData.address2 || undefined,
-                city: shippingData.city,
-                state: shippingData.state,
-                postal_code: shippingData.zipCode,
-                country: 'US'
-              }
+      if (paymentMethod === 'PAYPAL') {
+        if (paypalCardFieldsEligible && paypalCardFieldsInstanceRef.current) {
+          if (typeof paypalCardFieldsInstanceRef.current.getState === 'function') {
+            const cardState = await paypalCardFieldsInstanceRef.current.getState().catch(() => null)
+            if (cardState && cardState.isFormValid === false) {
+              throw new Error('Please enter valid cardholder name, card number, expiration date, and security code (CVV) in the PayPal Card Fields.')
             }
           }
-        })
 
-        if (confirmResult.error) {
-          throw new Error(confirmResult.error.message || 'Card authorization was declined. Please check your card details or use PayPal below.')
-        }
-
-        if (!confirmResult.paymentIntent || confirmResult.paymentIntent.status !== 'succeeded') {
-          throw new Error(`Payment could not be completed. Status: ${confirmResult.paymentIntent?.status || 'unconfirmed'}`)
-        }
-
-        // Confirm on backend to log real-time capture event
-        await paymentApi.confirmStripePayment(confirmResult.paymentIntent.id).catch(() => {})
-
-        await finalizeSettledOrder('STRIPE', confirmResult.paymentIntent.id, 'Credit / Debit Card (Stripe)')
-        return
-      }
-
-      if (paymentMethod === 'PAYPAL') {
-        // If PayPal Expanded Checkout Hosted Card Fields are mounted and user submitted via main button
-        if (paypalCardFieldsEligible && paypalCardFieldsInstanceRef.current) {
-          setProcessingStep('Submitting card via PayPal Expanded Checkout...')
+          setProcessingStep('Authorizing card via PayPal Card Fields...')
           await paypalCardFieldsInstanceRef.current.submit({
             billingAddress: {
               addressLine1: shippingData.address1,
               addressLine2: shippingData.address2 || undefined,
-              adminArea1: shippingData.state,
+              adminArea1: shippingData.state || undefined,
               adminArea2: shippingData.city,
               postalCode: shippingData.zipCode,
-              countryCode: 'US'
+              countryCode
             }
           })
           return
         }
 
-        // Otherwise create PayPal order and redirect to PayPal approval URL (or capture directly)
+        // Redirect fallback or direct order settlement when Hosted CardFields isn't active
         setProcessingStep('Connecting to PayPal Express Checkout...')
-        const ppRes = await paymentApi.createPayPalOrder(grandTotal, shippingData.email)
+        const ppRes = await paymentApi.createPayPalOrder(paymentPayload)
         if (!ppRes.success || !ppRes.data?.orderId) {
           throw new Error(ppRes.error || 'Failed to connect to PayPal.')
         }
@@ -580,11 +694,11 @@ const CheckoutForm: React.FC = () => {
               city: shippingData.city,
               state: shippingData.state,
               postalCode: shippingData.zipCode,
-              country: shippingData.country
+              country: shippingData.country,
+              countryCode
             },
-            createAccount,
-            password: createAccount ? accountPassword : undefined,
-            notes: `Nanshan, Shenzhen, Guangdong Province, China Warehouse Express Delivery to ${shippingData.city}, ${shippingData.state} (${shippingData.zipCode}). Paid & Settled via PAYPAL (${ppOrderId})`
+            createAccount: false,
+            notes: `Express Worldwide Dispatch to ${shippingData.city}${shippingData.state ? `, ${shippingData.state}` : ''}, ${shippingData.country} (${shippingData.zipCode}). Paid & Settled via PAYPAL (${ppOrderId})`
           }
 
           localStorage.setItem('pending_paypal_order', JSON.stringify({
@@ -594,8 +708,7 @@ const CheckoutForm: React.FC = () => {
             shippingCost,
             tax: estimatedTax,
             shippingData,
-            createAccount,
-            accountPassword,
+            createAccount: false,
             items: items.map(i => ({
               productId: i.productId,
               name: i.product.name,
@@ -613,6 +726,59 @@ const CheckoutForm: React.FC = () => {
           throw new Error(captureRes.error || 'PayPal capture failed.')
         }
         await finalizeSettledOrder('PAYPAL', captureRes.data?.paymentId || ppOrderId, 'PayPal Express')
+        return
+      }
+
+      if (paymentMethod === 'STRIPE') {
+        if (!stripe || !elements) {
+          throw new Error('Stripe Card Gateway is initializing. Please wait a moment and try again.')
+        }
+
+        const cardNumberElement = elements.getElement(CardNumberElement)
+        if (!cardNumberElement) {
+          throw new Error('Card input fields are not ready. Please refresh the page.')
+        }
+
+        setProcessingStep('Initializing secure USD card transaction with Stripe...')
+        const intentRes = await paymentApi.createStripePaymentIntent(paymentPayload)
+        if (!intentRes.success || !intentRes.data?.clientSecret) {
+          throw new Error(intentRes.error || 'Failed to initialize card payment with Stripe.')
+        }
+
+        const clientSecret = intentRes.data.clientSecret
+
+        setProcessingStep('Authorizing card with your bank (3D-Secure)...')
+        const confirmResult = await stripe.confirmCardPayment(clientSecret, {
+          payment_method: {
+            card: cardNumberElement,
+            billing_details: {
+              name: cardholderName.trim() || `${shippingData.firstName} ${shippingData.lastName}`.trim(),
+              email: shippingData.email,
+              phone: shippingData.phone || undefined,
+              address: {
+                line1: shippingData.address1,
+                line2: shippingData.address2 || undefined,
+                city: shippingData.city,
+                state: shippingData.state || undefined,
+                postal_code: shippingData.zipCode,
+                country: countryCode
+              }
+            }
+          }
+        })
+
+        if (confirmResult.error) {
+          throw new Error(confirmResult.error.message || 'Card authorization was declined. Please check your card details or use PayPal.')
+        }
+
+        if (!confirmResult.paymentIntent || confirmResult.paymentIntent.status !== 'succeeded') {
+          throw new Error(`Payment could not be completed. Status: ${confirmResult.paymentIntent?.status || 'unconfirmed'}`)
+        }
+
+        await paymentApi.confirmStripePayment(confirmResult.paymentIntent.id).catch(() => { })
+
+        await finalizeSettledOrder('STRIPE', confirmResult.paymentIntent.id, 'Credit / Debit Card (Stripe)')
+        return
       }
     } catch (error: any) {
       console.error('Payment checkout error:', error)
@@ -630,7 +796,7 @@ const CheckoutForm: React.FC = () => {
     style: {
       base: {
         fontSize: '14px',
-        color: '#f3f4f6',
+        color: isDarkMode ? '#f3f4f6' : '#111827',
         '::placeholder': {
           color: '#9ca3af',
         },
@@ -711,7 +877,7 @@ const CheckoutForm: React.FC = () => {
               <div className="flex items-center justify-between mb-5 border-b border-gray-100 dark:border-neutral-800 pb-3">
                 <h2 className="text-base font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-2">
                   <Truck className="w-5 h-5 text-creamy-500" />
-                  1. Delivery Destination (USA & Global)
+                  1. Delivery Destination (Please Ensure accurate delivery details for shipping)
                 </h2>
                 <span className="text-[11px] text-gray-400 font-bold uppercase tracking-widest">* Required</span>
               </div>
@@ -810,15 +976,14 @@ const CheckoutForm: React.FC = () => {
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">State / Region *</label>
+                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">State / Province / Region</label>
                     <input
                       type="text"
                       name="state"
-                      placeholder="TX"
+                      placeholder="TX / Province / Region"
                       value={shippingData.state}
                       onChange={handleInputChange}
                       className={inputClasses}
-                      required
                     />
                   </div>
                   <div>
@@ -836,20 +1001,88 @@ const CheckoutForm: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">Country *</label>
-                  <select
-                    name="country"
-                    value={shippingData.country}
-                    onChange={handleInputChange}
-                    className={inputClasses}
-                  >
-                    <option value="United States">United States</option>
-                    <option value="Canada">Canada</option>
-                    <option value="United Kingdom">United Kingdom</option>
-                    <option value="Australia">Australia</option>
-                    <option value="Germany">Germany</option>
-                    <option value="Other">Other International Destination</option>
-                  </select>
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-1.5">
+                    <label className="text-xs font-bold text-gray-700 dark:text-gray-300 flex items-center gap-1.5">
+                      <Globe className="w-3.5 h-3.5 text-creamy-500" />
+                      <span>Country / Destination *</span>
+                      <span className="ml-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-gray-100 dark:bg-neutral-800 text-gray-500 dark:text-gray-400">
+                        ISO: {resolveClientCountryIso2(shippingData.country)}
+                      </span>
+                    </label>
+                    <div className="relative sm:w-56">
+                      <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={countrySearch}
+                        onChange={(e) => setCountrySearch(e.target.value)}
+                        placeholder="Filter all countries..."
+                        aria-label="Filter countries"
+                        className="w-full pl-8 pr-2.5 py-1 bg-gray-50 dark:bg-[#1a1d24] border border-gray-300 dark:border-neutral-700 rounded-lg text-[11px] text-gray-900 dark:text-white placeholder:text-gray-400 focus:outline-none focus:ring-1 focus:ring-creamy-500"
+                      />
+                    </div>
+                  </div>
+                  {(() => {
+                    const normalizedQuery = countrySearch.trim().toLowerCase()
+                    const popularCountries = POPULAR_COUNTRY_CODES
+                      .map((code) => COUNTRIES.find((c) => c.code === code))
+                      .filter((c): c is NonNullable<typeof c> => Boolean(c))
+                    const filteredCountries = normalizedQuery
+                      ? COUNTRIES.filter(
+                        (c) =>
+                          c.name.toLowerCase().includes(normalizedQuery) ||
+                          c.code.toLowerCase() === normalizedQuery
+                      )
+                      : COUNTRIES
+                    const hasSelectedInFiltered = filteredCountries.some(
+                      (c) => c.name === shippingData.country
+                    )
+
+                    return (
+                      <select
+                        name="country"
+                        value={shippingData.country}
+                        onChange={handleInputChange}
+                        className={inputClasses}
+                        required
+                      >
+                        {!normalizedQuery ? (
+                          <>
+                            <optgroup label="Popular Destinations">
+                              {popularCountries.map((country) => (
+                                <option key={`pop-${country.code}`} value={country.name}>
+                                  {country.name} ({country.code})
+                                </option>
+                              ))}
+                            </optgroup>
+                            <optgroup label={`All Countries & Territories (${COUNTRIES.length})`}>
+                              {COUNTRIES.map((country) => (
+                                <option key={country.code} value={country.name}>
+                                  {country.name} ({country.code})
+                                </option>
+                              ))}
+                            </optgroup>
+                          </>
+                        ) : (
+                          <>
+                            {!hasSelectedInFiltered && shippingData.country && (
+                              <option value={shippingData.country}>{shippingData.country}</option>
+                            )}
+                            {filteredCountries.length > 0 ? (
+                              filteredCountries.map((country) => (
+                                <option key={country.code} value={country.name}>
+                                  {country.name} ({country.code})
+                                </option>
+                              ))
+                            ) : (
+                              <option value={shippingData.country} disabled>
+                                No matching country found — clear filter to view all
+                              </option>
+                            )}
+                          </>
+                        )}
+                      </select>
+                    )
+                  })()}
                 </div>
 
                 {/* Inline Account Creation for Guest / New Shoppers */}
@@ -874,7 +1107,7 @@ const CheckoutForm: React.FC = () => {
                         </label>
                         <input
                           type="password"
-                          placeholder="Choose password (at least 6 characters)"
+                          placeholder="Choose password (at least 8 characters)"
                           value={accountPassword}
                           onChange={(e) => setAccountPassword(e.target.value)}
                           className={inputClasses}
@@ -889,73 +1122,209 @@ const CheckoutForm: React.FC = () => {
               </form>
             </div>
 
-            {/* 2. Payment Method — Direct Card Input Fields Alongside PayPal JS SDK ("Pay with PayPal" + Expanded Card Fields) */}
+            {/* 2. Payment Method — PayPal Primary (Integrated Card Fields + Wallet) & Stripe Secondary Card */}
             <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-6 transition-colors">
               <div className="flex items-center justify-between mb-4 border-b border-gray-100 dark:border-neutral-800 pb-3">
                 <h2 className="text-base font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-2">
                   <CreditCard className="w-5 h-5 text-creamy-500" />
-                  2. Payment Method (Card or PayPal)
+                  2. Payment Method
                 </h2>
                 <span className="text-[10px] uppercase font-bold text-creamy-500 bg-creamy-500/10 px-2 py-0.5 rounded">
                   USD ($) Encrypted
                 </span>
               </div>
 
-              {/* Express "Pay with PayPal" Smart Button Rendered Directly Above / Alongside Card Fields */}
-              <div className="mb-5 p-4 rounded-xl bg-gray-50 dark:bg-[#1a1d24] border border-gray-200 dark:border-neutral-800">
-                <div className="flex items-center justify-between mb-2.5">
-                  <div className="flex items-center gap-2">
-                    <div className="w-5 h-5 rounded bg-[#003087] flex items-center justify-center font-black text-white text-[11px]">
-                      P
-                    </div>
-                    <span className="text-xs font-extrabold uppercase tracking-wider text-gray-900 dark:text-white">
-                      Express Pay with PayPal / Pay Later
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-bold text-emerald-500 flex items-center gap-1">
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    PayPal Buyer Protection
-                  </span>
-                </div>
-
-                {/* Official PayPal JavaScript SDK Buttons Container */}
-                <div ref={paypalButtonsContainerRef} className="min-h-[46px]" />
-
-                {!paypalSdkReady && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPaymentMethod('PAYPAL')
-                      handlePayment()
-                    }}
-                    className="w-full py-3 px-4 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black text-xs uppercase tracking-wider shadow-sm transition-all flex items-center justify-center gap-2"
-                  >
-                    <span>Pay with PayPal ({formatPrice(grandTotal)})</span>
-                  </button>
-                )}
-              </div>
-
-              <div className="relative flex py-1 items-center mb-5">
-                <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
-                <span className="flex-shrink mx-3 text-[10px] font-black uppercase tracking-widest text-gray-400">
-                  Or Pay Directly With Credit / Debit Card
-                </span>
-                <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
-              </div>
-
               <div className="space-y-4">
-                {/* Option 1: Direct Credit / Debit Card Input Fields (Hosted Card Fields) */}
+                {/* Option 1 (Primary): PayPal Checkout — Integrated Card Processing & Express Wallet */}
                 <div
                   onClick={() => {
-                    if (paymentMethod !== 'STRIPE') setPaymentMethod('STRIPE')
+                    if (paymentMethod !== 'PAYPAL') {
+                      setPaymentMethod('PAYPAL')
+                      if (errorMessage) setErrorMessage(null)
+                    }
                   }}
-                  className={`p-4 border rounded-xl transition-all cursor-pointer ${
-                    paymentMethod === 'STRIPE'
-                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
-                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
-                  }`}
+                  className={`p-4 border rounded-xl transition-all cursor-pointer ${paymentMethod === 'PAYPAL'
+                    ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
                 >
-                  <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        name="paymentMethod"
+                        value="PAYPAL"
+                        checked={paymentMethod === 'PAYPAL'}
+                        onChange={() => {
+                          setPaymentMethod('PAYPAL')
+                          if (errorMessage) setErrorMessage(null)
+                        }}
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                      />
+                      <div className="w-6 h-6 rounded bg-[#003087] flex items-center justify-center font-black text-white text-xs shrink-0">
+                        P
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="font-bold text-sm text-gray-900 dark:text-white">
+                            Pay with Card or PayPal Wallet
+                          </p>
+                          <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-creamy-500/20 text-creamy-600 dark:text-creamy-400">
+                            Primary Checkout
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Visa, Mastercard, Amex, Discover via PayPal Card Fields — or PayPal / Pay Later / Venmo
+                        </p>
+                      </div>
+                    </div>
+                    <div className="hidden sm:flex items-center gap-1 text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 shrink-0">
+                      <ShieldCheck className="w-3 h-3" />
+                      <span>Buyer Protected</span>
+                    </div>
+                  </div>
+
+                  {/* Keep PayPal iframe containers permanently mounted in the DOM and toggle via CSS */}
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className={
+                      paymentMethod === 'PAYPAL'
+                        ? 'mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-4 cursor-default'
+                        : 'hidden'
+                    }
+                  >
+                    {/* Section A: Card Checkout via PayPal */}
+                    <div className="p-3.5 rounded-xl bg-gray-50 dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-extrabold uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-1.5">
+                          <CreditCard className="w-4 h-4 text-creamy-500" />
+                          Credit or Debit Card (PayPal Secure Card Fields)
+                        </span>
+                        <span className="text-[10px] font-bold text-emerald-500 flex items-center gap-1">
+                          <Lock className="w-3 h-3" />
+                          256-Bit SSL
+                        </span>
+                      </div>
+
+                      {paypalSdkStatus === 'loading' && (
+                        <div className="space-y-2.5 animate-pulse py-1">
+                          <div className="h-10 rounded-xl bg-gray-200 dark:bg-neutral-800" />
+                          <div className="h-10 rounded-xl bg-gray-200 dark:bg-neutral-800" />
+                          <div className="grid grid-cols-2 gap-3">
+                            <div className="h-10 rounded-xl bg-gray-200 dark:bg-neutral-800" />
+                            <div className="h-10 rounded-xl bg-gray-200 dark:bg-neutral-800" />
+                          </div>
+                          <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                            Initializing encrypted PayPal Card Fields...
+                          </p>
+                        </div>
+                      )}
+
+                      {/* PayPal ACDC Hosted Card Fields containers */}
+                      <div className={paypalSdkStatus === 'ready' && paypalCardFieldsEligible ? 'space-y-3' : 'hidden'}>
+                        <div>
+                          <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                            Cardholder Name *
+                          </label>
+                          <div
+                            id="paypal-card-name-container"
+                            ref={paypalCardNameContainerRef}
+                            className="min-h-[46px] w-full bg-white rounded-xl px-2.5 py-0.5 border border-gray-300 dark:border-neutral-600 focus-within:ring-2 focus-within:ring-creamy-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                            Card Number *
+                          </label>
+                          <div
+                            id="paypal-card-number-container"
+                            ref={paypalCardNumberContainerRef}
+                            className="min-h-[46px] w-full bg-white rounded-xl px-2.5 py-0.5 border border-gray-300 dark:border-neutral-600 focus-within:ring-2 focus-within:ring-creamy-500"
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                              Expiration Date (MM/YY) *
+                            </label>
+                            <div
+                              id="paypal-card-expiry-container"
+                              ref={paypalCardExpiryContainerRef}
+                              className="min-h-[46px] w-full bg-white rounded-xl px-2.5 py-0.5 border border-gray-300 dark:border-neutral-600 focus-within:ring-2 focus-within:ring-creamy-500"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
+                              Security Code (CVV) *
+                            </label>
+                            <div
+                              id="paypal-card-cvv-container"
+                              ref={paypalCardCvvContainerRef}
+                              className="min-h-[46px] w-full bg-white rounded-xl px-2.5 py-0.5 border border-gray-300 dark:border-neutral-600 focus-within:ring-2 focus-within:ring-creamy-500"
+                            />
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                          Click <strong>Confirm &amp; Pay</strong> on the right to authorize card charges in USD for delivery to{' '}
+                          <span className="font-semibold text-gray-700 dark:text-gray-200">{shippingData.country}</span>.
+                        </p>
+                      </div>
+
+                      {/* PayPal Integrated Card Smart Button Fallback when ACDC Hosted CardFields isn't active on merchant ID */}
+                      <div
+                        className={
+                          paypalSdkStatus === 'ready' && !paypalCardFieldsEligible
+                            ? 'space-y-2'
+                            : 'hidden'
+                        }
+                      >
+                        <div ref={paypalCardFallbackContainerRef} className="min-h-[44px]" />
+                        {!paypalCardFallbackReady && (
+                          <p className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-2">
+                            <CheckCircle className="w-4 h-4 text-emerald-500 shrink-0" />
+                            <span>
+                              Use the <strong>PayPal</strong> wallet button below, click <strong>Continue &amp; Pay via PayPal</strong> on the right, or enter card details directly via <strong>Stripe</strong> below.
+                            </span>
+                          </p>
+                        )}
+                      </div>
+
+                      {paypalSdkStatus === 'error' && (
+                        <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/40 text-[11px] text-amber-800 dark:text-amber-300">
+                          PayPal embedded SDK is currently blocked or unavailable in your browser. You can still click{' '}
+                          <strong>Continue &amp; Pay via PayPal</strong> on the right to complete payment securely at PayPal.com, or select <strong>Stripe Direct Card</strong> below.
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Section B: Express PayPal Wallet */}
+                    <div className="space-y-2">
+                      <div className="relative flex py-0.5 items-center">
+                        <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
+                        <span className="flex-shrink mx-3 text-[10px] font-black uppercase tracking-widest text-gray-400">
+                          Or Express PayPal Wallet
+                        </span>
+                        <div className="flex-grow border-t border-gray-200 dark:border-neutral-800" />
+                      </div>
+                      <div ref={paypalButtonsContainerRef} className="min-h-[46px]" />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Option 2 (Secondary): Direct Credit / Debit Card via Stripe Hosted Elements */}
+                <div
+                  onClick={() => {
+                    if (paymentMethod !== 'STRIPE') {
+                      setPaymentMethod('STRIPE')
+                      if (errorMessage) setErrorMessage(null)
+                    }
+                  }}
+                  className={`p-4 border rounded-xl transition-all cursor-pointer ${paymentMethod === 'STRIPE'
+                    ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
                     <div className="flex items-center gap-3">
                       <input
                         type="radio"
@@ -971,10 +1340,10 @@ const CheckoutForm: React.FC = () => {
                       <CreditCard className="w-5 h-5 text-creamy-500" />
                       <div>
                         <p className="font-bold text-sm text-gray-900 dark:text-white">
-                          Credit or Debit Card (Direct Hosted Card Fields)
+                          Credit or Debit Card (Stripe Gateway)
                         </p>
                         <p className="text-[11px] text-gray-500 dark:text-neutral-400">
-                          Visa, Mastercard, American Express, Discover — Instant 3D-Secure Authorization
+                          Alternative card checkout — Visa, Mastercard, Amex, Discover with 3D-Secure
                         </p>
                       </div>
                     </div>
@@ -985,7 +1354,10 @@ const CheckoutForm: React.FC = () => {
                   </div>
 
                   {paymentMethod === 'STRIPE' && (
-                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3.5">
+                    <div
+                      onClick={(e) => e.stopPropagation()}
+                      className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3.5 cursor-default"
+                    >
                       <div>
                         <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">
                           Name on Card *
@@ -1026,85 +1398,6 @@ const CheckoutForm: React.FC = () => {
                           </div>
                         </div>
                       </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Option 2: PayPal Expanded Checkout / Portal Option */}
-                <div
-                  onClick={() => {
-                    if (paymentMethod !== 'PAYPAL') setPaymentMethod('PAYPAL')
-                  }}
-                  className={`p-4 border rounded-xl transition-all cursor-pointer ${
-                    paymentMethod === 'PAYPAL'
-                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
-                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="radio"
-                        name="paymentMethod"
-                        value="PAYPAL"
-                        checked={paymentMethod === 'PAYPAL'}
-                        onChange={() => {
-                          setPaymentMethod('PAYPAL')
-                          if (errorMessage) setErrorMessage(null)
-                        }}
-                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
-                      />
-                      <div className="w-6 h-6 rounded bg-[#003087] flex items-center justify-center font-black text-white text-xs">
-                        P
-                      </div>
-                      <div>
-                        <p className="font-bold text-sm text-gray-900 dark:text-white">
-                          PayPal Expanded Checkout {paypalCardFieldsEligible ? '& Hosted Card Fields' : '& Wallet'}
-                        </p>
-                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
-                          Pay with PayPal Balance, Pay Later, Venmo, or PayPal Hosted Card Processing
-                        </p>
-                      </div>
-                    </div>
-                    <span className="text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-creamy-100 dark:bg-creamy-900/40 text-creamy-700 dark:text-creamy-300">
-                      PayPal SDK
-                    </span>
-                  </div>
-
-                  {paymentMethod === 'PAYPAL' && (
-                    <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3">
-                      {paypalCardFieldsEligible ? (
-                        <div className="space-y-3">
-                          <p className="text-[11px] text-gray-500 dark:text-gray-400 font-semibold">
-                            Enter your card in PayPal Hosted Card Fields below or click the PayPal button above:
-                          </p>
-                          <div>
-                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Cardholder Name</label>
-                            <div id="paypal-card-name-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
-                          </div>
-                          <div>
-                            <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Card Number</label>
-                            <div id="paypal-card-number-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
-                          </div>
-                          <div className="grid grid-cols-2 gap-3">
-                            <div>
-                              <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">Expiration Date</label>
-                              <div id="paypal-card-expiry-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
-                            </div>
-                            <div>
-                              <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 mb-1">CVV</label>
-                              <div id="paypal-card-cvv-container" className="min-h-[42px] bg-white rounded-xl px-2 border border-gray-300" />
-                            </div>
-                          </div>
-                        </div>
-                      ) : (
-                        <p className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-2">
-                          <CheckCircle className="w-4 h-4 text-emerald-500 flex-shrink-0" />
-                          <span>
-                            Use the interactive <strong>Pay with PayPal</strong> button above for instant in-page checkout, or click <strong>Confirm & Pay with PayPal</strong> on the right to complete via PayPal's portal.
-                          </span>
-                        </p>
-                      )}
                     </div>
                   )}
                 </div>
@@ -1209,14 +1502,18 @@ const CheckoutForm: React.FC = () => {
                   </>
                 ) : (
                   <span>
-                    Confirm & Pay {formatPrice(grandTotal)} with {paymentMethod === 'STRIPE' ? 'Card' : 'PayPal'}
+                    {paymentMethod === 'PAYPAL'
+                      ? paypalCardFieldsEligible
+                        ? `Confirm & Pay ${formatPrice(grandTotal)} with Card (PayPal)`
+                        : `Continue & Pay ${formatPrice(grandTotal)} via PayPal`
+                      : `Confirm & Pay ${formatPrice(grandTotal)} with Card (Stripe)`}
                   </span>
                 )}
               </button>
 
               <div className="mt-4 p-3 bg-gray-50 dark:bg-[#1a1d24] rounded-xl border border-gray-200 dark:border-neutral-800 text-[10px] text-gray-500 dark:text-gray-400 space-y-1">
                 <p className="font-bold text-gray-700 dark:text-gray-300">DriveFlyElectric Express Dispatch</p>
-                <p>Nanshan, Shenzhen, Guangdong Province, China Warehouse • North America HQ: Austin, TX</p>
+                <p>Austin, TX HQ • Worldwide Express Crate Delivery</p>
                 <p>Orders include an official PDF Purchase Receipt & 12-month factory warranty.</p>
               </div>
             </div>

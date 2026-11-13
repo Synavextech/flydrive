@@ -1,5 +1,15 @@
 import { Request, Response } from 'express'
+import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
+
+const addToCartSchema = z.object({
+  productId: z.string().trim().min(1, 'Product ID is required.').max(100),
+  quantity: z.coerce.number().int('Quantity must be a whole number.').min(1, 'Minimum quantity is 1.').max(50, 'Maximum quantity per item is 50.').default(1)
+})
+
+const updateCartItemSchema = z.object({
+  quantity: z.coerce.number().int('Quantity must be a whole number.').min(1, 'Quantity must be at least 1.').max(50, 'Maximum quantity per item is 50.')
+})
 
 // @desc    Get user's cart
 // @route   GET /api/cart
@@ -18,7 +28,7 @@ export const getCart = async (req: Request, res: Response) => {
     console.error('Error fetching cart:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to load shopping cart.'
     })
   }
 }
@@ -28,8 +38,16 @@ export const getCart = async (req: Request, res: Response) => {
 // @access  Private
 export const addToCart = async (req: Request, res: Response) => {
   try {
+    const parsed = addToCartSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid cart item payload.'
+      })
+    }
+
     const userId = req.user!.id
-    const { productId, quantity = 1 } = req.body
+    const { productId, quantity } = parsed.data
 
     // Validate product exists and is active
     const product = await databaseService.findProductById(productId)
@@ -43,14 +61,25 @@ export const addToCart = async (req: Request, res: Response) => {
     if (!product.isActive) {
       return res.status(400).json({
         success: false,
-        error: 'Product is not available'
+        error: 'Product is not currently available for purchase.'
       })
     }
 
-    if (product.stock < quantity) {
+    if (product.isComingSoon) {
       return res.status(400).json({
         success: false,
-        error: 'Insufficient stock'
+        error: 'This upcoming vehicle is not yet open for direct cart checkout. Use Book Now to reserve an alert.'
+      })
+    }
+
+    const existingCart = await databaseService.findOrCreateCart(userId)
+    const existingItem = existingCart.items?.find((item: any) => item.productId === productId)
+    const cumulativeQty = (existingItem ? Number(existingItem.quantity) : 0) + quantity
+
+    if (product.stock < cumulativeQty) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient stock. Only ${product.stock} unit(s) available.`
       })
     }
 
@@ -65,7 +94,7 @@ export const addToCart = async (req: Request, res: Response) => {
     console.error('Error adding to cart:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to add item to cart.'
     })
   }
 }
@@ -75,15 +104,16 @@ export const addToCart = async (req: Request, res: Response) => {
 // @access  Private
 export const updateCartItem = async (req: Request, res: Response) => {
   try {
-    const { quantity } = req.body
-    const cartItemId = req.params.itemId
-
-    if (quantity <= 0) {
+    const parsed = updateCartItemSchema.safeParse(req.body)
+    if (!parsed.success) {
       return res.status(400).json({
         success: false,
-        error: 'Quantity must be greater than 0'
+        error: parsed.error.issues[0]?.message || 'Invalid quantity specified.'
       })
     }
+
+    const { quantity } = parsed.data
+    const cartItemId = req.params.itemId
 
     // Check if cart item exists and belongs to user
     const cartItem = await databaseService.prisma.cartItem.findUnique({
@@ -107,10 +137,17 @@ export const updateCartItem = async (req: Request, res: Response) => {
 
     // Check stock availability
     const product = await databaseService.findProductById(cartItem.productId)
-    if (!product || product.stock < quantity) {
+    if (!product || !product.isActive || product.isComingSoon) {
       return res.status(400).json({
         success: false,
-        error: 'Insufficient stock'
+        error: 'This product is no longer available for direct purchase.'
+      })
+    }
+
+    if (product.stock < quantity) {
+      return res.status(400).json({
+        success: false,
+        error: `Insufficient stock. Only ${product.stock} unit(s) available.`
       })
     }
 
@@ -125,7 +162,7 @@ export const updateCartItem = async (req: Request, res: Response) => {
     console.error('Error updating cart item:', error)
     res.status(500).json({
       success: false,
-      error: 'Server Error'
+      error: 'Unable to update cart item.'
     })
   }
 }

@@ -152,7 +152,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
       }
 
       if (!response.ok) {
-        const errMessage = data?.error || data?.message || `Failed to fetch products (${response.status} ${response.statusText || 'Error'})`
+        const errMessage = data?.error || data?.message || 'Unable to load catalog inventory right now. Please try again.'
         throw new Error(errMessage)
       }
 
@@ -170,7 +170,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
     } catch (error) {
       dispatch({
         type: 'PRODUCTS_ERROR',
-        payload: error instanceof Error ? error.message : 'Failed to fetch products',
+        payload: error instanceof Error ? error.message : 'Unable to load catalog inventory right now.',
       })
     }
   }, [state.selectedCategory, state.searchQuery, API_URL])
@@ -199,7 +199,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
 
       if (!response.ok) {
         if (!cached) {
-          const errMessage = data?.error || data?.message || `Failed to fetch product (${response.status} ${response.statusText || 'Error'})`
+          const errMessage = data?.error || data?.message || 'Product details could not be loaded.'
           throw new Error(errMessage)
         }
         return
@@ -215,7 +215,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
       if (!cached) {
         dispatch({
           type: 'PRODUCTS_ERROR',
-          payload: error instanceof Error ? error.message : 'Failed to fetch product',
+          payload: error instanceof Error ? error.message : 'Product details could not be loaded.',
         })
       }
     }
@@ -235,61 +235,6 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
 
   const [reviewsByProduct, setReviewsByProduct] = useState<Record<string, ProductReview[]>>({})
   const [reviewsLoading, setReviewsLoading] = useState(false)
-
-  const buildBaselineReviews = useCallback((product: Product): ProductReview[] => {
-    const productName = product.name || 'Electric Vehicle'
-    const shortName = productName.split('(')[0].trim()
-    const category = (product.category || '').toLowerCase()
-    const thumb = product.images?.[0] || ''
-    const thumb2 = product.images?.[1] || thumb
-
-    const reviewerProfiles = category.includes('heli')
-      ? [
-          { name: 'Capt. Henrik Lindqvist', rating: 5, title: 'Flight-ready assembly & telemetry stability', comment: `Took delivery of the ${shortName} in Gothenburg. Rotor balance, avionics harness, and battery thermal curve passed pre-flight checks smoothly.`, daysAgo: 6 },
-          { name: 'Marcus Vance', rating: 5, title: 'Crating protection exceeded expectations', comment: `Arrived in a custom steel-framed crate with torque sheets and inspection certificates. Zero transit scuffs and whisper-quiet hover spool-up.`, daysAgo: 14 },
-          { name: 'Dr. Kenji Takahashi', rating: 5, title: 'Responsive flight controller & clean wiring', comment: `Inspected the brushless drive bus and triple-redundant ESCs on arrival. Build finish on the ${shortName} airframe feels aerospace grade.`, daysAgo: 23 },
-          { name: 'Elena Rostova', rating: 4, title: 'Detailed handover docs & spare hardware', comment: `Customs clearance took two extra days on our end, but the Shenzhen dispatch team provided full packing specs and spare fasteners.`, daysAgo: 35 },
-          { name: 'David Al-Mansoor', rating: 5, title: 'Precision pitch response out of the crate', comment: `Very happy with the cockpit instrumentation and fast-charge deck on the ${shortName}. Support answered our setup call within 15 minutes.`, daysAgo: 47 },
-        ]
-      : category.includes('microcar') || category.includes('cabin')
-      ? [
-          { name: 'Sophie Laurent', rating: 5, title: 'Compact footprint, remarkably quiet cabin', comment: `The ${shortName} handles narrow city streets effortlessly. Regenerative braking and A/C cabin sealing are surprisingly refined.`, daysAgo: 4 },
-          { name: 'Thomas Becker', rating: 5, title: 'Great commuter range & easy home charging', comment: `Plugs straight into our standard garage outlet overnight. Paint gloss, door latches, and digital dash on the ${shortName} arrived spotless.`, daysAgo: 11 },
-          { name: 'Priya Nair', rating: 5, title: 'Smooth suspension over cobblestones', comment: `Ordered for campus shuttle duty and the turning radius is unbeatable. Backup camera and hill-hold engage reliably every time.`, daysAgo: 19 },
-          { name: 'Carlos Mendoza', rating: 4, title: 'Solid steel frame & bright LED projector beams', comment: `Shipping crate kept the windshield and bodywork immaculate. Took about an hour to unwrap and complete the battery master check.`, daysAgo: 29 },
-          { name: 'Hannah Okafor', rating: 5, title: 'Low running cost & responsive brakes', comment: `Zero emissions for daily errands and plenty of cargo room behind the seats. Tracking updates stayed accurate all the way to port.`, daysAgo: 41 },
-        ]
-      : category.includes('kart')
-      ? [
-          { name: 'Lukas Meyer', rating: 5, title: 'Instant electric torque off every apex', comment: `The ${shortName} launches out of tight hairpins with zero lag. Hydraulic disc bite and tubular chassis stiffness feel track-bred.`, daysAgo: 5 },
-          { name: 'Devon Brooks', rating: 5, title: 'Swappable pack makes track days nonstop', comment: `We run our ${shortName} all weekend at the circuit. Controller thermal protection never throttled even in 34°C ambient heat.`, daysAgo: 13 },
-          { name: 'Matteo Rossi', rating: 5, title: 'Welds and steering geometry are dialed in', comment: `Unboxed ready to roll after checking tire pressures. Adjustable pedal slider fits both teens and adult drivers comfortably.`, daysAgo: 22 },
-          { name: 'Nadia Al-Khaled', rating: 4, title: 'Clean cable routing & strong drift grip', comment: `Great power delivery across all three speed modes. Wish a spare rear sprocket came in the box, otherwise a 10/10 build.`, daysAgo: 31 },
-          { name: 'Jordan Kim', rating: 5, title: 'Built like a serious motorsport machine', comment: `Purchased two ${shortName} units for private coaching. Zero chain noise—just pure electric acceleration and crisp turn-in.`, daysAgo: 44 },
-        ]
-      : [
-          { name: 'Oliver Grant', rating: 5, title: 'Torque, range, and finish punch above weight', comment: `Tested the ${shortName} over mixed hills right after delivery. Frame welds, battery lock, and controller mapping are rock solid.`, daysAgo: 7 },
-          { name: 'Amina Diallo', rating: 5, title: 'Arrived 95% assembled & tuned', comment: `Only needed 20 minutes with the included hex toolkit. Braking modulation and headlight cutoff are super crisp for night riding.`, daysAgo: 16 },
-          { name: 'Rafael Costa', rating: 5, title: 'Real-world range matches spec sheet', comment: `Getting full advertised mileage in mix of eco and sport assist on my ${shortName}. Display stays readable even in direct midday sun.`, daysAgo: 25 },
-          { name: 'Claire Beaumont', rating: 4, title: 'Sturdy utility rack & smooth hub drive', comment: `Hauls groceries and work gear without bogging down on 12% grades. Heavy-duty packaging prevented any shipping scratches.`, daysAgo: 34 },
-          { name: 'Ethan Patel', rating: 5, title: 'Reliable daily rider with instant tracking support', comment: `Battery clicks cleanly into the downtube and charges fast. Best build quality I have seen in this electric class.`, daysAgo: 48 },
-        ]
-
-    const baseDate = new Date('2026-10-20T14:30:00.000Z').getTime()
-    return reviewerProfiles.map((profile, idx) => ({
-      id: `verified-${product.id}-${idx + 1}`,
-      productId: product.id,
-      userId: null,
-      reviewerName: profile.name,
-      reviewerEmail: null,
-      rating: profile.rating,
-      title: profile.title,
-      comment: profile.comment,
-      images: idx === 0 && thumb ? [thumb] : idx === 2 && thumb2 ? [thumb2] : [],
-      verifiedPurchase: true,
-      createdAt: new Date(baseDate - profile.daysAgo * 86400000).toISOString(),
-    }))
-  }, [])
 
   const fetchAllReviews = useCallback(async () => {
     try {
@@ -333,19 +278,9 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
 
   const getReviewsForProduct = useCallback(
     (product: Product): ProductReview[] => {
-      const dbReviews = reviewsByProduct[product.id] || []
-      const baseline = buildBaselineReviews(product)
-      const seenIds = new Set(dbReviews.map((r) => r.id))
-      const combined = [...dbReviews]
-      for (const b of baseline) {
-        if (combined.length >= 5) break
-        if (!seenIds.has(b.id)) {
-          combined.push(b)
-        }
-      }
-      return combined
+      return reviewsByProduct[product.id] || []
     },
-    [reviewsByProduct, buildBaselineReviews]
+    [reviewsByProduct]
   )
 
   const submitProductReview = useCallback(
@@ -354,7 +289,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
       if (files && files.length > 0) {
         const uploadResponse = await reviewApi.uploadReviewImages(files)
         if (!uploadResponse.success) {
-          throw new Error(uploadResponse.message || 'Failed to upload review images')
+          throw new Error(uploadResponse.error || uploadResponse.message || 'Failed to upload review images')
         }
         uploadedUrls = uploadResponse.data?.urls || (uploadResponse.data?.url ? [uploadResponse.data.url] : [])
       }
@@ -366,7 +301,7 @@ export const ProductProvider: React.FC<ProductProviderProps> = ({ children }) =>
       })
 
       if (!response.success || !response.data) {
-        throw new Error(response.message || 'Failed to save review')
+        throw new Error(response.error || response.message || 'Failed to save review')
       }
 
       const created = response.data

@@ -2,22 +2,36 @@ import { Request, Response } from 'express'
 import { Event, EventsQuery, EventsResponse } from '../types/events.js'
 import { supabase } from '../utils/supabase.js'
 
+const INTERNAL_EVENT_CATEGORIES = new Set([
+  'LIVECHAT_SESSION',
+  'PRODUCT_REVIEW',
+  'PRODUCT_BOOKING'
+])
+
 /**
  * GET /api/events
- * Query real events from Supabase database (zero mock data)
+ * Query public events from Supabase database (excluding internal chat/review/booking records)
  */
 export const getEvents = async (req: Request, res: Response) => {
   try {
     const query = req.query as EventsQuery
     const { view, category, limit = 10, offset = 0 } = query
 
+    if (category && INTERNAL_EVENT_CATEGORIES.has(String(category).trim().toUpperCase())) {
+      return res.json({
+        events: [],
+        total: 0,
+        hasMore: false
+      })
+    }
+
     let queryBuilder = supabase
       .from('events')
       .select('*', { count: 'exact' })
-      .neq('category', 'LIVECHAT_SESSION')
+      .or('category.is.null,and(category.neq.LIVECHAT_SESSION,category.neq.PRODUCT_REVIEW,category.neq.PRODUCT_BOOKING)')
 
     if (category) {
-      queryBuilder = queryBuilder.ilike('category', category)
+      queryBuilder = queryBuilder.ilike('category', String(category).trim().slice(0, 60))
     }
 
     if (view && view.toLowerCase() !== 'all') {
@@ -29,8 +43,8 @@ export const getEvents = async (req: Request, res: Response) => {
       }
     }
 
-    const from = Number(offset) || 0
-    const limitNum = Number(limit) || 10
+    const from = Math.max(0, Number(offset) || 0)
+    const limitNum = Math.min(100, Math.max(1, Number(limit) || 10))
     const to = from + limitNum - 1
 
     queryBuilder = queryBuilder.range(from, to).order('date', { ascending: true })
@@ -38,7 +52,6 @@ export const getEvents = async (req: Request, res: Response) => {
     const { data, count, error } = await queryBuilder
 
     if (error) {
-      // Return clean empty payload if events table is empty or uninitialized
       console.warn('Notice from Supabase events query:', error.message)
       const emptyResponse: EventsResponse = {
         events: [],
@@ -71,13 +84,13 @@ export const getEvents = async (req: Request, res: Response) => {
     res.json(response)
   } catch (error) {
     console.error('Error fetching events:', error)
-    res.status(500).json({ error: 'Internal server error' })
+    res.status(500).json({ error: 'Unable to load events.' })
   }
 }
 
 /**
  * GET /api/events/:id
- * Query single event by ID from Supabase
+ * Query single public event by ID from Supabase
  */
 export const getEventById = async (req: Request, res: Response) => {
   try {
@@ -89,7 +102,11 @@ export const getEventById = async (req: Request, res: Response) => {
       .eq('id', id)
       .maybeSingle()
 
-    if (error || !data) {
+    if (
+      error ||
+      !data ||
+      (data.category && INTERNAL_EVENT_CATEGORIES.has(String(data.category).trim().toUpperCase()))
+    ) {
       return res.status(404).json({ error: 'Event not found' })
     }
 
@@ -109,6 +126,6 @@ export const getEventById = async (req: Request, res: Response) => {
     res.json(event)
   } catch (error) {
     console.error('Error fetching event by ID:', error)
-    res.status(500).json({ error: 'Internal server error' })
+    res.status(500).json({ error: 'Unable to load event.' })
   }
 }
