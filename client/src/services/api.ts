@@ -11,7 +11,15 @@ import {
   SupportSession,
   SupportSelectedProduct,
   AdminAnalyticsData,
-  ProductViewSource
+  ProductViewSource,
+  PaymentOptionsConfig,
+  WalletSummary,
+  Wallet,
+  WalletTransaction,
+  ReturnRequest,
+  ReturnReasonType,
+  EligibleExchangeResponse,
+  ActiveShippingSummary
 } from '../types'
 import { setSupportContactEmail } from '../utils/receiptPdf'
 
@@ -283,8 +291,17 @@ export const cartApi = {
 // Order API functions
 export const orderApi = {
   // Get user's orders
-  getOrders: async (): Promise<ApiResponse<Order[]>> => {
-    return apiRequest('/orders')
+  getOrders: async (params?: {
+    limit?: number
+    page?: number
+    status?: Order['status']
+  }): Promise<ApiResponse<Order[]>> => {
+    const searchParams = new URLSearchParams()
+    if (params?.limit) searchParams.set('limit', String(params.limit))
+    if (params?.page) searchParams.set('page', String(params.page))
+    if (params?.status) searchParams.set('status', params.status)
+    const qs = searchParams.toString()
+    return apiRequest(`/orders${qs ? `?${qs}` : ''}`)
   },
 
   // Get single order
@@ -318,10 +335,11 @@ export const orderApi = {
       lastName?: string
       phone?: string
     }
-    paymentMethod: 'STRIPE' | 'PAYPAL'
+    paymentMethod: 'STRIPE' | 'PAYPAL' | 'WALLET'
     paymentId?: string
     paymentStatus?: string
     paypalOrderId?: string
+    useWallet?: boolean
     createAccount?: boolean
     password?: string
     notes?: string
@@ -335,6 +353,11 @@ export const orderApi = {
       method: 'POST',
       body: JSON.stringify(orderData),
     })
+  },
+
+  // Get authenticated user's active shipping orders (PROCESSING / SHIPPED)
+  getActiveShipping: async (): Promise<ApiResponse<ActiveShippingSummary>> => {
+    return apiRequest('/orders/active-shipping')
   },
 
   // Update order status (admin only)
@@ -453,6 +476,29 @@ export const adminApi = {
   // Get storefront traffic, product checks, and order analytics
   getAnalytics: async (days: number = 30): Promise<ApiResponse<AdminAnalyticsData>> => {
     return apiRequest(`/admin/analytics?days=${encodeURIComponent(String(days))}`)
+  },
+
+  // Get checkout payment gateway availability flags & shopper warnings
+  getPaymentOptions: async (): Promise<ApiResponse<PaymentOptionsConfig>> => {
+    return apiRequest('/admin/payment-options')
+  },
+
+  // Toggle checkout payment option availability & update shopper warning message
+  updatePaymentOptions: async (payload: {
+    paypalAvailable?: boolean
+    paypalNotice?: string
+    stripeAvailable?: boolean
+    stripeNotice?: string
+  }): Promise<ApiResponse<PaymentOptionsConfig>> => {
+    const res = await apiRequest<PaymentOptionsConfig>('/admin/payment-options', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+    if (res.success) {
+      cachedPaymentConfigPromise = null
+      cachedPaymentConfigTimestamp = 0
+    }
+    return res
   },
 
   // Products management (Admin)
@@ -581,7 +627,8 @@ export const adminApi = {
     onActivity: (event: any) => void,
     onConnectionChange?: (connected: boolean) => void,
     onSupportSync?: (payload: { sessionId: string; type?: string; session?: SupportSession }) => void,
-    onAnalyticsSync?: (payload: { kind: string; data?: any; timestamp?: string }) => void
+    onAnalyticsSync?: (payload: { kind: string; data?: any; timestamp?: string }) => void,
+    onPaymentConfigSync?: (payload: { config?: PaymentOptionsConfig; timestamp?: string }) => void
   ): (() => void) => {
     let closed = false
     let controller: AbortController | null = null
@@ -644,6 +691,8 @@ export const adminApi = {
                 onSupportSync?.(parsed)
               } else if (eventName === 'analytics_sync') {
                 onAnalyticsSync?.(parsed)
+              } else if (eventName === 'payment_config_sync') {
+                onPaymentConfigSync?.(parsed)
               } else if (parsed && parsed.id) {
                 onActivity(parsed)
               }
@@ -710,6 +759,71 @@ export const adminApi = {
       body: JSON.stringify({ status }),
     })
   },
+
+  // 21-Day Return requests & Customer Wallet management (admin)
+  getReturns: async (status?: string): Promise<ApiResponse<ReturnRequest[]>> => {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : ''
+    return apiRequest(`/admin/returns${qs}`)
+  },
+
+  processReturn: async (
+    id: string,
+    payload: {
+      action: 'APPROVE_SAME_DAY_WALLET_REFUND' | 'APPROVE_EXCHANGE' | 'MARK_RETURN_RECEIVED_COMPLETE' | 'REJECT'
+      adminNotes?: string
+      returnTrackingNumber?: string
+    }
+  ): Promise<ApiResponse<ReturnRequest>> => {
+    return apiRequest(`/admin/returns/${encodeURIComponent(id)}/process`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  getWallets: async (): Promise<ApiResponse<Array<Wallet & { user?: Partial<User>; recentTransactions?: WalletTransaction[] }>>> => {
+    return apiRequest('/admin/wallets')
+  },
+
+  adjustWallet: async (
+    userId: string,
+    payload: { direction: 'CREDIT' | 'DEBIT'; amount: number; description: string }
+  ): Promise<ApiResponse<any>> => {
+    return apiRequest(`/admin/wallets/${encodeURIComponent(userId)}/adjust`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+}
+
+// Customer Wallet API functions
+export const walletApi = {
+  getWallet: async (): Promise<ApiResponse<WalletSummary>> => {
+    return apiRequest('/wallet')
+  },
+}
+
+// Customer 21-Day Return & Exchange API functions
+export const returnsApi = {
+  getMyReturns: async (): Promise<ApiResponse<ReturnRequest[]>> => {
+    return apiRequest('/returns')
+  },
+
+  getEligibleExchangeProducts: async (orderId: string): Promise<ApiResponse<EligibleExchangeResponse>> => {
+    return apiRequest(`/returns/eligible-products/${encodeURIComponent(orderId)}`)
+  },
+
+  submitReturnRequest: async (payload: {
+    orderId: string
+    reasonType: ReturnReasonType
+    reasonDetails?: string
+    exchangeProductId?: string | null
+    returnTrackingNumber?: string | null
+  }): Promise<ApiResponse<ReturnRequest>> => {
+    return apiRequest('/returns', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
 }
 
 // Public Client LiveChat & Support API functions
@@ -730,6 +844,10 @@ export const supportApi = {
     return storedToken ? `${base}?token=${encodeURIComponent(storedToken)}` : base
   },
 
+  getMySessions: async (): Promise<ApiResponse<SupportSession[]>> => {
+    return apiRequest('/support/my-sessions')
+  },
+
   initSession: async (payload: {
     sessionId?: string
     visitorId?: string
@@ -739,6 +857,7 @@ export const supportApi = {
     visitorPhone?: string
     topic?: string
     selectedProducts?: SupportSelectedProduct[]
+    activeOrderId?: string | null
     resumeOnly?: boolean
   }): Promise<ApiResponse<SupportSession | null>> => {
     const existingId = payload.sessionId
@@ -866,6 +985,7 @@ export const supportApi = {
       content: string
       topic?: string
       selectedProducts?: SupportSelectedProduct[]
+      activeOrderId?: string | null
       visitorName?: string
       visitorEmail?: string
       visitorPhone?: string
@@ -903,6 +1023,7 @@ type PaymentConfigPayload = {
   paypalMode: string
   paypalClientToken?: string | null
   supportEmail?: string
+  paymentAvailability?: PaymentOptionsConfig
 }
 
 let cachedPaymentConfigPromise: Promise<ApiResponse<PaymentConfigPayload>> | null = null
@@ -910,11 +1031,11 @@ let cachedPaymentConfigTimestamp = 0
 
 // Payment API functions (Stripe Card & PayPal JS SDK / Expanded Checkout)
 export const paymentApi = {
-  // Fetch runtime gateway keys, PayPal Client Token, and support contact email
+  // Fetch runtime gateway keys, PayPal Client Token, support email, and gateway availability flags
   // Deduplicates simultaneous mount requests (e.g., Stripe wrapper + PayPal loader)
-  getConfig: async (): Promise<ApiResponse<PaymentConfigPayload>> => {
+  getConfig: async (forceRefresh: boolean = false): Promise<ApiResponse<PaymentConfigPayload>> => {
     const now = Date.now()
-    if (cachedPaymentConfigPromise && now - cachedPaymentConfigTimestamp < 5000) {
+    if (!forceRefresh && cachedPaymentConfigPromise && now - cachedPaymentConfigTimestamp < 5000) {
       return cachedPaymentConfigPromise
     }
 
@@ -946,12 +1067,17 @@ export const paymentApi = {
           items: Array<{ productId: string; quantity: number }>
           customerEmail?: string
           shippingAddress?: Record<string, string | undefined>
+          useWallet?: boolean
         },
     customerEmail?: string
   ): Promise<ApiResponse<{
-    clientSecret: string
-    paymentIntentId: string
+    clientSecret?: string
+    paymentIntentId?: string
     amountUsd?: number
+    amount?: number
+    walletApplied?: number
+    orderTotal?: number
+    coveredByWallet?: boolean
     countryCode?: string
   }>> => {
     const body =
@@ -983,12 +1109,17 @@ export const paymentApi = {
           items: Array<{ productId: string; quantity: number }>
           customerEmail?: string
           shippingAddress?: Record<string, string | undefined>
+          useWallet?: boolean
         },
     customerEmail?: string
   ): Promise<ApiResponse<{
-    orderId: string
+    orderId?: string
     approveUrl?: string
     amountUsd?: number
+    amount?: number
+    walletApplied?: number
+    orderTotal?: number
+    coveredByWallet?: boolean
     countryCode?: string
   }>> => {
     const body =

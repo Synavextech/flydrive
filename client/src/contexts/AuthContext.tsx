@@ -52,18 +52,27 @@ const authReducer = (state: AuthState, action: AuthAction): AuthState => {
   }
 }
 
-// Initial state
+const hasStoredToken = (): boolean => {
+  try {
+    const token = localStorage.getItem('token')
+    return Boolean(token && token !== 'null' && token !== 'undefined')
+  } catch {
+    return false
+  }
+}
+
+// Initial state (keeps isLoading true while a persisted token is verified so ProtectedRoute won't bounce on refresh)
 const initialState: AuthState = {
   user: null,
   isAuthenticated: false,
-  isLoading: false,
+  isLoading: hasStoredToken(),
   error: null,
 }
 
 // Create context
 interface AuthContextType extends AuthState {
-  login: (email: string, password: string) => Promise<void>
-  register: (userData: RegisterData) => Promise<void>
+  login: (email: string, password: string) => Promise<User>
+  register: (userData: RegisterData) => Promise<User>
   logout: () => void
   clearError: () => void
   setAuthenticatedUser: (user: User, token: string) => void
@@ -104,7 +113,12 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const verifyToken = async () => {
     try {
       const token = localStorage.getItem('token')
-      if (!token) return
+      if (!token || token === 'null' || token === 'undefined') {
+        dispatch({ type: 'LOGOUT' })
+        return
+      }
+
+      dispatch({ type: 'AUTH_START' })
 
       const response = await fetch(`${API_URL}/auth/verify`, {
         credentials: 'include',
@@ -122,13 +136,15 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         }
       }
       localStorage.removeItem('token')
+      dispatch({ type: 'LOGOUT' })
     } catch (error) {
       localStorage.removeItem('token')
+      dispatch({ type: 'LOGOUT' })
     }
   }
 
   // Login function
-  const login = async (email: string, password: string) => {
+  const login = async (email: string, password: string): Promise<User> => {
     dispatch({ type: 'AUTH_START' })
 
     try {
@@ -138,7 +154,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({ email: email.trim(), password }),
       })
 
       const contentType = response.headers.get('content-type') || ''
@@ -167,6 +183,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
       localStorage.setItem('token', token)
       dispatch({ type: 'AUTH_SUCCESS', payload: user })
+      return user
     } catch (error) {
       dispatch({ type: 'AUTH_FAILURE', payload: error instanceof Error ? error.message : 'Login failed' })
       throw error
@@ -174,7 +191,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   }
 
   // Register function
-  const register = async (userData: RegisterData) => {
+  const register = async (userData: RegisterData): Promise<User> => {
     dispatch({ type: 'AUTH_START' })
 
     try {
@@ -184,7 +201,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(userData),
+        body: JSON.stringify({
+          ...userData,
+          email: userData.email.trim(),
+        }),
       })
 
       const contentType = response.headers.get('content-type') || ''
@@ -213,6 +233,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
       localStorage.setItem('token', token)
       dispatch({ type: 'AUTH_SUCCESS', payload: user })
+      return user
     } catch (error) {
       dispatch({ type: 'AUTH_FAILURE', payload: error instanceof Error ? error.message : 'Registration failed' })
       throw error

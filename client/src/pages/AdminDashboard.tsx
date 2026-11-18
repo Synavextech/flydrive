@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Package,
   ShoppingBag,
@@ -27,12 +28,28 @@ import {
   Monitor,
   Smartphone,
   Tablet,
-  Clock
+  Clock,
+  CreditCard,
+  ShieldAlert,
+  Wallet,
+  RotateCcw
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useProducts } from '../contexts/ProductContext'
 import { adminApi } from '../services/api'
-import { Product, Order, User, SupportSession, ProductBooking, AdminAnalyticsData, ProductViewSource } from '../types'
+import {
+  Product,
+  Order,
+  User,
+  SupportSession,
+  ProductBooking,
+  AdminAnalyticsData,
+  ProductViewSource,
+  PaymentOptionsConfig,
+  ReturnRequest,
+  Wallet as WalletType,
+  WalletTransaction
+} from '../types'
 import {
   OrderReceiptData,
   generateReceiptText,
@@ -56,7 +73,7 @@ const isVideoMedia = (url?: string) => {
 export const AdminDashboard: React.FC = () => {
   const { user } = useAuth()
   const { fetchProducts: fetchGlobalProducts } = useProducts()
-  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'bookings' | 'users' | 'support' | 'analytics'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'products' | 'orders' | 'returns' | 'bookings' | 'users' | 'support' | 'analytics'>('overview')
 
   // Dashboard Stats
   const [stats, setStats] = useState<{
@@ -142,6 +159,80 @@ export const AdminDashboard: React.FC = () => {
   analyticsDaysRef.current = analyticsDays
   const analyticsRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // Checkout Payment Options Availability Controls
+  const [paymentOptions, setPaymentOptions] = useState<PaymentOptionsConfig | null>(null)
+  const [paymentNoticeDrafts, setPaymentNoticeDrafts] = useState<{ paypal: string; stripe: string }>({
+    paypal: '',
+    stripe: ''
+  })
+  const [savingPaymentGateway, setSavingPaymentGateway] = useState<'paypal' | 'stripe' | null>(null)
+
+  // 21-Day Return Requests & Customer Wallets state
+  const [returnsList, setReturnsList] = useState<ReturnRequest[]>([])
+  const [walletsList, setWalletsList] = useState<Array<WalletType & { user?: Partial<User>; recentTransactions?: WalletTransaction[] }>>([])
+  const [processingReturnId, setProcessingReturnId] = useState<string | null>(null)
+  const [returnNotesDrafts, setReturnNotesDrafts] = useState<Record<string, string>>({})
+  const [returnTrackingDrafts, setReturnTrackingDrafts] = useState<Record<string, string>>({})
+  const [adjustWalletModal, setAdjustWalletModal] = useState<{
+    userId: string
+    label: string
+    direction: 'CREDIT' | 'DEBIT'
+    amount: string
+    description: string
+  } | null>(null)
+  const [adjustingWalletSubmitting, setAdjustingWalletSubmitting] = useState(false)
+
+  const syncPaymentOptionsState = (cfg: PaymentOptionsConfig) => {
+    setPaymentOptions(cfg)
+    setPaymentNoticeDrafts({
+      paypal: cfg.paypal?.notice || '',
+      stripe: cfg.stripe?.notice || ''
+    })
+  }
+
+  const fetchPaymentOptions = async () => {
+    try {
+      const res = await adminApi.getPaymentOptions()
+      if (res.success && res.data) {
+        syncPaymentOptionsState(res.data)
+      }
+    } catch {
+      // Silent fallback
+    }
+  }
+
+  const updatePaymentGatewaySetting = async (
+    gateway: 'paypal' | 'stripe',
+    nextAvailable?: boolean,
+    customNotice?: string
+  ) => {
+    try {
+      setSavingPaymentGateway(gateway)
+      const payload =
+        gateway === 'paypal'
+          ? {
+              ...(nextAvailable !== undefined ? { paypalAvailable: nextAvailable } : {}),
+              ...(customNotice !== undefined ? { paypalNotice: customNotice } : {})
+            }
+          : {
+              ...(nextAvailable !== undefined ? { stripeAvailable: nextAvailable } : {}),
+              ...(customNotice !== undefined ? { stripeNotice: customNotice } : {})
+            }
+      const res = await adminApi.updatePaymentOptions(payload)
+      if (res.success && res.data) {
+        syncPaymentOptionsState(res.data)
+        const activeState = res.data[gateway].available ? 'Available in Checkout' : 'Marked UNAVAILABLE (Shoppers Warned Not to Use)'
+        notify('success', `${gateway === 'paypal' ? 'PayPal' : 'Stripe Card'} is now ${activeState}`)
+      } else {
+        notify('error', res.error || 'Failed to save payment availability setting')
+      }
+    } catch (err: any) {
+      notify('error', err?.message || 'Unable to update payment availability setting')
+    } finally {
+      setSavingPaymentGateway(null)
+    }
+  }
+
   const fetchAnalytics = async (days: number = analyticsDaysRef.current) => {
     try {
       setAnalyticsLoading(true)
@@ -190,12 +281,28 @@ export const AdminDashboard: React.FC = () => {
     }
   }
 
+  const fetchReturnsAndWallets = async () => {
+    try {
+      const [retRes, walRes] = await Promise.allSettled([adminApi.getReturns(), adminApi.getWallets()])
+      if (retRes.status === 'fulfilled' && retRes.value.success && Array.isArray(retRes.value.data)) {
+        setReturnsList(retRes.value.data)
+      }
+      if (walRes.status === 'fulfilled' && walRes.value.success && Array.isArray(walRes.value.data)) {
+        setWalletsList(walRes.value.data)
+      }
+    } catch {
+      // Silent fallback
+    }
+  }
+
   useEffect(() => {
     fetchDashboardStats()
     fetchNotifications()
     fetchSupportSessions()
     fetchBookings()
+    fetchReturnsAndWallets()
     fetchAnalytics(analyticsDaysRef.current)
+    fetchPaymentOptions()
 
     const unsubscribeStream = adminApi.subscribeNotificationsStream(
       (incomingEvent) => {
@@ -211,11 +318,21 @@ export const AdminDashboard: React.FC = () => {
           evtType === 'ORDER_STATUS_UPDATED' ||
           evtType === 'ORDER_CANCELLED' ||
           evtType === 'ORDER_REFUNDED' ||
+          evtType === 'WALLET_DEBITED' ||
           evtType === 'USER_REGISTERED'
         ) {
           fetchDashboardStats()
           if (activeTabRef.current === 'orders') fetchOrders()
           if (activeTabRef.current === 'users') fetchUsers()
+          if (activeTabRef.current === 'returns' || evtType === 'WALLET_DEBITED') fetchReturnsAndWallets()
+        } else if (
+          evtType === 'RETURN_REQUESTED' ||
+          evtType === 'RETURN_WALLET_CREDITED' ||
+          evtType === 'RETURN_EXCHANGE_APPROVED' ||
+          evtType === 'RETURN_COMPLETED' ||
+          evtType === 'RETURN_REJECTED'
+        ) {
+          fetchReturnsAndWallets()
         } else if (evtType === 'PRODUCT_BOOKING_CREATED' || evtType === 'PRODUCT_BOOKING_UPDATED') {
           fetchBookings()
         } else if (
@@ -268,6 +385,13 @@ export const AdminDashboard: React.FC = () => {
           analyticsRefreshTimerRef.current = null
           fetchAnalytics(analyticsDaysRef.current)
         }, 1200)
+      },
+      (paymentSyncPayload) => {
+        if (paymentSyncPayload?.config) {
+          syncPaymentOptionsState(paymentSyncPayload.config)
+        } else {
+          fetchPaymentOptions()
+        }
       }
     )
 
@@ -628,21 +752,55 @@ export const AdminDashboard: React.FC = () => {
     setSelectedSessionId(session.id)
   }
 
-  // Handle toggling AI Concierge auto-reply pause state on a support session
-  const handleToggleAiPaused = async (sessionId: string, currentlyPaused: boolean) => {
+  // Handle Return & Exchange processing (Same-Day Instant Wallet Refund, Catalog Exchange, Complete, Reject)
+  const handleProcessReturn = async (
+    retId: string,
+    action: 'APPROVE_SAME_DAY_WALLET_REFUND' | 'APPROVE_EXCHANGE' | 'MARK_RETURN_RECEIVED_COMPLETE' | 'REJECT'
+  ) => {
     try {
-      const res = await adminApi.updateSupportSessionStatus(sessionId, { aiPaused: !currentlyPaused })
-      if (res.success && res.data) {
-        setSupportSessions(prev => prev.map(s => (s.id === sessionId ? res.data! : s)))
-        notify(
-          'success',
-          !currentlyPaused
-            ? 'AI Concierge paused for live agent takeover'
-            : 'AI Concierge resumed on this support session'
-        )
+      setProcessingReturnId(retId)
+      const res = await adminApi.processReturn(retId, {
+        action,
+        adminNotes: returnNotesDrafts[retId]?.trim() || undefined,
+        returnTrackingNumber: returnTrackingDrafts[retId]?.trim() || undefined
+      })
+      if (!res.success) {
+        throw new Error(res.error || 'Could not process return request.')
       }
+      notify('success', res.message || 'Return request processed successfully')
+      await Promise.all([fetchReturnsAndWallets(), fetchOrders(), fetchDashboardStats()])
     } catch (err: any) {
-      notify('error', err.message || 'Failed to update AI Concierge mode')
+      notify('error', err?.message || 'Unable to process return request')
+    } finally {
+      setProcessingReturnId(null)
+    }
+  }
+
+  const handleSubmitWalletAdjust = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!adjustWalletModal || adjustingWalletSubmitting) return
+    const amt = Number(adjustWalletModal.amount)
+    if (!Number.isFinite(amt) || amt <= 0) {
+      notify('error', 'Enter a positive USD amount to adjust wallet balance.')
+      return
+    }
+    try {
+      setAdjustingWalletSubmitting(true)
+      const res = await adminApi.adjustWallet(adjustWalletModal.userId, {
+        direction: adjustWalletModal.direction,
+        amount: amt,
+        description: adjustWalletModal.description.trim()
+      })
+      if (!res.success) {
+        throw new Error(res.error || 'Wallet adjustment failed.')
+      }
+      notify('success', res.message || 'Customer wallet balance updated.')
+      setAdjustWalletModal(null)
+      await fetchReturnsAndWallets()
+    } catch (err: any) {
+      notify('error', err?.message || 'Unable to adjust wallet balance')
+    } finally {
+      setAdjustingWalletSubmitting(false)
     }
   }
 
@@ -718,10 +876,17 @@ export const AdminDashboard: React.FC = () => {
         ? 'Credit / Debit Card (Stripe)'
         : ord.paymentMethod === 'PAYPAL'
           ? 'PayPal Express'
-          : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
+          : ord.paymentMethod === 'WALLET'
+            ? 'DriveFlyElectric Wallet Balance'
+            : ord.paymentMethod === 'WALLET_STRIPE'
+              ? 'DriveFlyElectric Wallet + Stripe Card'
+              : ord.paymentMethod === 'WALLET_PAYPAL'
+                ? 'DriveFlyElectric Wallet + PayPal Express'
+                : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
 
     const initialChargeVal = Number(ord.subtotal || ord.total || 0)
     const finalCostVal = Number(ord.total || 0)
+    const walletUsedVal = Number(ord.walletAmountUsed || 0)
     const isRefunded = ord.status === 'REFUNDED' || ord.paymentStatus === 'REFUNDED'
 
     return {
@@ -733,6 +898,7 @@ export const AdminDashboard: React.FC = () => {
       userName: customerName,
       address: formattedAddress,
       paymentSource,
+      ...(walletUsedVal > 0 ? { walletApplied: formatPrice(walletUsedVal) } : {}),
       initialCharge: formatPrice(initialChargeVal),
       finalCost: formatPrice(finalCostVal),
       totalRefund: isRefunded ? formatPrice(finalCostVal) : '$0.00',
@@ -797,6 +963,7 @@ export const AdminDashboard: React.FC = () => {
               onClick={() => {
                 fetchDashboardStats()
                 fetchBookings()
+                fetchPaymentOptions()
                 if (activeTab === 'products') fetchProducts()
                 if (activeTab === 'orders') fetchOrders()
                 if (activeTab === 'users') fetchUsers()
@@ -842,6 +1009,12 @@ export const AdminDashboard: React.FC = () => {
             { id: 'overview', label: 'Store Overview', icon: TrendingUp },
             { id: 'products', label: 'Fleet Products', icon: Package },
             { id: 'orders', label: 'Orders & Settlements', icon: ShoppingBag },
+            {
+              id: 'returns',
+              label: 'Returns & Wallets',
+              icon: RotateCcw,
+              badge: returnsList.filter(r => r.status === 'PENDING_REVIEW').length
+            },
             {
               id: 'bookings',
               label: 'Bookings',
@@ -944,6 +1117,151 @@ export const AdminDashboard: React.FC = () => {
                 Manage Fleet Catalog
               </button>
             </div>
+
+            {/* Checkout Payment Options Availability Controls */}
+            {(() => {
+              const gatewayCards = [
+                {
+                  key: 'paypal' as const,
+                  title: 'PayPal & Debit/Credit Card Fields',
+                  subtitle: 'PayPal Express Wallet + Expanded Hosted Card Fields',
+                  badgeLabel: 'PAYPAL',
+                  badgeClass: 'bg-[#003087] text-white',
+                  entry: paymentOptions?.paypal || {
+                    available: true,
+                    notice: 'PayPal checkout is currently unavailable. Please do not use this option — select another active payment method below.'
+                  }
+                },
+                {
+                  key: 'stripe' as const,
+                  title: 'Credit or Debit Card (Stripe Gateway)',
+                  subtitle: 'Stripe Hosted Card Elements with 3D-Secure verification',
+                  badgeLabel: 'STRIPE',
+                  badgeClass: 'bg-emerald-600 text-white',
+                  entry: paymentOptions?.stripe || {
+                    available: true,
+                    notice: 'Credit or Debit Card (Stripe Gateway) is currently unavailable. Please do not use this option — select another active payment method below.'
+                  }
+                }
+              ]
+              const unavailableCount = gatewayCards.filter(g => !g.entry.available).length
+
+              return (
+                <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm p-6 space-y-5">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100 dark:border-neutral-800 pb-4">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <CreditCard className="w-5 h-5 text-creamy-500" />
+                        <h3 className="font-anton text-lg uppercase text-gray-900 dark:text-white">
+                          Checkout Payment Options Availability
+                        </h3>
+                        {unavailableCount > 0 ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-red-500/15 text-red-500 border border-red-500/30">
+                            <ShieldAlert className="w-3 h-3" />
+                            {unavailableCount === 2 ? 'All Payment Options Marked Unavailable' : '1 Option Marked Unavailable'}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-emerald-500/15 text-emerald-500 border border-emerald-500/30">
+                            All Gateways Active
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Toggle any checkout payment method as Unavailable to display a &ldquo;Do Not Use&rdquo; alert in Checkout and block new attempts.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {gatewayCards.map(({ key, title, subtitle, badgeLabel, badgeClass, entry }) => {
+                      const isAvailable = entry.available
+                      const isSaving = savingPaymentGateway === key
+                      const draftNotice = paymentNoticeDrafts[key] ?? entry.notice
+
+                      return (
+                        <div
+                          key={key}
+                          className={`p-4 rounded-xl border transition-colors space-y-3.5 ${
+                            isAvailable
+                              ? 'border-gray-200 dark:border-neutral-800 bg-gray-50/70 dark:bg-[#1a1d24]'
+                              : 'border-red-300 dark:border-red-900/60 bg-red-50/50 dark:bg-red-950/20'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1 min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${badgeClass}`}>
+                                  {badgeLabel}
+                                </span>
+                                <p className="font-bold text-sm text-gray-900 dark:text-white">{title}</p>
+                              </div>
+                              <p className="text-[11px] text-gray-500 dark:text-gray-400">{subtitle}</p>
+                            </div>
+
+                            <button
+                              type="button"
+                              disabled={isSaving}
+                              onClick={() => updatePaymentGatewaySetting(key, !isAvailable, draftNotice)}
+                              className={`shrink-0 px-3 py-1.5 rounded-lg text-[11px] font-black uppercase tracking-wider transition-all ${
+                                isAvailable
+                                  ? 'bg-red-500/10 hover:bg-red-500 text-red-600 dark:text-red-400 hover:text-white border border-red-500/30'
+                                  : 'bg-emerald-500 hover:bg-emerald-400 text-black shadow-sm'
+                              } disabled:opacity-50`}
+                            >
+                              {isSaving
+                                ? 'Saving...'
+                                : isAvailable
+                                ? 'Set Unavailable'
+                                : 'Re-Enable Option'}
+                            </button>
+                          </div>
+
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span
+                              className={`font-bold ${
+                                isAvailable ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                              }`}
+                            >
+                              Status: {isAvailable ? 'Available for Checkout' : 'UNAVAILABLE — Shoppers Notified Not to Use'}
+                            </span>
+                            {entry.updatedAt && (
+                              <span className="text-[10px] text-gray-400">
+                                Updated {new Date(entry.updatedAt).toLocaleString()}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <label className="block text-[10px] font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                              Checkout Warning Message (shown when unavailable)
+                            </label>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={draftNotice}
+                                onChange={(e) =>
+                                  setPaymentNoticeDrafts(prev => ({ ...prev, [key]: e.target.value }))
+                                }
+                                placeholder="Tell customers why this payment method should not be used..."
+                                className="flex-1 px-3 py-2 text-xs rounded-lg bg-white dark:bg-[#12141a] border border-gray-200 dark:border-neutral-700 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-creamy-500"
+                              />
+                              <button
+                                type="button"
+                                disabled={isSaving || draftNotice.trim() === (entry.notice || '').trim()}
+                                onClick={() => updatePaymentGatewaySetting(key, isAvailable, draftNotice)}
+                                className="px-3 py-2 rounded-lg text-[11px] font-black uppercase tracking-wider bg-gray-900 dark:bg-creamy-500 text-white dark:text-black disabled:opacity-40 hover:opacity-90 transition-opacity whitespace-nowrap"
+                              >
+                                Save Notice
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })()}
 
             {/* Live Store Activity & Email Dispatch Feed */}
             <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
@@ -1815,22 +2133,11 @@ export const AdminDashboard: React.FC = () => {
                         </div>
 
                         <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleToggleAiPaused(activeSession.id, Boolean(activeSession.aiPaused))}
-                            className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
-                              activeSession.aiPaused
-                                ? 'bg-amber-500/15 border-amber-500/40 text-amber-400 hover:bg-amber-500/25'
-                                : 'bg-white dark:bg-[#14161c] border-gray-300 dark:border-neutral-700 text-gray-600 dark:text-gray-300 hover:border-creamy-500'
-                            }`}
-                            title={
-                              activeSession.aiPaused
-                                ? 'AI Concierge auto-replies are paused while you handle this chat. Click to resume AI auto-replies.'
-                                : 'AI Concierge auto-replies are active until a specialist replies. Click to pause AI.'
-                            }
-                          >
-                            {activeSession.aiPaused ? 'AI Paused • Resume AI' : 'AI Auto • Pause AI'}
-                          </button>
+                          {activeSession.activeOrderId && (
+                            <span className="px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-500 text-[10px] font-black uppercase">
+                              Active Order Tagged
+                            </span>
+                          )}
                           <button
                             type="button"
                             onClick={() => handleToggleSupportStatus(activeSession.id, activeSession.status)}
@@ -1845,17 +2152,20 @@ export const AdminDashboard: React.FC = () => {
                         </div>
                       </div>
 
-                      {/* Selected Catalogue Products ("What are you looking to buy today?") */}
+                      {/* Selected Catalogue Products */}
                       {activeSession.selectedProducts && activeSession.selectedProducts.length > 0 && (
                         <div className="px-4 py-2.5 bg-creamy-500/5 border-b border-gray-200 dark:border-neutral-800">
                           <p className="text-[10px] font-black uppercase tracking-wider text-creamy-500 mb-1.5">
-                            Selected Catalogue Rigs (Looking to Buy Today):
+                            Tagged Catalog Item(s):
                           </p>
                           <div className="flex flex-wrap gap-2">
                             {activeSession.selectedProducts.map((prod) => (
-                              <div
+                              <Link
                                 key={prod.id}
-                                className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#13151b] border border-gray-200 dark:border-neutral-700 shadow-2xs"
+                                to={`/product/${prod.id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-white dark:bg-[#13151b] border border-gray-200 dark:border-neutral-700 hover:border-creamy-500 shadow-2xs transition-colors"
                               >
                                 <img
                                   src={getSafeMediaUrl(prod.image)}
@@ -1873,55 +2183,57 @@ export const AdminDashboard: React.FC = () => {
                                     {prod.sku} • {formatPrice(prod.price)}
                                   </p>
                                 </div>
-                              </div>
+                              </Link>
                             ))}
                           </div>
                         </div>
                       )}
 
-                      {/* Messages History */}
+                      {/* Messages History (Client <-> Admin direct persistent thread) */}
                       <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-white dark:bg-[#14161c]">
-                        {(activeSession.messages || []).map((msg) => {
-                          const isAdmin = msg.senderRole === 'ADMIN'
-                          const isClient = msg.senderRole === 'CLIENT'
-                          return (
-                            <div
-                              key={msg.id}
-                              className={`flex flex-col ${isAdmin ? 'items-end' : 'items-start'}`}
-                            >
-                              <div className="flex items-center gap-1.5 mb-1 px-1">
-                                <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400">
-                                  {msg.senderName}
-                                </span>
-                                <span
-                                  className={`text-[8px] font-black uppercase px-1.5 py-0.5 rounded ${
-                                    isClient
-                                      ? 'bg-blue-500/20 text-blue-400'
-                                      : isAdmin
-                                      ? 'bg-emerald-500/20 text-emerald-400'
-                                      : 'bg-creamy-500/20 text-creamy-400'
+                        {(activeSession.messages || [])
+                          .filter((m) => m.senderRole !== 'AI_ASSISTANT')
+                          .map((msg) => {
+                            const isAdmin = msg.senderRole === 'ADMIN'
+                            const isClient = msg.senderRole === 'CLIENT'
+                            return (
+                              <div
+                                key={msg.id}
+                                className={`flex flex-col ${isAdmin ? 'items-end' : 'items-start'}`}
+                              >
+                                <div className="flex items-center gap-1.5 mb-1 px-1">
+                                  <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400">
+                                    {msg.senderName}
+                                  </span>
+                                  <span
+                                    className={`text-[8px] font-black uppercase px-1.5 py-0.5 rounded ${
+                                      isClient
+                                        ? 'bg-blue-500/20 text-blue-400'
+                                        : isAdmin
+                                        ? 'bg-emerald-500/20 text-emerald-400'
+                                        : 'bg-gray-500/20 text-gray-400'
+                                    }`}
+                                  >
+                                    {isClient ? 'CUSTOMER' : isAdmin ? 'ADMIN AGENT' : 'SYSTEM'}
+                                  </span>
+                                  <span className="text-[9px] text-gray-400">
+                                    {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  </span>
+                                </div>
+                                <div
+                                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-xs leading-relaxed whitespace-pre-line ${
+                                    isAdmin
+                                      ? 'bg-creamy-500 text-black font-semibold rounded-br-xs'
+                                      : isClient
+                                      ? 'bg-blue-600 text-white font-medium rounded-bl-xs shadow-sm'
+                                      : 'bg-gray-100 dark:bg-[#1d202a] text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-neutral-800 rounded-bl-xs'
                                   }`}
                                 >
-                                  {isClient ? 'CUSTOMER' : isAdmin ? 'SPECIALIST' : 'CONCIERGE'}
-                                </span>
-                                <span className="text-[9px] text-gray-400">
-                                  {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                </span>
+                                  {msg.content}
+                                </div>
                               </div>
-                              <div
-                                className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-xs leading-relaxed whitespace-pre-line ${
-                                  isAdmin
-                                    ? 'bg-creamy-500 text-black font-semibold rounded-br-xs'
-                                    : isClient
-                                    ? 'bg-blue-600 text-white font-medium rounded-bl-xs shadow-sm'
-                                    : 'bg-gray-100 dark:bg-[#1d202a] text-gray-800 dark:text-gray-200 border border-gray-200 dark:border-neutral-800 rounded-bl-xs'
-                                }`}
-                              >
-                                {msg.content}
-                              </div>
-                            </div>
-                          )
-                        })}
+                            )
+                          })}
                         <div ref={adminChatEndRef} />
                       </div>
 
@@ -2380,7 +2692,316 @@ export const AdminDashboard: React.FC = () => {
             </div>
           )
         })()}
+
+        {/* Tab 7: RETURNS & CUSTOMER WALLETS (21-Day Return Policy & Same-Day Instant Wallet Refund) */}
+        {activeTab === 'returns' && (
+          <div className="space-y-8">
+            <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+              <div className="p-6 border-b border-gray-100 dark:border-neutral-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-black font-anton flex items-center gap-2">
+                    <RotateCcw className="w-5 h-5 text-creamy-500" />
+                    21-Day Return &amp; Exchange Requests
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-neutral-400">
+                    Issue instant Same-Day Wallet Balance Deposits while awaiting return shipping, approve equal/close-value catalog exchanges, or finalize received returns.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={fetchReturnsAndWallets}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-gray-200 dark:border-neutral-700 text-xs font-bold hover:border-creamy-500"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Refresh
+                </button>
+              </div>
+
+              {returnsList.length === 0 ? (
+                <div className="p-10 text-center text-xs text-gray-500">
+                  No customer return or exchange requests submitted yet.
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-100 dark:divide-neutral-800">
+                  {returnsList.map((ret) => {
+                    const isBusy = processingReturnId === ret.id
+                    return (
+                      <div key={ret.id} className="p-6 space-y-4 text-xs">
+                        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="font-mono font-black text-sm">{ret.returnNumber}</span>
+                              <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-neutral-800 font-mono text-[10px]">
+                                Order #{ret.orderNumber || ret.orderId}
+                              </span>
+                              <span className="px-2 py-0.5 rounded bg-creamy-500/15 text-creamy-600 dark:text-creamy-400 font-black text-[10px] uppercase">
+                                {ret.status}
+                              </span>
+                              {ret.walletCredited && (
+                                <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 font-black text-[10px] uppercase">
+                                  Wallet Credited
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-gray-500 dark:text-neutral-400 mt-1">
+                              Customer: <strong className="text-gray-900 dark:text-white">{ret.userName || 'Customer'}</strong> ({ret.userEmail || ret.userId}) •{' '}
+                              21-Day Window Until: <strong>{new Date(ret.eligibleUntil).toLocaleDateString()}</strong>
+                            </p>
+                          </div>
+
+                          <div className="text-left md:text-right">
+                            <p className="text-lg font-black text-creamy-500">{formatPrice(ret.refundAmount)}</p>
+                            <p className="text-[11px] font-semibold">
+                              {ret.reasonType === 'EXCHANGE_EQUAL_VALUE'
+                                ? `Exchange -> ${ret.exchangeProduct?.name || ret.exchangeProductId || 'Replacement'} (${ret.exchangePriceDelta >= 0 ? `+${formatPrice(ret.exchangePriceDelta)}` : formatPrice(ret.exchangePriceDelta)})`
+                                : 'Money Back to Wallet (Not As Ordered)'}
+                            </p>
+                          </div>
+                        </div>
+
+                        {ret.reasonDetails && (
+                          <div className="p-3 rounded-xl bg-gray-50 dark:bg-[#1a1d24] border border-gray-200 dark:border-neutral-800">
+                            <strong className="uppercase text-[10px] text-gray-500 block mb-0.5">Customer Details:</strong>
+                            <p>{ret.reasonDetails}</p>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <input
+                            type="text"
+                            placeholder={`Return Tracking # (${ret.returnTrackingNumber || 'optional'})`}
+                            value={returnTrackingDrafts[ret.id] ?? ret.returnTrackingNumber ?? ''}
+                            onChange={(e) =>
+                              setReturnTrackingDrafts((prev) => ({ ...prev, [ret.id]: e.target.value }))
+                            }
+                            className="px-3 py-2 rounded-xl border border-gray-200 dark:border-neutral-700 bg-gray-50 dark:bg-[#1a1d24] text-xs"
+                          />
+                          <input
+                            type="text"
+                            placeholder={`Support / Admin Notes (${ret.adminNotes || 'optional'})`}
+                            value={returnNotesDrafts[ret.id] ?? ret.adminNotes ?? ''}
+                            onChange={(e) =>
+                              setReturnNotesDrafts((prev) => ({ ...prev, [ret.id]: e.target.value }))
+                            }
+                            className="px-3 py-2 rounded-xl border border-gray-200 dark:border-neutral-700 bg-gray-50 dark:bg-[#1a1d24] text-xs"
+                          />
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2 pt-1">
+                          {ret.status === 'PENDING_REVIEW' && ret.reasonType === 'NOT_AS_ORDERED_REFUND' && (
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleProcessReturn(ret.id, 'APPROVE_SAME_DAY_WALLET_REFUND')}
+                              className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-black uppercase tracking-wider text-[11px] disabled:opacity-50"
+                            >
+                              {isBusy ? 'Processing...' : `Issue Same-Day Wallet Deposit (+${formatPrice(ret.refundAmount)})`}
+                            </button>
+                          )}
+
+                          {ret.status === 'PENDING_REVIEW' && ret.reasonType === 'EXCHANGE_EQUAL_VALUE' && (
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleProcessReturn(ret.id, 'APPROVE_EXCHANGE')}
+                              className="px-3.5 py-2 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[11px] disabled:opacity-50"
+                            >
+                              {isBusy ? 'Creating Replacement...' : 'Approve Catalog Exchange'}
+                            </button>
+                          )}
+
+                          {(ret.status === 'WALLET_CREDITED' ||
+                            ret.status === 'EXCHANGE_APPROVED' ||
+                            ret.status === 'PENDING_REVIEW') && (
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleProcessReturn(ret.id, 'MARK_RETURN_RECEIVED_COMPLETE')}
+                              className="px-3.5 py-2 rounded-xl bg-gray-900 dark:bg-white text-white dark:text-black font-bold uppercase tracking-wider text-[11px] disabled:opacity-50"
+                            >
+                              Mark Return Received &amp; Complete
+                            </button>
+                          )}
+
+                          {ret.status === 'PENDING_REVIEW' && !ret.walletCredited && !ret.exchangeOrderId && (
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleProcessReturn(ret.id, 'REJECT')}
+                              className="px-3.5 py-2 rounded-xl border border-red-300 dark:border-red-900/50 text-red-600 dark:text-red-400 font-bold uppercase tracking-wider text-[11px] hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50"
+                            >
+                              Decline
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Customer Wallets & Audit Balances */}
+            <div className="bg-white dark:bg-[#16181e] rounded-2xl border border-gray-200 dark:border-neutral-800 shadow-sm overflow-hidden">
+              <div className="p-6 border-b border-gray-100 dark:border-neutral-800 flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-black font-anton flex items-center gap-2">
+                    <Wallet className="w-5 h-5 text-creamy-500" />
+                    Customer Wallets &amp; Balances
+                  </h3>
+                  <p className="text-xs text-gray-500 dark:text-neutral-400">
+                    Audit customer refund credits, checkout debits, or post manual wallet adjustments.
+                  </p>
+                </div>
+              </div>
+
+              {walletsList.length === 0 ? (
+                <div className="p-8 text-center text-xs text-gray-500">
+                  No customer wallets initialized yet (created automatically when customers view Account, Checkout, or receive a refund).
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-gray-50 dark:bg-[#1a1d24] text-[10px] font-black uppercase tracking-wider text-gray-500">
+                      <tr>
+                        <th className="px-6 py-3">Customer</th>
+                        <th className="px-6 py-3">Current Balance</th>
+                        <th className="px-6 py-3">Recent Ledger Entry</th>
+                        <th className="px-6 py-3 text-right">Adjust</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 dark:divide-neutral-800">
+                      {walletsList.map((w) => {
+                        const latestTx = w.recentTransactions?.[0]
+                        const displayName =
+                          `${w.user?.firstName || ''} ${w.user?.lastName || ''}`.trim() ||
+                          w.user?.email ||
+                          w.userId
+                        return (
+                          <tr key={w.id}>
+                            <td className="px-6 py-4">
+                              <p className="font-bold text-gray-900 dark:text-white">{displayName}</p>
+                              <p className="text-[11px] text-gray-500">{w.user?.email || w.userId}</p>
+                            </td>
+                            <td className="px-6 py-4 font-black text-base text-creamy-500">
+                              {formatPrice(w.balance)}
+                            </td>
+                            <td className="px-6 py-4 text-[11px] text-gray-500 dark:text-neutral-400">
+                              {latestTx
+                                ? `${latestTx.direction === 'CREDIT' ? '+' : '-'}${formatPrice(latestTx.amount)} (${latestTx.type})`
+                                : 'No transactions yet'}
+                            </td>
+                            <td className="px-6 py-4 text-right">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setAdjustWalletModal({
+                                    userId: w.userId,
+                                    label: `${displayName} (${w.user?.email || w.userId})`,
+                                    direction: 'CREDIT',
+                                    amount: '',
+                                    description: ''
+                                  })
+                                }
+                                className="px-3 py-1.5 rounded-lg border border-creamy-500/40 text-creamy-600 dark:text-creamy-400 font-bold hover:bg-creamy-500/10"
+                              >
+                                Adjust Balance
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Admin Manual Wallet Adjustment Modal */}
+      {adjustWalletModal && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-start justify-between border-b border-gray-100 dark:border-neutral-800 pb-3">
+              <div>
+                <p className="text-[10px] font-black uppercase text-creamy-500">Wallet Adjustment</p>
+                <h3 className="font-anton text-lg">{adjustWalletModal.label}</h3>
+              </div>
+              <button type="button" onClick={() => setAdjustWalletModal(null)} className="text-gray-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={handleSubmitWalletAdjust} className="space-y-3 text-xs">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAdjustWalletModal({ ...adjustWalletModal, direction: 'CREDIT' })}
+                  className={`py-2 rounded-xl font-black uppercase ${
+                    adjustWalletModal.direction === 'CREDIT'
+                      ? 'bg-emerald-500 text-black'
+                      : 'border border-gray-300 dark:border-neutral-700'
+                  }`}
+                >
+                  + Credit Wallet
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAdjustWalletModal({ ...adjustWalletModal, direction: 'DEBIT' })}
+                  className={`py-2 rounded-xl font-black uppercase ${
+                    adjustWalletModal.direction === 'DEBIT'
+                      ? 'bg-red-500 text-white'
+                      : 'border border-gray-300 dark:border-neutral-700'
+                  }`}
+                >
+                  - Debit Wallet
+                </button>
+              </div>
+              <div>
+                <label className="font-bold block mb-1">Amount (USD) *</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  required
+                  value={adjustWalletModal.amount}
+                  onChange={(e) => setAdjustWalletModal({ ...adjustWalletModal, amount: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-gray-300 dark:border-neutral-700 bg-gray-50 dark:bg-[#1a1d24]"
+                />
+              </div>
+              <div>
+                <label className="font-bold block mb-1">Audit Description / Reason *</label>
+                <input
+                  type="text"
+                  required
+                  minLength={3}
+                  value={adjustWalletModal.description}
+                  onChange={(e) => setAdjustWalletModal({ ...adjustWalletModal, description: e.target.value })}
+                  placeholder="e.g. Same-day goodwill refund / adjustment"
+                  className="w-full px-3 py-2 rounded-xl border border-gray-300 dark:border-neutral-700 bg-gray-50 dark:bg-[#1a1d24]"
+                />
+              </div>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setAdjustWalletModal(null)}
+                  className="px-4 py-2 rounded-xl border border-gray-300 dark:border-neutral-700 font-bold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={adjustingWalletSubmitting}
+                  className="px-4 py-2 rounded-xl bg-creamy-500 text-black font-black uppercase disabled:opacity-50"
+                >
+                  {adjustingWalletSubmitting ? 'Saving...' : 'Apply Adjustment'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Add / Edit Product Modal with Direct Image File Upload */}
       {isProductModalOpen && (

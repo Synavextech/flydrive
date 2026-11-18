@@ -28,7 +28,8 @@ const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
 })
 
 async function createOrUpdateAdmin() {
-    const adminEmail = (process.env.ADMIN_EMAIL || '').trim()
+    const rawAdminEmail = (process.env.ADMIN_EMAIL || '').trim()
+    const adminEmail = rawAdminEmail.toLowerCase()
     const adminPassword = (process.env.ADMIN_PASSWORD || '').trim()
     const adminFirstName = process.env.ADMIN_FIRST_NAME || 'DriveFlyElectric'
     const adminLastName = process.env.ADMIN_LAST_NAME || 'Admin'
@@ -45,16 +46,21 @@ async function createOrUpdateAdmin() {
         const saltRounds = 10
         const hashedPassword = await bcrypt.hash(adminPassword, saltRounds)
 
-        // 2. Check if user already exists
-        const { data: existingUser, error: checkError } = await supabase
+        // 2. Check if user already exists (matching both normalized lowercase and legacy casing)
+        const candidateEmails = Array.from(new Set([adminEmail, rawAdminEmail]))
+        const { data: matchedUsers, error: checkError } = await supabase
             .from('users')
             .select('id, email, role, is_active')
-            .eq('email', adminEmail)
-            .maybeSingle()
+            .in('email', candidateEmails)
+            .limit(5)
 
         if (checkError) {
             throw checkError
         }
+
+        const existingUser =
+            (matchedUsers || []).find((u) => String(u.email || '').trim().toLowerCase() === adminEmail) ||
+            null
 
         if (existingUser) {
             console.log(`ℹ️ Existing user found with ID: ${existingUser.id}. Elevating permissions to full ADMIN...`)
@@ -62,6 +68,7 @@ async function createOrUpdateAdmin() {
             const { data: updatedUser, error: updateError } = await supabase
                 .from('users')
                 .update({
+                    email: adminEmail,
                     password: hashedPassword,
                     role: 'ADMIN',
                     is_active: true,
@@ -77,7 +84,7 @@ async function createOrUpdateAdmin() {
                 throw updateError
             }
 
-            console.log('✅ Admin user elevated successfully!')
+            console.log(' Admin user elevated successfully!')
             console.log(`   ID: ${updatedUser.id}`)
             console.log(`   Email: ${updatedUser.email}`)
             console.log(`   Role: ${updatedUser.role}`)
@@ -107,7 +114,7 @@ async function createOrUpdateAdmin() {
                 throw insertError
             }
 
-            console.log('✅ Administrator account created successfully!')
+            console.log(' Administrator account created successfully!')
             console.log(`   ID: ${newUser.id}`)
             console.log(`   Email: ${newUser.email}`)
             console.log(`   Role: ${newUser.role}`)

@@ -21,6 +21,7 @@ import type {
   Product,
   ProductBooking,
   ProductReview,
+  ReturnRequest,
   SystemActivityRecord,
   SystemActivityType
 } from '../types/database.js'
@@ -169,6 +170,13 @@ class EmailService {
     this.activityEmitter.emit('analytics_sync', {
       kind,
       data,
+      timestamp: new Date().toISOString()
+    })
+  }
+
+  public emitPaymentConfigSync(config: any): void {
+    this.activityEmitter.emit('payment_config_sync', {
+      config,
       timestamp: new Date().toISOString()
     })
   }
@@ -1216,6 +1224,256 @@ class EmailService {
       clearInterval(this.cartReminderTimer)
       this.cartReminderTimer = null
     }
+  }
+
+  async sendReturnRequestedNotification(returnReq: ReturnRequest, order: any): Promise<void> {
+    const customerEmail = returnReq.userEmail || order?.user?.email
+    const customerName = returnReq.userName || 'Valued Customer'
+    const orderNum = order?.orderNumber || returnReq.orderNumber || returnReq.orderId
+    const { adminContactEmail, systemEmails } = this.getTransporter()
+    const isExchange = returnReq.reasonType === 'EXCHANGE_EQUAL_VALUE'
+    const policyLabel = isExchange
+      ? `Exchange for Catalog Item (${returnReq.exchangeProduct?.name || returnReq.exchangeProductId || 'Replacement Unit'})`
+      : 'Item Not What I Ordered — Same-Day Wallet Balance Refund'
+
+    let userSent = false
+    if (customerEmail && isValidEmailAddress(customerEmail)) {
+      const safeName = escapeHtml(customerName)
+      const safeRetNum = escapeHtml(returnReq.returnNumber)
+      const safeOrderNum = escapeHtml(orderNum)
+      const safeTrk = escapeHtml(returnReq.returnTrackingNumber || 'Pending')
+      const eligibleStr = new Date(returnReq.eligibleUntil).toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      })
+
+      const res = await this.dispatchMail({
+        to: customerEmail,
+        subject: `Return Request Received (${returnReq.returnNumber}) • Order #${orderNum}`,
+        text: `Hello ${customerName},\n\nWe received your ${policyLabel} request (${returnReq.returnNumber}) for Order #${orderNum}.\nReturn Tracking: ${returnReq.returnTrackingNumber || 'Pending'}\n21-Day Return Window Valid Until: ${eligibleStr}\n\nNote: Once a support agent processes your return, we provide same-day balance deposit directly to your DriveFlyElectric Wallet while awaiting return shipping.\n\nQuestions: ${adminContactEmail}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+            <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
+              <h2 style="margin: 0; font-size: 20px; color: #76cf89;">Return Request Logged • ${safeRetNum}</h2>
+              <p style="margin: 4px 0 0; font-size: 12px; color: #9de0ab;">Order #${safeOrderNum} • 21-Day Return Window Valid Through ${escapeHtml(eligibleStr)}</p>
+            </div>
+            <div style="padding: 24px; font-size: 14px; line-height: 1.6; color: #111827;">
+              <p>Hello <strong>${safeName}</strong>,</p>
+              <p>Your request under <strong>${escapeHtml(policyLabel)}</strong> has been received and assigned to our support team.</p>
+              <div style="background: #f0f9f2; border: 1px solid #58b970; border-radius: 10px; padding: 14px 16px; margin: 16px 0;">
+                <div><strong>Return Reference:</strong> ${safeRetNum}</div>
+                <div><strong>Return Shipping Ref:</strong> ${safeTrk}</div>
+                <div><strong>Eligible Amount:</strong> $${Number(returnReq.refundAmount || 0).toFixed(2)} USD</div>
+              </div>
+              <p>We offer <strong>same-day wallet balance deposit</strong> upon processing by our customer support agent while awaiting return shipping.</p>
+              <p style="font-size: 12px; color: #6b7280;">Need directions? Reply in LiveChat or email <a href="mailto:${escapeHtml(adminContactEmail)}" style="color: #429b58;">${escapeHtml(adminContactEmail)}</a>.</p>
+            </div>
+          </div>
+        `
+      })
+      userSent = res.success
+    }
+
+    let sysSent = false
+    if (systemEmails.length > 0) {
+      const sysRes = await this.dispatchMail({
+        to: systemEmails.join(', '),
+        subject: `[RETURN REQUEST] ${returnReq.returnNumber} • Order #${orderNum} ($${Number(returnReq.refundAmount || 0).toFixed(2)})`,
+        text: `Return Request: ${returnReq.returnNumber}\nCustomer: ${customerName} (${customerEmail || 'N/A'})\nOrder: #${orderNum}\nOption: ${policyLabel}\nRefund Amount: $${Number(returnReq.refundAmount || 0).toFixed(2)}\nDetails: ${returnReq.reasonDetails || 'N/A'}`
+      })
+      sysSent = sysRes.success
+    }
+
+    this.recordActivity({
+      type: 'RETURN_REQUESTED',
+      title: `Return Requested • ${returnReq.returnNumber}`,
+      message: `${customerName} submitted ${policyLabel} for Order #${orderNum} ($${Number(returnReq.refundAmount || 0).toFixed(2)} USD).`,
+      userEmail: customerEmail || undefined,
+      orderNumber: orderNum,
+      amount: Number(returnReq.refundAmount || 0),
+      metadata: {
+        returnId: returnReq.id,
+        returnNumber: returnReq.returnNumber,
+        reasonType: returnReq.reasonType,
+        userId: returnReq.userId
+      },
+      emailDispatched: userSent,
+      systemMailDispatched: sysSent
+    })
+  }
+
+  async sendReturnWalletCreditedNotification(
+    returnReq: ReturnRequest,
+    order: any,
+    newBalance: number
+  ): Promise<void> {
+    const customerEmail = returnReq.userEmail || order?.user?.email
+    const customerName = returnReq.userName || 'Valued Customer'
+    const orderNum = order?.orderNumber || returnReq.orderNumber || returnReq.orderId
+    const { adminContactEmail, systemEmails } = this.getTransporter()
+
+    let userSent = false
+    if (customerEmail && isValidEmailAddress(customerEmail)) {
+      const res = await this.dispatchMail({
+        to: customerEmail,
+        subject: `Same-Day Refund Deposited to Your Wallet (${returnReq.returnNumber}) • $${Number(returnReq.refundAmount).toFixed(2)} USD`,
+        text: `Hello ${customerName},\n\nGreat news! Your same-day refund of $${Number(returnReq.refundAmount).toFixed(2)} USD for Order #${orderNum} (Return ${returnReq.returnNumber}) has been deposited instantly into your DriveFlyElectric Wallet while we await your return shipment (${returnReq.returnTrackingNumber || 'Pending'}).\n\nCurrent Wallet Balance: $${Number(newBalance).toFixed(2)} USD\nYou can spend your wallet balance immediately at checkout.\n\nSupport: ${adminContactEmail}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+            <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
+              <h2 style="margin: 0; font-size: 20px; color: #76cf89;">Instant Same-Day Wallet Deposit • +$${Number(returnReq.refundAmount).toFixed(2)}</h2>
+              <p style="margin: 4px 0 0; font-size: 12px; color: #9de0ab;">Return ${escapeHtml(returnReq.returnNumber)} • Order #${escapeHtml(orderNum)}</p>
+            </div>
+            <div style="padding: 24px; font-size: 14px; line-height: 1.6; color: #111827;">
+              <p>Hello <strong>${escapeHtml(customerName)}</strong>,</p>
+              <p>Our customer support agent has processed your return request. Your refund of <strong>$${Number(returnReq.refundAmount).toFixed(2)} USD</strong> has been credited <strong>same-day to your DriveFlyElectric Wallet</strong> while awaiting physical return shipping.</p>
+              <div style="background: #f0f9f2; border: 1px solid #58b970; border-radius: 10px; padding: 14px 16px; margin: 16px 0;">
+                <div><strong>Credited Amount:</strong> +$${Number(returnReq.refundAmount).toFixed(2)} USD</div>
+                <div><strong>Updated Wallet Balance:</strong> $${Number(newBalance).toFixed(2)} USD</div>
+                <div><strong>Return Shipment Tracking:</strong> ${escapeHtml(returnReq.returnTrackingNumber || 'Assigned in Account Portal')}</div>
+              </div>
+              <p>You can apply your Wallet Balance directly on any future checkout.</p>
+            </div>
+          </div>
+        `
+      })
+      userSent = res.success
+    }
+
+    let sysSent = false
+    if (systemEmails.length > 0) {
+      const sysRes = await this.dispatchMail({
+        to: systemEmails.join(', '),
+        subject: `[WALLET REFUND CREDITED] ${returnReq.returnNumber} • +$${Number(returnReq.refundAmount).toFixed(2)} USD`,
+        text: `Same-day wallet refund deposited for Return ${returnReq.returnNumber} (Order #${orderNum}).\nCustomer: ${customerName} (${customerEmail || 'N/A'})\nCredited: $${Number(returnReq.refundAmount).toFixed(2)}\nNew Balance: $${Number(newBalance).toFixed(2)}`
+      })
+      sysSent = sysRes.success
+    }
+
+    this.recordActivity({
+      type: 'RETURN_WALLET_CREDITED',
+      title: `Wallet Refund Deposited • +$${Number(returnReq.refundAmount).toFixed(2)} USD`,
+      message: `Same-day wallet deposit credited to ${customerName} for Return ${returnReq.returnNumber} (Order #${orderNum}) while awaiting return shipping.`,
+      userEmail: customerEmail || undefined,
+      orderNumber: orderNum,
+      amount: Number(returnReq.refundAmount || 0),
+      metadata: {
+        returnId: returnReq.id,
+        returnNumber: returnReq.returnNumber,
+        newBalance,
+        userId: returnReq.userId
+      },
+      emailDispatched: userSent,
+      systemMailDispatched: sysSent
+    })
+  }
+
+  async sendReturnExchangeApprovedNotification(
+    returnReq: ReturnRequest,
+    originalOrder: any,
+    replacementOrder: any,
+    newBalance?: number
+  ): Promise<void> {
+    const customerEmail = returnReq.userEmail || originalOrder?.user?.email
+    const customerName = returnReq.userName || 'Valued Customer'
+    const origNum = originalOrder?.orderNumber || returnReq.orderNumber || returnReq.orderId
+    const newNum = replacementOrder?.orderNumber || returnReq.exchangeOrderId || 'Processing'
+    const newTrk = replacementOrder?.trackingNumber || `TRK-${newNum}`
+    const { systemEmails } = this.getTransporter()
+    const itemName = returnReq.exchangeProduct?.name || 'Replacement Catalog Unit'
+
+    let userSent = false
+    if (customerEmail && isValidEmailAddress(customerEmail)) {
+      const balanceNote =
+        typeof newBalance === 'number' ? `\nUpdated Wallet Balance: $${newBalance.toFixed(2)} USD` : ''
+      const res = await this.dispatchMail({
+        to: customerEmail,
+        subject: `Catalog Exchange Approved (${returnReq.returnNumber}) • Replacement Order #${newNum}`,
+        text: `Hello ${customerName},\n\nYour exchange request (${returnReq.returnNumber}) for Order #${origNum} has been approved!\nReplacement Item: ${itemName}\nReplacement Order #: ${newNum}\nTracking Number: ${newTrk}${balanceNote}\n\nThank you for shopping with DriveFlyElectric.`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+            <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
+              <h2 style="margin: 0; font-size: 20px; color: #76cf89;">Exchange Approved • #${escapeHtml(newNum)}</h2>
+              <p style="margin: 4px 0 0; font-size: 12px; color: #9de0ab;">Return ${escapeHtml(returnReq.returnNumber)} • Replacement Unit Preparing</p>
+            </div>
+            <div style="padding: 24px; font-size: 14px; line-height: 1.6; color: #111827;">
+              <p>Hello <strong>${escapeHtml(customerName)}</strong>,</p>
+              <p>We have approved your exchange for <strong>${escapeHtml(itemName)}</strong> while awaiting your return shipment.</p>
+              <div style="background: #f0f9f2; border: 1px solid #58b970; border-radius: 10px; padding: 14px 16px; margin: 16px 0;">
+                <div><strong>Replacement Order:</strong> #${escapeHtml(newNum)}</div>
+                <div><strong>Tracking Number:</strong> ${escapeHtml(newTrk)}</div>
+                <div><strong>Original Order:</strong> #${escapeHtml(origNum)}</div>
+                ${typeof newBalance === 'number' ? `<div><strong>Wallet Balance:</strong> $${newBalance.toFixed(2)} USD</div>` : ''}
+              </div>
+            </div>
+          </div>
+        `
+      })
+      userSent = res.success
+    }
+
+    let sysSent = false
+    if (systemEmails.length > 0) {
+      const sysRes = await this.dispatchMail({
+        to: systemEmails.join(', '),
+        subject: `[EXCHANGE APPROVED] ${returnReq.returnNumber} -> Order #${newNum}`,
+        text: `Exchange ${returnReq.returnNumber} approved for ${customerName}. Replacement Order #${newNum} (${itemName}).`
+      })
+      sysSent = sysRes.success
+    }
+
+    this.recordActivity({
+      type: 'RETURN_EXCHANGE_APPROVED',
+      title: `Exchange Approved • #${newNum}`,
+      message: `${customerName} exchanged Order #${origNum} for ${itemName} (Replacement Order #${newNum}).`,
+      userEmail: customerEmail || undefined,
+      orderNumber: String(newNum),
+      metadata: {
+        returnId: returnReq.id,
+        returnNumber: returnReq.returnNumber,
+        exchangeOrderId: replacementOrder?.id,
+        userId: returnReq.userId
+      },
+      emailDispatched: userSent,
+      systemMailDispatched: sysSent
+    })
+  }
+
+  async sendReturnOutcomeNotification(returnReq: ReturnRequest, order: any): Promise<void> {
+    const customerEmail = returnReq.userEmail || order?.user?.email
+    const customerName = returnReq.userName || 'Valued Customer'
+    const orderNum = order?.orderNumber || returnReq.orderNumber || returnReq.orderId
+    const isCompleted = returnReq.status === 'COMPLETED'
+    const { adminContactEmail } = this.getTransporter()
+
+    let userSent = false
+    if (customerEmail && isValidEmailAddress(customerEmail)) {
+      const res = await this.dispatchMail({
+        to: customerEmail,
+        subject: `Return ${returnReq.returnNumber} ${isCompleted ? 'Completed' : 'Update'} • Order #${orderNum}`,
+        text: isCompleted
+          ? `Hello ${customerName},\n\nYour returned shipment for Order #${orderNum} (${returnReq.returnNumber}) has been received and verified complete.\n\nSupport: ${adminContactEmail}`
+          : `Hello ${customerName},\n\nUpdate on Return ${returnReq.returnNumber} (Order #${orderNum}): Status is ${returnReq.status}.${returnReq.adminNotes ? `\nNote: ${returnReq.adminNotes}` : ''}\n\nSupport: ${adminContactEmail}`
+      })
+      userSent = res.success
+    }
+
+    this.recordActivity({
+      type: isCompleted ? 'RETURN_COMPLETED' : 'RETURN_REJECTED',
+      title: `Return ${isCompleted ? 'Completed' : 'Rejected'} • ${returnReq.returnNumber}`,
+      message: `Return ${returnReq.returnNumber} for Order #${orderNum} marked ${returnReq.status}.`,
+      userEmail: customerEmail || undefined,
+      orderNumber: orderNum,
+      metadata: {
+        returnId: returnReq.id,
+        returnNumber: returnReq.returnNumber,
+        status: returnReq.status,
+        userId: returnReq.userId
+      },
+      emailDispatched: userSent,
+      systemMailDispatched: false
+    })
   }
 }
 

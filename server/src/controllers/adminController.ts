@@ -43,6 +43,13 @@ const bookingStatusSchema = z.object({
   status: z.enum(['PENDING', 'CONFIRMED', 'NOTIFIED', 'CANCELLED'])
 })
 
+const paymentOptionsSchema = z.object({
+  paypalAvailable: z.boolean().optional(),
+  paypalNotice: z.string().trim().max(400).optional(),
+  stripeAvailable: z.boolean().optional(),
+  stripeNotice: z.string().trim().max(400).optional()
+})
+
 const replySupportSchema = z.object({
   content: z.string().trim().min(1, 'Reply message content is required.').max(2000)
 })
@@ -601,10 +608,14 @@ export const streamNotifications = (req: Request, res: Response) => {
   const onAnalyticsSync = (payload: any) => {
     res.write(`event: analytics_sync\ndata: ${JSON.stringify(payload)}\n\n`)
   }
+  const onPaymentConfigSync = (payload: any) => {
+    res.write(`event: payment_config_sync\ndata: ${JSON.stringify(payload)}\n\n`)
+  }
 
   emailService.activityEmitter.on('activity', onActivity)
   emailService.activityEmitter.on('support_sync', onSupportSync)
   emailService.activityEmitter.on('analytics_sync', onAnalyticsSync)
+  emailService.activityEmitter.on('payment_config_sync', onPaymentConfigSync)
 
   const heartbeat = setInterval(() => {
     res.write(`: heartbeat\n\n`)
@@ -615,6 +626,7 @@ export const streamNotifications = (req: Request, res: Response) => {
     emailService.activityEmitter.off('activity', onActivity)
     emailService.activityEmitter.off('support_sync', onSupportSync)
     emailService.activityEmitter.off('analytics_sync', onAnalyticsSync)
+    emailService.activityEmitter.off('payment_config_sync', onPaymentConfigSync)
   })
 }
 
@@ -702,6 +714,7 @@ export const replySupportSession = async (req: Request, res: Response) => {
 
     const result = await databaseService.appendSupportMessage(sessionId, {
       senderRole: 'ADMIN',
+      senderUserId: req.user!.id,
       senderName,
       content: cleanContent
     })
@@ -739,16 +752,12 @@ export const updateSupportSessionStatus = async (req: Request, res: Response) =>
     }
 
     const sessionId = req.params.id
-    const { status, markRead, aiPaused } = req.body
+    const { status, markRead } = req.body
 
     let session = null
     let changed = false
     if (markRead) {
       session = await databaseService.markSupportSessionRead(sessionId, 'ADMIN')
-      if (session) changed = true
-    }
-    if (typeof aiPaused === 'boolean') {
-      session = await databaseService.setSupportSessionAiMode(sessionId, aiPaused)
       if (session) changed = true
     }
     if (status === 'OPEN' || status === 'RESOLVED') {
@@ -856,6 +865,86 @@ export const updateProductBookingStatus = async (req: Request, res: Response) =>
     res.status(500).json({
       success: false,
       error: 'Unable to update booking status.'
+    })
+  }
+}
+
+// @desc    Get checkout payment gateway availability settings (Admin)
+// @route   GET /api/admin/payment-options
+// @access  Private/Admin
+export const getPaymentOptions = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const config = await databaseService.getPaymentOptionsConfig(true)
+    res.status(200).json({
+      success: true,
+      data: config
+    })
+  } catch (error) {
+    console.error('Error fetching payment options config:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to load payment gateway settings.'
+    })
+  }
+}
+
+// @desc    Toggle checkout payment option availability & shopper notice (Admin)
+// @route   PUT /api/admin/payment-options
+// @access  Private/Admin
+export const updatePaymentOptions = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const parsed = paymentOptionsSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]?.message || 'Invalid payment gateway configuration payload.'
+      })
+    }
+
+    const updated = await databaseService.setPaymentOptionsConfig({
+      ...parsed.data,
+      updatedBy: req.user?.email || null
+    })
+
+    const summaryText = `PayPal: ${updated.paypal.available ? 'Available' : 'UNAVAILABLE (Blocked)'} • Stripe Card: ${updated.stripe.available ? 'Available' : 'UNAVAILABLE (Blocked)'}`
+    emailService.recordActivity({
+      type: 'PAYMENT_GATEWAY_STATUS_UPDATED',
+      title: 'Checkout Payment Options Updated',
+      message: summaryText,
+      userEmail: req.user?.email || undefined,
+      metadata: {
+        paypalAvailable: updated.paypal.available,
+        stripeAvailable: updated.stripe.available
+      },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+    emailService.emitPaymentConfigSync(updated)
+
+    res.status(200).json({
+      success: true,
+      message: 'Checkout payment option availability updated.',
+      data: updated
+    })
+  } catch (error) {
+    console.error('Error updating payment options config:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to update payment gateway settings.'
     })
   }
 }

@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { Link, useNavigate, useLocation } from 'react-router-dom'
+import { Link, useNavigate, useLocation, useSearchParams } from 'react-router-dom'
 import { Eye, EyeOff, LogIn, AlertCircle, X, Mail, MessageSquare } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPdf'
@@ -7,6 +7,7 @@ import { formatSupportPhone, getSupportWhatsAppDigits } from '../utils/receiptPd
 const LoginPage = () => {
   const navigate = useNavigate()
   const location = useLocation()
+  const [searchParams] = useSearchParams()
   const { login, isLoading, error, clearError } = useAuth()
 
   const [formData, setFormData] = useState({
@@ -19,7 +20,8 @@ const LoginPage = () => {
   const supportPhone = formatSupportPhone()
   const whatsAppDigits = getSupportWhatsAppDigits()
 
-  const from = (location.state as any)?.from?.pathname || '/'
+  const rawRedirect = searchParams.get('redirect') || (location.state as any)?.from?.pathname || '/'
+  const from = rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/'
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target
@@ -34,8 +36,10 @@ const LoginPage = () => {
     e.preventDefault()
 
     try {
-      await login(formData.email, formData.password)
-      navigate(from, { replace: true })
+      const loggedInUser = await login(formData.email, formData.password)
+      const destination =
+        from === '/' && loggedInUser?.role === 'ADMIN' ? '/admin' : from
+      navigate(destination, { replace: true })
     } catch (error) {
       // Handled in auth context
     }
@@ -63,7 +67,10 @@ const LoginPage = () => {
         </h2>
         <p className="mt-2 text-xs text-gray-500 dark:text-gray-400 font-medium">
           New to DriveFlyElectric?{' '}
-          <Link to="/register" className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors">
+          <Link
+            to={from !== '/' ? `/register?redirect=${encodeURIComponent(from)}` : '/register'}
+            className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors"
+          >
             Create an account
           </Link>
         </p>

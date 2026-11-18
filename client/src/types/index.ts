@@ -145,10 +145,12 @@ export interface Order {
   tax: number
   shipping: number
   discount: number
-  paymentMethod: 'STRIPE' | 'PAYPAL'
+  paymentMethod: 'STRIPE' | 'PAYPAL' | 'WALLET' | 'WALLET_STRIPE' | 'WALLET_PAYPAL'
   paymentStatus: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
   paymentId?: string
   receiptToken?: string
+  deliveredAt?: string | null
+  walletAmountUsed?: number
   shippingAddressId?: string
   billingAddressId?: string
   notes?: string
@@ -242,7 +244,15 @@ export interface PaymentIntent {
 }
 
 // LiveChat & Support types
-export type SupportTopic = 'Payment Issue' | 'Item Purchase' | 'General Inquiry' | 'Shipping Issue'
+export type SupportTopic =
+  | 'General Inquiry'
+  | 'Shipping Inquiry'
+  | 'Item Purchase'
+  | 'Payment Queries'
+  | 'Return Policy'
+  | 'Payment Issue'
+  | 'Shipping Issue'
+  | string
 
 export interface SupportSelectedProduct {
   id: string
@@ -256,7 +266,7 @@ export interface SupportSelectedProduct {
 export interface SupportMessage {
   id: string
   sessionId: string
-  senderRole: 'CLIENT' | 'ADMIN' | 'AI_ASSISTANT'
+  senderRole: 'CLIENT' | 'ADMIN' | 'SYSTEM' | 'AI_ASSISTANT'
   senderName: string
   content: string
   metadata?: Record<string, any>
@@ -271,8 +281,9 @@ export interface SupportSession {
   visitorName: string
   visitorEmail?: string
   visitorPhone?: string
-  topic: SupportTopic | string
+  topic: SupportTopic
   selectedProducts: SupportSelectedProduct[]
+  activeOrderId?: string | null
   status: 'OPEN' | 'RESOLVED'
   isOnline: boolean
   lastSeenAt: string
@@ -382,4 +393,125 @@ export interface AdminAnalyticsData {
   recentActivity: Order[]
   activeCartRemindersCount?: number
   trafficAnalytics: TrafficAnalyticsSummary
+}
+
+export interface PaymentOptionStatus {
+  available: boolean
+  notice: string
+  updatedAt?: string | null
+  updatedBy?: string | null
+}
+
+export interface PaymentOptionsConfig {
+  paypal: PaymentOptionStatus
+  stripe: PaymentOptionStatus
+}
+
+// Wallet & 21-Day Return Policy types
+export type WalletTransactionType =
+  | 'REFUND_DEPOSIT'
+  | 'CHECKOUT_PAYMENT'
+  | 'EXCHANGE_CREDIT'
+  | 'ADMIN_ADJUSTMENT'
+
+export type WalletTransactionDirection = 'CREDIT' | 'DEBIT'
+
+export interface Wallet {
+  id: string
+  userId: string
+  balance: number
+  currency: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WalletTransaction {
+  id: string
+  walletId: string
+  userId: string
+  type: WalletTransactionType
+  direction: WalletTransactionDirection
+  amount: number
+  balanceBefore: number
+  balanceAfter: number
+  orderId?: string | null
+  returnRequestId?: string | null
+  referenceId?: string | null
+  description: string
+  createdBy?: string | null
+  createdAt: string
+}
+
+export interface WalletSummary {
+  wallet: Wallet
+  transactions: WalletTransaction[]
+}
+
+export interface ActiveShippingSummary {
+  hasActiveShipping: boolean
+  orders: Order[]
+}
+
+export type ReturnReasonType = 'NOT_AS_ORDERED_REFUND' | 'EXCHANGE_EQUAL_VALUE'
+
+export type ReturnRequestStatus =
+  | 'PENDING_REVIEW'
+  | 'WALLET_CREDITED'
+  | 'EXCHANGE_APPROVED'
+  | 'COMPLETED'
+  | 'REJECTED'
+  | 'EXPIRED'
+
+export interface ReturnRequestItem {
+  productId: string
+  name: string
+  sku?: string | null
+  quantity: number
+  unitPrice: number
+  totalPrice: number
+}
+
+export interface ReturnRequest {
+  id: string
+  returnNumber: string
+  orderId: string
+  orderNumber?: string | null
+  orderTrackingNumber?: string | null
+  userId: string
+  userEmail?: string | null
+  userName?: string | null
+  reasonType: ReturnReasonType
+  reasonDetails?: string | null
+  items: ReturnRequestItem[]
+  exchangeProductId?: string | null
+  exchangeProduct?: Product | null
+  exchangeOrderId?: string | null
+  refundAmount: number
+  exchangePriceDelta: number
+  status: ReturnRequestStatus
+  walletCredited: boolean
+  walletTransactionId?: string | null
+  returnTrackingNumber?: string | null
+  eligibleUntil: string
+  processedBy?: string | null
+  adminNotes?: string | null
+  processedAt?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface EligibleExchangeResponse {
+  orderId: string
+  orderNumber: string
+  baseCatalogValue: number
+  tolerancePercent: number
+  eligibility: {
+    eligible: boolean
+    expired: boolean
+    reason?: string
+    anchorDate: string
+    eligibleUntil: string
+    daysRemaining: number
+  }
+  products: Array<Product & { priceDifference: number; exactMatch: boolean }>
 }

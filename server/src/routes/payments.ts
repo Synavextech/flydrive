@@ -1,4 +1,4 @@
-import express, { Request } from 'express'
+import express, { Request, Response } from 'express'
 import Stripe from 'stripe'
 import { z } from 'zod'
 import { optionalAuth } from '../middleware/auth.js'
@@ -44,8 +44,28 @@ const shippingInputSchema = z
 const createPaymentRequestSchema = z.object({
   items: z.array(paymentItemSchema).optional(),
   customerEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
-  shippingAddress: shippingInputSchema
+  shippingAddress: shippingInputSchema,
+  useWallet: z.boolean().optional()
 })
+
+async function resolveGatewayAmountsWithWallet(
+  req: Request,
+  totalUsd: number,
+  useWallet?: boolean
+): Promise<{ walletApplied: number; gatewayAmount: number; coveredByWallet: boolean }> {
+  const cleanTotal = databaseService.roundCurrency(totalUsd)
+  if (!useWallet || !req.user?.id) {
+    return { walletApplied: 0, gatewayAmount: cleanTotal, coveredByWallet: false }
+  }
+  const wallet = await databaseService.getOrCreateWallet(req.user.id)
+  const walletApplied = Math.min(databaseService.roundCurrency(wallet.balance), cleanTotal)
+  const gatewayAmount = databaseService.roundCurrency(Math.max(0, cleanTotal - walletApplied))
+  return {
+    walletApplied,
+    gatewayAmount,
+    coveredByWallet: gatewayAmount <= 0
+  }
+}
 
 async function resolveItemsForPricing(req: Request, requestedItems?: Array<{ productId: string; quantity: number }>) {
   if (Array.isArray(requestedItems) && requestedItems.length > 0) {
@@ -63,11 +83,25 @@ async function resolveItemsForPricing(req: Request, requestedItems?: Array<{ pro
   return []
 }
 
+async function ensureGatewayAvailable(gateway: 'paypal' | 'stripe', res: Response): Promise<boolean> {
+  const availability = await databaseService.getPaymentOptionsConfig()
+  const entry = availability[gateway]
+  if (!entry.available) {
+    res.status(503).json({
+      success: false,
+      code: 'PAYMENT_OPTION_UNAVAILABLE',
+      error: entry.notice
+    })
+    return false
+  }
+  return true
+}
+
 // ==========================================
 // 0. PAYMENT GATEWAY RUNTIME CONFIGURATION
 // ==========================================
 
-// Returns public client keys and PayPal Client Token for JS SDK Buttons & Card Fields
+// Returns public client keys, PayPal Client Token, and admin-toggled gateway availability
 router.get('/config', async (_req, res) => {
   const stripePublishableKey = (
     process.env.STRIPE_PUBLISHABLE_KEY ||
@@ -85,9 +119,10 @@ router.get('/config', async (_req, res) => {
     ''
   ).trim()
   const paypalMode = getPayPalMode()
+  const paymentAvailability = await databaseService.getPaymentOptionsConfig()
 
   let paypalClientToken: string | null = null
-  if (paypalClientId) {
+  if (paypalClientId && paymentAvailability.paypal.available) {
     try {
       const { token, baseUrl } = await getPayPalAccessToken()
       const tokenRes = await fetch(`${baseUrl}/v1/identity/generate-token`, {
@@ -115,7 +150,8 @@ router.get('/config', async (_req, res) => {
       paypalMerchantId,
       paypalMode,
       paypalClientToken,
-      supportEmail: getAdminContactEmail()
+      supportEmail: getAdminContactEmail(),
+      paymentAvailability
     }
   })
 })
@@ -127,6 +163,7 @@ router.get('/config', async (_req, res) => {
 // Create Payment Intent with authoritative server-computed USD total
 router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (req, res) => {
   try {
+    if (!(await ensureGatewayAvailable('stripe', res))) return
     const parsed = createPaymentRequestSchema.safeParse(req.body)
     if (!parsed.success) {
       return res.status(400).json({
@@ -144,7 +181,20 @@ router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (
     }
 
     const pricing = await computeAuthoritativeOrderPricing(items)
-    const amountInCents = Math.round(pricing.total * 100)
+    const walletSplit = await resolveGatewayAmountsWithWallet(req, pricing.total, parsed.data.useWallet)
+    if (walletSplit.coveredByWallet) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          coveredByWallet: true,
+          walletApplied: walletSplit.walletApplied,
+          orderTotal: pricing.total,
+          amount: 0
+        }
+      })
+    }
+
+    const amountInCents = Math.round(walletSplit.gatewayAmount * 100)
     const customerEmail = parsed.data.customerEmail || req.user?.email || undefined
     const ship = parsed.data.shippingAddress
 
@@ -176,16 +226,18 @@ router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (
         company: 'DriveFlyElectric',
         subtotal_usd: pricing.subtotal.toFixed(2),
         tax_usd: pricing.tax.toFixed(2),
+        wallet_applied_usd: walletSplit.walletApplied.toFixed(2),
+        gateway_due_usd: walletSplit.gatewayAmount.toFixed(2),
         total_usd: pricing.total.toFixed(2)
       }
     })
 
     emailService.recordActivity({
       type: 'PAYMENT_AUTHORIZED',
-      title: `Stripe Card Intent Initialized • $${pricing.total.toFixed(2)} USD`,
-      message: `Stripe PaymentIntent (${paymentIntent.id}) created for $${pricing.total.toFixed(2)} USD.`,
+      title: `Stripe Card Intent Initialized • $${walletSplit.gatewayAmount.toFixed(2)} USD`,
+      message: `Stripe PaymentIntent (${paymentIntent.id}) created for $${walletSplit.gatewayAmount.toFixed(2)} USD${walletSplit.walletApplied > 0 ? ` (after $${walletSplit.walletApplied.toFixed(2)} wallet balance)` : ''}.`,
       userEmail: customerEmail,
-      amount: pricing.total,
+      amount: walletSplit.gatewayAmount,
       emailDispatched: false,
       systemMailDispatched: false
     })
@@ -195,7 +247,9 @@ router.post('/stripe/create-intent', paymentInitRateLimit, optionalAuth, async (
       data: {
         clientSecret: paymentIntent.client_secret,
         paymentIntentId: paymentIntent.id,
-        amount: pricing.total
+        amount: walletSplit.gatewayAmount,
+        walletApplied: walletSplit.walletApplied,
+        orderTotal: pricing.total
       }
     })
   } catch (error: any) {
@@ -520,6 +574,7 @@ router.post('/stripe/webhook', async (req, res) => {
 // Create PayPal Order with authoritative server-computed USD total
 router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (req, res) => {
   try {
+    if (!(await ensureGatewayAvailable('paypal', res))) return
     const parsed = createPaymentRequestSchema.safeParse(req.body)
     if (!parsed.success) {
       return res.status(400).json({
@@ -537,8 +592,21 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
     }
 
     const pricing = await computeAuthoritativeOrderPricing(items)
+    const walletSplit = await resolveGatewayAmountsWithWallet(req, pricing.total, parsed.data.useWallet)
+    if (walletSplit.coveredByWallet) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          coveredByWallet: true,
+          walletApplied: walletSplit.walletApplied,
+          orderTotal: pricing.total,
+          amount: 0
+        }
+      })
+    }
+
     const { token, baseUrl } = await getPayPalAccessToken()
-    const formattedTotal = pricing.total.toFixed(2)
+    const formattedTotal = walletSplit.gatewayAmount.toFixed(2)
     const cleanOrigin = resolveSafeRedirectOrigin(req)
     const customerEmail = parsed.data.customerEmail || req.user?.email || undefined
     const ship = parsed.data.shippingAddress
@@ -549,7 +617,10 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
       purchase_units: [
         {
           reference_id: `DFE-${Date.now()}`,
-          description: 'DriveFlyElectric Order',
+          description:
+            walletSplit.walletApplied > 0
+              ? `DriveFlyElectric Order (Wallet -$${walletSplit.walletApplied.toFixed(2)})`
+              : 'DriveFlyElectric Order',
           amount: {
             currency_code: 'USD',
             value: formattedTotal,
@@ -565,7 +636,15 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
               shipping: {
                 currency_code: 'USD',
                 value: pricing.shipping.toFixed(2)
-              }
+              },
+              ...(walletSplit.walletApplied > 0
+                ? {
+                    discount: {
+                      currency_code: 'USD',
+                      value: walletSplit.walletApplied.toFixed(2)
+                    }
+                  }
+                : {})
             }
           },
           ...(hasShippingAddress && ship
@@ -644,7 +723,9 @@ router.post('/paypal/create-order', paymentInitRateLimit, optionalAuth, async (r
         orderId: orderData.id,
         approveUrl: approveLink,
         status: orderData.status,
-        amount: pricing.total
+        amount: walletSplit.gatewayAmount,
+        walletApplied: walletSplit.walletApplied,
+        orderTotal: pricing.total
       }
     })
   } catch (error: any) {

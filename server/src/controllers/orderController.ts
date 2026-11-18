@@ -9,6 +9,7 @@ import { buildReceiptDataFromOrder, generateReceiptPdfBuffer } from '../utils/re
 import {
   extractGuestMetadataFromNotes,
   getJwtSecret,
+  isSecureCookieRequest,
   signReceiptAccessToken,
   verifyReceiptAccessToken
 } from '../middleware/security.js'
@@ -46,9 +47,10 @@ const createOrderSchema = z.object({
       countryCode: z.string().trim().max(5).optional()
     })
     .optional(),
-  paymentMethod: z.enum(['STRIPE', 'PAYPAL']).default('PAYPAL'),
-  paymentId: z.string().trim().min(3, 'A verified payment transaction ID is required.').max(200),
+  paymentMethod: z.enum(['STRIPE', 'PAYPAL', 'WALLET']).default('PAYPAL'),
+  paymentId: z.string().trim().max(200).optional().default(''),
   paypalOrderId: z.string().trim().max(120).optional(),
+  useWallet: z.boolean().optional().default(false),
   notes: z.string().trim().max(2000).optional(),
   items: z
     .array(
@@ -87,20 +89,35 @@ export const createOrder = async (req: Request, res: Response) => {
       billingAddressId,
       shippingAddress: shippingAddressInput,
       paymentMethod,
-      paymentId,
+      paymentId: rawPaymentId,
       paypalOrderId,
+      useWallet,
       notes,
       items: bodyItems,
       password: customerPassword,
       createAccount
     } = parsed.data
 
+    if (paymentMethod !== 'WALLET' && (!rawPaymentId || rawPaymentId.length < 3)) {
+      return res.status(400).json({
+        success: false,
+        error: 'A verified payment transaction ID is required.'
+      })
+    }
+
+    const paymentId =
+      paymentMethod === 'WALLET'
+        ? rawPaymentId && rawPaymentId.length >= 3
+          ? rawPaymentId
+          : `WALLET-${crypto.randomUUID()}`
+        : rawPaymentId
+
     const rawCustomerEmail =
       customer?.email || shippingAddressInput?.email || req.user?.email || ''
     const customerEmail = rawCustomerEmail.trim().toLowerCase()
 
     // 1. Idempotency check on raw paymentId before allocating any order/user resources
-    const existingByPayment = await databaseService.findOrderByPaymentId(paymentId)
+    const existingByPayment = paymentId ? await databaseService.findOrderByPaymentId(paymentId) : null
     if (existingByPayment) {
       const guestMeta = extractGuestMetadataFromNotes(existingByPayment.notes)
       const callerOwnsOrder =
@@ -165,7 +182,7 @@ export const createOrder = async (req: Request, res: Response) => {
         tokenToReturn = (jwt as any).sign(
           { id: newUser.id, email: newUser.email, role: newUser.role },
           getJwtSecret(),
-          { expiresIn: process.env.JWT_EXPIRE || '30d' }
+          { expiresIn: process.env.JWT_EXPIRES_IN || process.env.JWT_EXPIRE || '7d' }
         )
 
         emailService
@@ -211,42 +228,80 @@ export const createOrder = async (req: Request, res: Response) => {
       })
     }
 
-    // 3. Mandatory live gateway verification BEFORE recording settled order
-    const verification =
-      paymentMethod === 'STRIPE'
-        ? await verifyStripePaymentIntent(paymentId, pricing.total)
-        : await verifyPayPalPayment(paymentId, pricing.total, paypalOrderId)
-
-    if (!verification.verified) {
-      emailService
-        .recordPaymentFailure({
-          gateway: paymentMethod,
-          stage: 'Order Verification',
-          amount: pricing.total,
-          userEmail: customerEmail || req.user?.email || undefined,
-          referenceId: paymentId,
-          reason: verification.reason || 'Payment verification failed with the processor.'
-        })
-        .catch(() => {})
-
-      return res.status(402).json({
+    // 2B. Enforce authenticated account for Wallet payments and compute authoritative wallet/gateway split
+    if ((paymentMethod === 'WALLET' || useWallet) && !userId) {
+      return res.status(401).json({
         success: false,
-        error:
-          verification.reason ||
-          'Payment verification failed with the processor. Your order has not been finalized.'
+        error: 'Please sign in or create an account to use your DriveFlyElectric Wallet balance.'
       })
     }
 
-    const verifiedPaymentId = verification.paymentId || paymentId
-    if (verifiedPaymentId !== paymentId) {
-      const duplicateVerified = await databaseService.findOrderByPaymentId(verifiedPaymentId)
-      if (duplicateVerified) {
-        return res.status(409).json({
+    let walletApplied = 0
+    let gatewayDue = pricing.total
+    if (paymentMethod === 'WALLET') {
+      const wallet = await databaseService.getOrCreateWallet(userId!)
+      if (wallet.balance < pricing.total) {
+        return res.status(400).json({
           success: false,
-          error: 'This captured payment has already been assigned to an order.'
+          error: `Insufficient wallet balance ($${wallet.balance.toFixed(2)}) for order total $${pricing.total.toFixed(2)}. Toggle Apply Wallet Balance with Stripe or PayPal to pay the difference.`
         })
       }
+      walletApplied = pricing.total
+      gatewayDue = 0
+    } else if (useWallet && userId) {
+      const wallet = await databaseService.getOrCreateWallet(userId)
+      walletApplied = Math.min(databaseService.roundCurrency(wallet.balance), pricing.total)
+      gatewayDue = databaseService.roundCurrency(Math.max(0, pricing.total - walletApplied))
     }
+
+    // 3. Mandatory live gateway verification BEFORE debiting wallet or recording settled order
+    let verifiedPaymentId = paymentId
+    if (gatewayDue > 0) {
+      const verification =
+        paymentMethod === 'STRIPE'
+          ? await verifyStripePaymentIntent(paymentId, gatewayDue)
+          : await verifyPayPalPayment(paymentId, gatewayDue, paypalOrderId)
+
+      if (!verification.verified) {
+        emailService
+          .recordPaymentFailure({
+            gateway: paymentMethod as 'STRIPE' | 'PAYPAL',
+            stage: 'Order Verification',
+            amount: gatewayDue,
+            userEmail: customerEmail || req.user?.email || undefined,
+            referenceId: paymentId,
+            reason: verification.reason || 'Payment verification failed with the processor.'
+          })
+          .catch(() => {})
+
+        return res.status(402).json({
+          success: false,
+          error:
+            verification.reason ||
+            'Payment verification failed with the processor. Your order has not been finalized.'
+        })
+      }
+
+      verifiedPaymentId = verification.paymentId || paymentId
+      if (verifiedPaymentId !== paymentId) {
+        const duplicateVerified = await databaseService.findOrderByPaymentId(verifiedPaymentId)
+        if (duplicateVerified) {
+          return res.status(409).json({
+            success: false,
+            error: 'This captured payment has already been assigned to an order.'
+          })
+        }
+      }
+    }
+
+    const storedPaymentMethod =
+      walletApplied > 0 && gatewayDue === 0
+        ? 'WALLET'
+        : walletApplied > 0 && gatewayDue > 0
+          ? paymentMethod === 'STRIPE'
+            ? 'WALLET_STRIPE'
+            : 'WALLET_PAYPAL'
+          : paymentMethod
 
     // 4. Persist shipping address record only for resolved user accounts
     let finalShippingAddressId: string | undefined = shippingAddressId || undefined
@@ -292,27 +347,79 @@ export const createOrder = async (req: Request, res: Response) => {
     const mergedNotes = structuredSegments.join(' ')
 
     const generatedReceiptToken = crypto.randomBytes(24).toString('hex')
-    const order = await databaseService.createOrder({
-      userId,
-      total: pricing.total,
-      subtotal: pricing.subtotal,
-      tax: pricing.tax,
-      shipping: pricing.shipping,
-      paymentMethod,
-      paymentId: verifiedPaymentId,
-      paymentStatus: 'COMPLETED',
-      paymentVerified: true,
-      receiptToken: generatedReceiptToken,
-      status: 'PROCESSING',
-      shippingAddressId: finalShippingAddressId,
-      billingAddressId: billingAddressId || undefined,
-      notes: mergedNotes,
-      items: pricing.orderItems.map(({ productId, quantity, price }) => ({
-        productId,
-        quantity,
-        price
-      }))
-    })
+    let walletDebitTxId: string | null = null
+    const walletDebitRef = `checkout_wallet:${verifiedPaymentId}`
+
+    if (walletApplied > 0 && userId) {
+      const debitRes = await databaseService.debitWalletAtomic({
+        userId,
+        type: 'CHECKOUT_PAYMENT',
+        amount: walletApplied,
+        description: `Wallet checkout payment (${storedPaymentMethod} • ${verifiedPaymentId})`,
+        referenceId: walletDebitRef,
+        createdBy: userId
+      })
+      walletDebitTxId = debitRes.transactionId
+    }
+
+    let order
+    try {
+      order = await databaseService.createOrder({
+        userId,
+        total: pricing.total,
+        subtotal: pricing.subtotal,
+        tax: pricing.tax,
+        shipping: pricing.shipping,
+        walletAmountUsed: walletApplied,
+        paymentMethod: storedPaymentMethod,
+        paymentId: verifiedPaymentId,
+        paymentStatus: 'COMPLETED',
+        paymentVerified: true,
+        receiptToken: generatedReceiptToken,
+        status: 'PROCESSING',
+        shippingAddressId: finalShippingAddressId,
+        billingAddressId: billingAddressId || undefined,
+        notes: mergedNotes,
+        items: pricing.orderItems.map(({ productId, quantity, price }) => ({
+          productId,
+          quantity,
+          price
+        }))
+      })
+    } catch (createOrderErr) {
+      if (walletApplied > 0 && userId && walletDebitTxId) {
+        await databaseService
+          .creditWalletAtomic({
+            userId,
+            type: 'ADMIN_ADJUSTMENT',
+            amount: walletApplied,
+            description: `Automatic checkout reversal (${verifiedPaymentId})`,
+            referenceId: `rollback:${walletDebitRef}`,
+            createdBy: userId
+          })
+          .catch((rbErr) => console.error('Wallet rollback failed:', rbErr))
+      }
+      throw createOrderErr
+    }
+
+    if (walletDebitTxId) {
+      await databaseService.linkWalletTransactionOrderId(walletDebitTxId, order.id).catch(() => {})
+      emailService.recordActivity({
+        type: 'WALLET_DEBITED',
+        title: `Wallet Payment Applied • $${walletApplied.toFixed(2)} USD`,
+        message: `${authUserToReturn?.email || customerEmail || 'Customer'} paid $${walletApplied.toFixed(2)} from Wallet for Order #${order.orderNumber}.`,
+        userEmail: authUserToReturn?.email || customerEmail || undefined,
+        orderNumber: order.orderNumber,
+        amount: walletApplied,
+        metadata: {
+          orderId: order.id,
+          userId: userId || undefined,
+          transactionId: walletDebitTxId
+        },
+        emailDispatched: false,
+        systemMailDispatched: false
+      })
+    }
 
     const effectiveReceiptToken = order.receiptToken || signReceiptAccessToken(order.id)
 
@@ -349,7 +456,7 @@ export const createOrder = async (req: Request, res: Response) => {
     if (tokenToReturn) {
       res.cookie('token', tokenToReturn, {
         httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
+        secure: isSecureCookieRequest(req),
         sameSite: 'lax',
         maxAge: 30 * 24 * 60 * 60 * 1000
       })
@@ -421,6 +528,26 @@ export const getOrders = async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: 'Unable to load orders.'
+    })
+  }
+}
+
+// @desc    Get user's active shipping orders (PROCESSING / SHIPPED) for WhatsApp & LiveChat shipping inquiry
+// @route   GET /api/orders/active-shipping
+// @access  Private
+export const getActiveShippingOrders = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id
+    const activeSummary = await databaseService.getActiveShippingOrders(userId)
+    res.status(200).json({
+      success: true,
+      data: activeSummary
+    })
+  } catch (error) {
+    console.error('Error fetching active shipping orders:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to verify active shipping status.'
     })
   }
 }

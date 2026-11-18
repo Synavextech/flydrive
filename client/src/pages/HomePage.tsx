@@ -32,7 +32,7 @@ import { AuthModal } from '../components/AuthModal'
 import { QuickCartDrawer } from '../components/QuickCartDrawer'
 import { ShareProductButton } from '../components/ShareProductButton'
 import { BookComingSoonModal } from '../components/BookComingSoonModal'
-import { formatSupportPhone, getSupportContactEmail, getSupportWhatsAppDigits } from '../utils/receiptPdf'
+import { formatSupportPhone, getSupportContactEmail } from '../utils/receiptPdf'
 
 const CATEGORIES = [
   { id: 'all', label: 'All Rigs' },
@@ -72,7 +72,6 @@ export const HomePage: React.FC = () => {
   const [newsletterSubscribed, setNewsletterSubscribed] = useState(false)
 
   const supportPhone = formatSupportPhone()
-  const whatsAppDigits = getSupportWhatsAppDigits()
 
   // Quick Review Composer & Photo Zoom Modal state
   const [reviewModalProduct, setReviewModalProduct] = useState<Product | null>(null)
@@ -989,6 +988,32 @@ export const HomePage: React.FC = () => {
                                   <MessageSquare className="w-2.5 h-2.5" />
                                   <span>Write Review</span>
                                 </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    window.dispatchEvent(
+                                      new CustomEvent('dfe:open-livechat', {
+                                        detail: {
+                                          topic: 'Item Purchase',
+                                          source: 'catalog_card',
+                                          items: [
+                                            {
+                                              id: product.id,
+                                              name: product.name,
+                                              sku: product.sku,
+                                              price: product.price,
+                                              category: product.category,
+                                              image: product.images?.[0] || ''
+                                            }
+                                          ]
+                                        }
+                                      })
+                                    )
+                                  }
+                                  className="text-creamy-600 dark:text-creamy-400 hover:underline flex items-center gap-1"
+                                >
+                                  <span>Tag in Chat</span>
+                                </button>
                                 <Link
                                   to={`/product/${product.id}#reviews`}
                                   className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center gap-0.5"
@@ -1034,14 +1059,19 @@ export const HomePage: React.FC = () => {
 
                 <p>1000 DriveFly Electric Way, Suite 400</p>
                 <p>Austin, TX 78701, United States • Global Dispatch</p>
-                <a
-                  href={`https://wa.me/${whatsAppDigits}?text=Hello!%20I%20would%20like%20some%20assistance%20regarding%20DriveFlyElectric.`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-creamy-600 dark:text-creamy-400 font-semibold pt-1 block hover:underline"
+                <button
+                  type="button"
+                  onClick={() =>
+                    window.dispatchEvent(
+                      new CustomEvent('dfe:open-livechat', {
+                        detail: { topic: 'General Inquiry', source: 'footer' }
+                      })
+                    )
+                  }
+                  className="text-creamy-600 dark:text-creamy-400 font-semibold pt-1 block hover:underline text-left"
                 >
-                  📞 WhatsApp / Call: {supportPhone}
-                </a>
+                  💬 LiveChat Support • Hotline: {supportPhone}
+                </button>
                 <p className="text-creamy-600 dark:text-creamy-400 font-semibold">✉️ info-eurotopmobility@driveflyelectric.shop</p>
               </div>
 
@@ -1145,7 +1175,8 @@ export const HomePage: React.FC = () => {
                     Factory Warranty &amp; Guarantees
                   </button>
                 </li>
-                <li><Link to="/login" className="hover:text-creamy-500 dark:hover:text-white transition-colors">Customer Portal</Link></li>
+                <li><Link to="/faq" className="hover:text-creamy-500 dark:hover:text-white transition-colors">FAQ &amp; 21-Day Return Policy</Link></li>
+                <li><Link to={isAuthenticated ? '/account' : '/login'} className="hover:text-creamy-500 dark:hover:text-white transition-colors">Customer Portal &amp; Wallet</Link></li>
               </ul>
             </div>
 

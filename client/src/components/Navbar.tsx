@@ -18,7 +18,10 @@ import {
   Copy,
   Check,
   Loader2,
-  AlertCircle
+  AlertCircle,
+  Wallet,
+  MessageSquare,
+  BookOpen
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useCart } from '../contexts/CartContext'
@@ -399,6 +402,33 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                         </Link>
                       )}
 
+                      <Link
+                        to="/account"
+                        onClick={() => setShowUserMenu(false)}
+                        className="flex items-center px-4 py-2.5 text-xs font-bold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-white/5 transition-colors"
+                      >
+                        <Wallet className="mr-2 h-4 w-4 text-creamy-500" />
+                        My Account, Wallet &amp; Returns
+                      </Link>
+
+                      <Link
+                        to="/account?tab=chats"
+                        onClick={() => setShowUserMenu(false)}
+                        className="flex items-center px-4 py-2.5 text-xs font-bold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-white/5 transition-colors"
+                      >
+                        <MessageSquare className="mr-2 h-4 w-4 text-creamy-500" />
+                        My Support Chats
+                      </Link>
+
+                      <Link
+                        to="/faq"
+                        onClick={() => setShowUserMenu(false)}
+                        className="flex items-center px-4 py-2.5 text-xs font-bold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-white/5 transition-colors"
+                      >
+                        <BookOpen className="mr-2 h-4 w-4 text-creamy-500" />
+                        FAQ &amp; Return Policy
+                      </Link>
+
                       <button
                         type="button"
                         onClick={() => {
@@ -677,7 +707,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenCart }) => {
                 </p>
                 <nav className="grid grid-cols-3 gap-2.5">
                   <Link
-                    to={isAuthenticated ? (user?.role === 'ADMIN' ? '/admin' : '/checkout') : '/login'}
+                    to={isAuthenticated ? (user?.role === 'ADMIN' ? '/admin' : '/account') : '/login'}
                     onClick={() => setMobileMenuOpen(false)}
                     className="flex flex-col items-center justify-center gap-1.5 bg-gray-50 dark:bg-[#1a1a20] border border-gray-200 dark:border-white/10 rounded-lg py-3.5 text-gray-700 dark:text-gray-300 hover:text-creamy-500 transition-colors"
                   >

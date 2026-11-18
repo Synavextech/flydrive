@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken'
 import { z } from 'zod'
 import { databaseService } from '../services/databaseService.js'
 import { emailService } from '../utils/emailService.js'
-import { getJwtSecret } from '../middleware/security.js'
+import { getJwtSecret, isSecureCookieRequest } from '../middleware/security.js'
 
 const registerSchema = z.object({
   email: z.string().trim().email('Please provide a valid email address.').max(254),
@@ -45,14 +45,14 @@ const generateToken = (userId: string, email: string, role: string): string => {
   return (jwt as any).sign(
     { id: userId, email, role },
     secret,
-    { expiresIn: process.env.JWT_EXPIRE || '30d' }
+    { expiresIn: process.env.JWT_EXPIRES_IN || process.env.JWT_EXPIRE || '7d' }
   )
 }
 
-const setAuthCookie = (res: Response, token: string) => {
+const setAuthCookie = (req: Request, res: Response, token: string) => {
   res.cookie('token', token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: isSecureCookieRequest(req),
     sameSite: 'lax',
     maxAge: 30 * 24 * 60 * 60 * 1000
   })
@@ -106,7 +106,7 @@ export const register = async (req: Request, res: Response) => {
     })
 
     const token = generateToken(user.id, user.email, user.role)
-    setAuthCookie(res, token)
+    setAuthCookie(req, res, token)
 
     emailService
       .sendAccountRegistrationNotifications(user, 'Account Registration')
@@ -176,7 +176,7 @@ export const login = async (req: Request, res: Response) => {
     }
 
     const token = generateToken(user.id, user.email, user.role)
-    setAuthCookie(res, token)
+    setAuthCookie(req, res, token)
 
     emailService.recordActivity({
       type: 'USER_LOGIN',
@@ -207,10 +207,10 @@ export const login = async (req: Request, res: Response) => {
 // @desc    Logout user (clear HttpOnly cookie)
 // @route   POST /api/auth/logout
 // @access  Public
-export const logout = async (_req: Request, res: Response) => {
+export const logout = async (req: Request, res: Response) => {
   res.clearCookie('token', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: isSecureCookieRequest(req),
     sameSite: 'lax'
   })
   res.status(200).json({

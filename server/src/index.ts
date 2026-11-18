@@ -28,13 +28,12 @@ import adminRoutes from './routes/admin.js'
 import eventsRoutes from './routes/events.js'
 import paymentRoutes from './routes/payments.js'
 import cartRoutes from './routes/cart.js'
+import { walletRouter, returnRouter } from './routes/walletReturns.js'
 import { optionalAuth, protect } from './middleware/auth.js'
 import {
   createRateLimiter,
   isAllowedOrigin,
-  signSupportVisitorToken,
-  validateStartupEnvironment,
-  verifySupportVisitorToken
+  validateStartupEnvironment
 } from './middleware/security.js'
 import {
   getProfile,
@@ -291,6 +290,8 @@ app.use('/api/admin', adminRoutes)
 app.use('/api/events', eventsRoutes)
 app.use('/api/payments', paymentRoutes)
 app.use('/api/cart', cartRoutes)
+app.use('/api/wallet', walletRouter)
+app.use('/api/returns', returnRouter)
 
 // User profile & address management routes
 app.get('/api/users/profile', protect, getProfile)
@@ -302,7 +303,7 @@ app.post('/api/addresses', protect, createAddress)
 app.put('/api/addresses/:id', protect, updateAddress)
 app.delete('/api/addresses/:id', protect, deleteAddress)
 
-// Public Real-Time Client LiveChat & Support Routes (unlimited messaging; session-token & registered-account scoped)
+// Authenticated Real-Time Client LiveChat & Support Routes (strictly user-owned persistent threads; zero mock replies)
 const supportSelectedProductSchema = z.object({
   id: z.string().trim().min(1).max(120),
   name: z.string().trim().min(1).max(200),
@@ -330,6 +331,7 @@ const supportSessionInitSchema = z.object({
   visitorId: z.string().trim().max(120).optional(),
   topic: z.string().trim().max(200).optional(),
   selectedProducts: z.array(supportSelectedProductItemSchema).max(20).optional(),
+  activeOrderId: z.string().trim().max(120).optional().nullable(),
   visitorName: z.string().trim().max(120).optional(),
   visitorEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
   visitorPhone: z.string().trim().max(40).optional(),
@@ -340,30 +342,39 @@ const supportMessageSchema = z.object({
   content: z.string().trim().min(1, 'Message content is required.').max(2000),
   topic: z.string().trim().max(200).optional(),
   selectedProducts: z.array(supportSelectedProductItemSchema).max(20).optional(),
+  activeOrderId: z.string().trim().max(120).optional().nullable(),
   visitorName: z.string().trim().max(120).optional(),
   visitorEmail: z.string().trim().email().max(254).optional().or(z.literal('')),
   visitorPhone: z.string().trim().max(40).optional()
 })
 
-function hasSupportSessionAccess(req: express.Request, sessionId: string, existingSession?: any): boolean {
-  if (req.user?.role === 'ADMIN') return true
-  if (req.user?.id && existingSession) {
-    if (existingSession.userId && existingSession.userId === req.user.id) return true
-    if (
-      existingSession.visitorEmail &&
-      req.user.email &&
-      String(existingSession.visitorEmail).trim().toLowerCase() === String(req.user.email).trim().toLowerCase()
-    ) {
-      return true
-    }
+function hasSupportSessionAccess(req: express.Request, _sessionId: string, existingSession?: any): boolean {
+  if (!req.user?.id) return false
+  if (req.user.role === 'ADMIN') return true
+  if (!existingSession) return false
+  if (existingSession.userId && existingSession.userId === req.user.id) return true
+  if (
+    !existingSession.userId &&
+    existingSession.visitorEmail &&
+    req.user.email &&
+    String(existingSession.visitorEmail).trim().toLowerCase() === String(req.user.email).trim().toLowerCase()
+  ) {
+    return true
   }
-  const token = String(
-    (req.headers['x-support-token'] as string) || (req.query.token as string) || ''
-  ).trim()
-  return verifySupportVisitorToken(sessionId, token)
+  return false
 }
 
-app.post('/api/support/session', optionalAuth, async (req, res) => {
+app.get('/api/support/my-sessions', protect, async (req, res) => {
+  try {
+    const sessions = await databaseService.listSupportSessionsByUserId(req.user!.id)
+    res.status(200).json({ success: true, data: sessions })
+  } catch (err) {
+    console.error('Support sessions list error:', err)
+    res.status(500).json({ success: false, error: 'Failed to load your support chat threads.' })
+  }
+})
+
+app.post('/api/support/session', protect, async (req, res) => {
   try {
     const parsed = supportSessionInitSchema.safeParse(req.body || {})
     if (!parsed.success) {
@@ -382,33 +393,32 @@ app.post('/api/support/session', optionalAuth, async (req, res) => {
         }
         return res.status(403).json({
           success: false,
-          error: 'Support session token mismatch. Please start a new chat session.'
+          error: 'Support session belongs to another user account.'
         })
       }
     }
 
     const session = await databaseService.upsertSupportSession({
       ...parsed.data,
-      userId: req.user?.id,
+      userId: req.user!.id,
       registeredUser: req.user
     })
     if (!session) {
       return res.status(200).json({ success: true, data: null })
     }
-    const visitorToken = signSupportVisitorToken(session.id)
     emailService.emitSupportSync(session, 'session_updated')
-    res.status(200).json({ success: true, data: session, visitorToken })
+    res.status(200).json({ success: true, data: session })
   } catch (err) {
     console.error('Support session init error:', err)
     res.status(500).json({ success: false, error: 'Failed to initialize support session' })
   }
 })
 
-app.get('/api/support/session/:id/stream', optionalAuth, async (req, res) => {
+app.get('/api/support/session/:id/stream', protect, async (req, res) => {
   try {
     const sessionId = req.params.id
     const existing = await databaseService.getSupportSession(sessionId)
-    if (!hasSupportSessionAccess(req, sessionId, existing)) {
+    if (!existing || !hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized to stream this support session.'
@@ -449,11 +459,11 @@ app.get('/api/support/session/:id/stream', optionalAuth, async (req, res) => {
   }
 })
 
-app.get('/api/support/session/:id', optionalAuth, async (req, res) => {
+app.get('/api/support/session/:id', protect, async (req, res) => {
   try {
     const sessionId = req.params.id
     const existing = await databaseService.getSupportSession(sessionId)
-    if (!hasSupportSessionAccess(req, sessionId, existing)) {
+    if (!existing || !hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({
         success: false,
         error: 'Not authorized to access this support session.'
@@ -472,15 +482,14 @@ app.get('/api/support/session/:id', optionalAuth, async (req, res) => {
     if (req.query.open === 'true' && hadUnreadClient) {
       emailService.emitSupportSync(session, 'client_read')
     }
-    const visitorToken = signSupportVisitorToken(session.id)
-    res.status(200).json({ success: true, data: session, visitorToken })
+    res.status(200).json({ success: true, data: session })
   } catch (err) {
     console.error('Support session fetch error:', err)
     res.status(500).json({ success: false, error: 'Failed to load support session' })
   }
 })
 
-app.post('/api/support/session/:id/messages', optionalAuth, async (req, res) => {
+app.post('/api/support/session/:id/messages', protect, async (req, res) => {
   try {
     const sessionId = req.params.id
     const parsed = supportMessageSchema.safeParse(req.body || {})
@@ -499,14 +508,16 @@ app.post('/api/support/session/:id/messages', optionalAuth, async (req, res) => 
       })
     }
 
-    const { content, topic, selectedProducts, visitorName, visitorEmail, visitorPhone } = parsed.data
+    const { content, topic, selectedProducts, activeOrderId, visitorName, visitorEmail, visitorPhone } = parsed.data
     const result = await databaseService.appendSupportMessage(sessionId, {
       senderRole: 'CLIENT',
+      senderUserId: req.user!.id,
       senderName: visitorName || undefined,
       content,
       topic,
       selectedProducts,
-      userId: req.user?.id,
+      activeOrderId,
+      userId: req.user!.id,
       registeredUser: req.user,
       visitorName,
       visitorEmail: visitorEmail || undefined,
@@ -518,12 +529,10 @@ app.post('/api/support/session/:id/messages', optionalAuth, async (req, res) => 
       .sendSupportInquiryAlert(result.session, content)
       .catch((err) => console.error('Support inquiry alert error:', err))
 
-    const visitorToken = signSupportVisitorToken(result.session.id)
     res.status(200).json({
       success: true,
       data: result.session,
-      newMessages: result.newMessages,
-      visitorToken
+      newMessages: result.newMessages
     })
   } catch (err) {
     console.error('Support message send error:', err)
@@ -531,11 +540,11 @@ app.post('/api/support/session/:id/messages', optionalAuth, async (req, res) => 
   }
 })
 
-app.post('/api/support/session/:id/heartbeat', optionalAuth, async (req, res) => {
+app.post('/api/support/session/:id/heartbeat', protect, async (req, res) => {
   try {
     const sessionId = req.params.id
     const existing = await databaseService.getSupportSession(sessionId)
-    if (!hasSupportSessionAccess(req, sessionId, existing)) {
+    if (!existing || !hasSupportSessionAccess(req, sessionId, existing)) {
       return res.status(403).json({ success: false })
     }
     const isOnline =

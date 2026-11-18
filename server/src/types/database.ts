@@ -1,6 +1,6 @@
 export type Role = 'CUSTOMER' | 'ADMIN'
 export type OrderStatus = 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
-export type PaymentMethod = 'STRIPE' | 'PAYPAL'
+export type PaymentMethod = 'STRIPE' | 'PAYPAL' | 'WALLET' | 'WALLET_STRIPE' | 'WALLET_PAYPAL'
 export type PaymentStatus = 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
 export type AddressType = 'SHIPPING' | 'BILLING'
 
@@ -147,6 +147,8 @@ export interface Order {
   shippingAddressId: string | null
   billingAddressId: string | null
   notes: string | null
+  deliveredAt?: Date | null
+  walletAmountUsed?: number
   createdAt: Date
   updatedAt: Date
   items?: OrderItem[]
@@ -166,6 +168,12 @@ export type SystemActivityType =
   | 'ORDER_STATUS_UPDATED'
   | 'ORDER_CANCELLED'
   | 'ORDER_REFUNDED'
+  | 'WALLET_DEBITED'
+  | 'RETURN_REQUESTED'
+  | 'RETURN_WALLET_CREDITED'
+  | 'RETURN_EXCHANGE_APPROVED'
+  | 'RETURN_COMPLETED'
+  | 'RETURN_REJECTED'
   | 'PRODUCT_CREATED'
   | 'PRODUCT_UPDATED'
   | 'PRODUCT_DELETED'
@@ -176,6 +184,7 @@ export type SystemActivityType =
   | 'SUPPORT_REPLY'
   | 'SUPPORT_STATUS_UPDATED'
   | 'CART_REMINDER_SENT'
+  | 'PAYMENT_GATEWAY_STATUS_UPDATED'
 
 export type CartReminderStatus = 'ACTIVE' | 'COMPLETED' | 'CLEARED' | 'EXPIRED'
 
@@ -317,4 +326,98 @@ export interface TrafficAnalyticsSummary {
   }>
   recentVisits: SiteVisitRecord[]
   recentProductViews: ProductViewRecord[]
+}
+
+export interface PaymentOptionAvailability {
+  available: boolean
+  notice: string
+  updatedAt?: string | null
+  updatedBy?: string | null
+}
+
+export interface PaymentOptionsConfig {
+  paypal: PaymentOptionAvailability
+  stripe: PaymentOptionAvailability
+}
+
+export type WalletTransactionType =
+  | 'REFUND_DEPOSIT'
+  | 'CHECKOUT_PAYMENT'
+  | 'EXCHANGE_CREDIT'
+  | 'ADMIN_ADJUSTMENT'
+
+export type WalletTransactionDirection = 'CREDIT' | 'DEBIT'
+
+export interface Wallet {
+  id: string
+  userId: string
+  balance: number
+  currency: string
+  createdAt: Date
+  updatedAt: Date
+}
+
+export interface WalletTransaction {
+  id: string
+  walletId: string
+  userId: string
+  type: WalletTransactionType
+  direction: WalletTransactionDirection
+  amount: number
+  balanceBefore: number
+  balanceAfter: number
+  orderId?: string | null
+  returnRequestId?: string | null
+  referenceId?: string | null
+  description: string
+  createdBy?: string | null
+  createdAt: Date
+}
+
+export type ReturnReasonType = 'NOT_AS_ORDERED_REFUND' | 'EXCHANGE_EQUAL_VALUE'
+
+export type ReturnRequestStatus =
+  | 'PENDING_REVIEW'
+  | 'WALLET_CREDITED'
+  | 'EXCHANGE_APPROVED'
+  | 'COMPLETED'
+  | 'REJECTED'
+  | 'EXPIRED'
+
+export interface ReturnRequestItem {
+  productId: string
+  name: string
+  sku?: string | null
+  quantity: number
+  unitPrice: number
+  totalPrice: number
+}
+
+export interface ReturnRequest {
+  id: string
+  returnNumber: string
+  orderId: string
+  orderNumber?: string | null
+  orderTrackingNumber?: string | null
+  userId: string
+  userEmail?: string | null
+  userName?: string | null
+  reasonType: ReturnReasonType
+  reasonDetails?: string | null
+  items: ReturnRequestItem[]
+  exchangeProductId?: string | null
+  exchangeProduct?: Product | null
+  exchangeOrderId?: string | null
+  refundAmount: number
+  exchangePriceDelta: number
+  status: ReturnRequestStatus
+  walletCredited: boolean
+  walletTransactionId?: string | null
+  returnTrackingNumber?: string | null
+  eligibleUntil: Date
+  processedBy?: string | null
+  adminNotes?: string | null
+  processedAt?: Date | null
+  createdAt: Date
+  updatedAt: Date
 }

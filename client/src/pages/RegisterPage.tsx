@@ -1,11 +1,18 @@
 import React, { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, UserPlus } from 'lucide-react'
+import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom'
+import { Eye, EyeOff, UserPlus, MessageSquare } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 
 const RegisterPage = () => {
   const navigate = useNavigate()
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
   const { register, isLoading, error, clearError } = useAuth()
+
+  const rawRedirect = searchParams.get('redirect') || (location.state as any)?.from?.pathname || ''
+  const isSupportRedirect = searchParams.get('reason') === 'support' || rawRedirect.includes('support=1')
+  const safeRedirect =
+    rawRedirect && rawRedirect.startsWith('/') && !rawRedirect.startsWith('//') ? rawRedirect : '/'
 
   const [formData, setFormData] = useState({
     firstName: '',
@@ -47,7 +54,7 @@ const RegisterPage = () => {
         email: formData.email,
         password: formData.password,
       })
-      navigate('/')
+      navigate(safeRedirect, { replace: true })
     } catch (err) {
       // Handled in auth context
     }
@@ -75,11 +82,26 @@ const RegisterPage = () => {
         </h2>
         <p className="mt-2 text-xs text-gray-500 dark:text-gray-400 font-medium">
           Already have an account?{' '}
-          <Link to="/login" className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors">
+          <Link
+            to={safeRedirect !== '/' ? `/login?redirect=${encodeURIComponent(safeRedirect)}` : '/login'}
+            className="font-bold text-creamy-500 hover:text-creamy-400 transition-colors"
+          >
             Sign in
           </Link>
         </p>
       </div>
+
+      {isSupportRedirect && (
+        <div className="mt-5 sm:mx-auto sm:w-full sm:max-w-md px-4 sm:px-0">
+          <div className="rounded-xl border border-creamy-500/40 bg-creamy-50 dark:bg-creamy-500/10 p-3.5 text-left flex items-start gap-2.5">
+            <MessageSquare className="w-4 h-4 text-creamy-600 dark:text-creamy-400 shrink-0 mt-0.5" />
+            <div className="text-xs text-gray-800 dark:text-gray-200 leading-snug">
+              <span className="font-black text-creamy-700 dark:text-creamy-300">Account Required for Support LiveChat:</span>{' '}
+              Create your free account so your support thread stays linked to your session and admin replies remain saved in your history.
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="mt-8 sm:mx-auto sm:w-full sm:max-w-md px-4 sm:px-0">
         <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 py-8 px-6 shadow-2xl rounded-2xl transition-colors">

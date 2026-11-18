@@ -9,10 +9,11 @@ import {
   useStripe,
   useElements
 } from '@stripe/react-stripe-js'
-import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, Globe, Search } from 'lucide-react'
+import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, Globe, Search, Ban, ShieldAlert, Wallet, MessageCircle } from 'lucide-react'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
-import { orderApi, paymentApi, addressApi, cartApi } from '../services/api'
+import { orderApi, paymentApi, addressApi, cartApi, walletApi } from '../services/api'
+import { PaymentOptionsConfig } from '../types'
 import { COUNTRIES, POPULAR_COUNTRY_CODES, resolveClientCountryIso2 } from '../data/countries'
 
 // Safe URL encoder for filenames with spaces or special characters
@@ -82,8 +83,24 @@ const CheckoutForm: React.FC = () => {
   const [createAccount, setCreateAccount] = useState(false)
   const [accountPassword, setAccountPassword] = useState('')
 
-  // Supported payment modes: PayPal Primary (Standard SDK: PayPal + Debit or Credit Card) or Stripe Secondary Card
-  const [paymentMethod, setPaymentMethod] = useState<'PAYPAL' | 'STRIPE'>('PAYPAL')
+  // Supported payment modes: DriveFlyElectric Wallet, PayPal Primary (Standard SDK: PayPal + Card) or Stripe Secondary Card
+  const [paymentMethod, setPaymentMethod] = useState<'PAYPAL' | 'STRIPE' | 'WALLET'>('PAYPAL')
+  const [walletBalance, setWalletBalance] = useState<number>(0)
+  const [walletLoading, setWalletLoading] = useState<boolean>(false)
+  const [useWalletCredit, setUseWalletCredit] = useState<boolean>(false)
+  const [paymentAvailability, setPaymentAvailability] = useState<PaymentOptionsConfig>({
+    paypal: {
+      available: true,
+      notice: 'PayPal checkout is currently unavailable. Please do not use this option — select another active payment method below.'
+    },
+    stripe: {
+      available: true,
+      notice: 'Credit or Debit Card (Stripe Gateway) is currently unavailable. Please do not use this option — select another active payment method below.'
+    }
+  })
+  const isPayPalAvailable = paymentAvailability.paypal.available
+  const isStripeAvailable = paymentAvailability.stripe.available
+  const hasUnavailablePaymentOption = !isPayPalAvailable || !isStripeAvailable
   const [cardholderName, setCardholderName] = useState('')
   const [countrySearch, setCountrySearch] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
@@ -130,7 +147,11 @@ const CheckoutForm: React.FC = () => {
     totalPrice,
     grandTotal: 0,
     estimatedTax: 0,
-    shippingCost: 0
+    shippingCost: 0,
+    paymentMethod: 'PAYPAL' as 'PAYPAL' | 'STRIPE' | 'WALLET',
+    useWalletCredit: false,
+    walletAppliedAmount: 0,
+    remainingGatewayDue: 0
   })
 
   // Format price in USD
@@ -143,6 +164,23 @@ const CheckoutForm: React.FC = () => {
   const estimatedTax = totalPrice * 0.05
   const grandTotal = totalPrice + shippingCost + estimatedTax
 
+  const canPayFullWithWallet = isAuthenticated && walletBalance >= grandTotal && grandTotal > 0
+  const isFullWalletSelected = paymentMethod === 'WALLET' && canPayFullWithWallet
+  const walletAppliedAmount = !isAuthenticated
+    ? 0
+    : isFullWalletSelected
+      ? grandTotal
+      : useWalletCredit
+        ? Math.min(walletBalance, grandTotal)
+        : 0
+  const remainingGatewayDue = Math.max(0, Math.round((grandTotal - walletAppliedAmount) * 100) / 100)
+  const isSelectedPaymentAvailable =
+    paymentMethod === 'WALLET'
+      ? canPayFullWithWallet
+      : paymentMethod === 'PAYPAL'
+        ? isPayPalAvailable
+        : isStripeAvailable
+
   useEffect(() => {
     latestCheckoutRef.current = {
       shippingData,
@@ -153,9 +191,52 @@ const CheckoutForm: React.FC = () => {
       totalPrice,
       grandTotal,
       estimatedTax,
-      shippingCost
+      shippingCost,
+      paymentMethod,
+      useWalletCredit,
+      walletAppliedAmount,
+      remainingGatewayDue
     }
-  }, [shippingData, createAccount, accountPassword, isAuthenticated, items, totalPrice, grandTotal, estimatedTax, shippingCost])
+  }, [
+    shippingData,
+    createAccount,
+    accountPassword,
+    isAuthenticated,
+    items,
+    totalPrice,
+    grandTotal,
+    estimatedTax,
+    shippingCost,
+    paymentMethod,
+    useWalletCredit,
+    walletAppliedAmount,
+    remainingGatewayDue
+  ])
+
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setWalletBalance(0)
+      setUseWalletCredit(false)
+      setPaymentMethod((prev) => (prev === 'WALLET' ? 'PAYPAL' : prev))
+      return
+    }
+    let cancelled = false
+    setWalletLoading(true)
+    walletApi
+      .getWallet()
+      .then((res) => {
+        if (!cancelled && res.success && res.data?.wallet) {
+          setWalletBalance(Number(res.data.wallet.balance || 0))
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setWalletLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isAuthenticated])
 
   // Sync user profile and saved default shipping address when authenticated
   useEffect(() => {
@@ -244,10 +325,12 @@ const CheckoutForm: React.FC = () => {
   }, [items, shippingData.email, shippingData.firstName, shippingData.lastName, isAuthenticated])
 
   const buildPaymentRequestPayload = useCallback(() => {
-    const { items: currentItems, shippingData: sd } = latestCheckoutRef.current
+    const { items: currentItems, shippingData: sd, paymentMethod: curMethod, useWalletCredit: useCredit } =
+      latestCheckoutRef.current
     return {
       items: currentItems.map(i => ({ productId: i.productId, quantity: i.quantity })),
       customerEmail: sd.email,
+      useWallet: curMethod !== 'WALLET' && useCredit,
       shippingAddress: {
         firstName: sd.firstName,
         lastName: sd.lastName,
@@ -280,9 +363,9 @@ const CheckoutForm: React.FC = () => {
     return true
   }, [])
 
-  // Unified Order Settlement Handler (Used by PayPal Expanded Checkout & Stripe Card Elements)
+  // Unified Order Settlement Handler (Used by Wallet, PayPal Expanded Checkout & Stripe Card Elements)
   const finalizeSettledOrder = useCallback(async (
-    settledMethod: 'STRIPE' | 'PAYPAL',
+    settledMethod: 'STRIPE' | 'PAYPAL' | 'WALLET',
     paymentRecordId: string,
     paymentSourceLabel?: string,
     paypalOrderId?: string
@@ -295,11 +378,14 @@ const CheckoutForm: React.FC = () => {
       items: currentItems,
       totalPrice: subTotal,
       grandTotal: finalTotal,
-      estimatedTax: taxAmt
+      estimatedTax: taxAmt,
+      useWalletCredit: useCredit,
+      walletAppliedAmount: walletUsed
     } = latestCheckoutRef.current
 
     const shouldCreateAccount = !isAuth && ca
     const countryCode = resolveClientCountryIso2(sd.country)
+    const shouldApplyWalletCredit = settledMethod === 'WALLET' || (isAuth && useCredit && walletUsed > 0)
     setIsProcessing(true)
     setProcessingStep('Securing your settled order & generating official PDF receipt...')
 
@@ -308,6 +394,7 @@ const CheckoutForm: React.FC = () => {
       paymentMethod: settledMethod,
       paymentId: paymentRecordId,
       paymentStatus: 'COMPLETED',
+      useWallet: settledMethod !== 'WALLET' && shouldApplyWalletCredit,
       ...(paypalOrderId ? { paypalOrderId } : {}),
       shippingAddress: {
         firstName: sd.firstName,
@@ -324,7 +411,7 @@ const CheckoutForm: React.FC = () => {
       },
       createAccount: shouldCreateAccount,
       password: shouldCreateAccount ? pwd : undefined,
-      notes: `Express Worldwide Dispatch to ${sd.city}${sd.state ? `, ${sd.state}` : ''}, ${sd.country} (${sd.zipCode}). Paid & Settled via ${settledMethod} (${paymentRecordId})`
+      notes: `Express Worldwide Dispatch to ${sd.city}${sd.state ? `, ${sd.state}` : ''}, ${sd.country} (${sd.zipCode}). Paid & Settled via ${settledMethod}${shouldApplyWalletCredit && settledMethod !== 'WALLET' ? ' + Wallet Balance' : ''} (${paymentRecordId})`
     })
 
     if (!orderRes.success || !orderRes.data) {
@@ -349,6 +436,18 @@ const CheckoutForm: React.FC = () => {
     const locationPart = [sd.city, sd.state, sd.zipCode].filter(Boolean).join(', ')
     const fullAddressString = `${sd.address1}${sd.address2 ? `, ${sd.address2}` : ''}, ${locationPart}, ${sd.country}`
 
+    const resolvedSourceLabel =
+      paymentSourceLabel ||
+      (settledMethod === 'WALLET'
+        ? 'DriveFlyElectric Wallet Balance'
+        : settledMethod === 'STRIPE'
+          ? shouldApplyWalletCredit
+            ? 'DriveFlyElectric Wallet + Credit / Debit Card (Stripe)'
+            : 'Credit / Debit Card (Stripe)'
+          : shouldApplyWalletCredit
+            ? 'DriveFlyElectric Wallet + PayPal Express'
+            : 'PayPal Express')
+
     const receiptData = {
       orderId,
       receiptToken,
@@ -359,7 +458,8 @@ const CheckoutForm: React.FC = () => {
       transactionId: paymentRecordId,
       userName: `${sd.firstName} ${sd.lastName}`.trim() || 'Valued Customer',
       address: fullAddressString,
-      paymentSource: paymentSourceLabel || (settledMethod === 'STRIPE' ? 'Credit / Debit Card (Stripe)' : 'PayPal Express'),
+      paymentSource: resolvedSourceLabel,
+      ...(walletUsed > 0 ? { walletApplied: `$${walletUsed.toFixed(2)}` } : {}),
       initialCharge: `$${subTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
       finalCost: `$${finalTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
       totalRefund: '$0.00',
@@ -407,6 +507,45 @@ const CheckoutForm: React.FC = () => {
     })
   }, [clearCart, navigate, setAuthenticatedUser])
 
+  const applyPaymentAvailability = useCallback((next?: PaymentOptionsConfig) => {
+    if (!next) return
+    setPaymentAvailability(next)
+    setPaymentMethod(prev => {
+      if (prev === 'PAYPAL' && !next.paypal.available && next.stripe.available) {
+        return 'STRIPE'
+      }
+      if (prev === 'STRIPE' && !next.stripe.available && next.paypal.available) {
+        return 'PAYPAL'
+      }
+      return prev
+    })
+  }, [])
+
+  // Sync runtime payment option availability on focus/visibility changes
+  useEffect(() => {
+    let lastCheckedAt = Date.now()
+    const syncAvailability = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      const now = Date.now()
+      if (now - lastCheckedAt < 2500) return
+      lastCheckedAt = now
+      paymentApi
+        .getConfig(true)
+        .then(res => {
+          if (res.success && res.data?.paymentAvailability) {
+            applyPaymentAvailability(res.data.paymentAvailability)
+          }
+        })
+        .catch(() => { })
+    }
+    window.addEventListener('focus', syncAvailability)
+    document.addEventListener('visibilitychange', syncAvailability)
+    return () => {
+      window.removeEventListener('focus', syncAvailability)
+      document.removeEventListener('visibilitychange', syncAvailability)
+    }
+  }, [applyPaymentAvailability])
+
   // Load PayPal JS SDK v5 Expanded Checkout (PayPal Wallet Button + Hosted Card Fields)
   useEffect(() => {
     let isMounted = true
@@ -427,17 +566,18 @@ const CheckoutForm: React.FC = () => {
     }
 
     const loadPayPalSdk = async () => {
-      if ((window as any).paypal) {
-        handleLoaded()
-        return
-      }
-
       let clientId = defaultPayPalClientId
       let clientToken: string | null = null
+      let paypalEnabled = isPayPalAvailable
 
       try {
         const cfgRes = await paymentApi.getConfig()
+        if (!isMounted) return
         if (cfgRes.success && cfgRes.data) {
+          if (cfgRes.data.paymentAvailability) {
+            applyPaymentAvailability(cfgRes.data.paymentAvailability)
+            paypalEnabled = cfgRes.data.paymentAvailability.paypal.available
+          }
           if (cfgRes.data.paypalClientId) {
             clientId = cfgRes.data.paypalClientId
           }
@@ -449,7 +589,7 @@ const CheckoutForm: React.FC = () => {
         // Use fallback clientId from client environment
       }
 
-      if (!isMounted) return
+      if (!isMounted || !paypalEnabled) return
       if ((window as any).paypal) {
         handleLoaded()
         return
@@ -488,11 +628,16 @@ const CheckoutForm: React.FC = () => {
         existingScript.removeEventListener('error', handleFailed)
       }
     }
-  }, [])
+  }, [isPayPalAvailable, applyPaymentAvailability])
 
   // Submit handler for PayPal Expanded Hosted Card Fields (Name, Number, Expiry, CVV)
   const submitPayPalCardFields = useCallback(async () => {
     if (isProcessing) return
+    if (!isPayPalAvailable) {
+      setErrorMessage(paymentAvailability.paypal.notice)
+      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      return
+    }
     const cf = paypalCardFieldsRef.current
     if (!cf || typeof cf.submit !== 'function') {
       setErrorMessage('PayPal Card Fields are still initializing. Please try again in a moment.')
@@ -537,7 +682,7 @@ const CheckoutForm: React.FC = () => {
       setErrorMessage(msg)
       setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
     }
-  }, [isProcessing, validateShippingBeforeCheckout])
+  }, [isProcessing, isPayPalAvailable, paymentAvailability.paypal.notice, validateShippingBeforeCheckout])
 
   useEffect(() => {
     submitPayPalCardFieldsRef.current = submitPayPalCardFields
@@ -547,7 +692,7 @@ const CheckoutForm: React.FC = () => {
   // Containers stay mounted in the DOM (toggled via CSS) so SDK iframes remain intact across method switches.
   useEffect(() => {
     const paypal = (window as any).paypal
-    if (!paypalSdkReady || !paypal || !paypalButtonsContainerRef.current || items.length === 0) return
+    if (!isPayPalAvailable || !paypalSdkReady || !paypal || !paypalButtonsContainerRef.current || items.length === 0) return
 
     let cancelled = false
     let buttonsInstance: { close?: () => Promise<void> } | null = null
@@ -736,7 +881,7 @@ const CheckoutForm: React.FC = () => {
       }
       clearPayPalMountContainers()
     }
-  }, [paypalSdkReady, items.length, isDarkMode, validateShippingBeforeCheckout, buildPaymentRequestPayload, finalizeSettledOrder])
+  }, [isPayPalAvailable, paypalSdkReady, items.length, isDarkMode, validateShippingBeforeCheckout, buildPaymentRequestPayload, finalizeSettledOrder])
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target
@@ -757,8 +902,19 @@ const CheckoutForm: React.FC = () => {
     })
   }
 
-  // Primary Submit Handler supporting PayPal Expanded CardFields, PayPal Express Portal Redirect, and Stripe Card Elements
+  // Primary Submit Handler supporting Full Wallet, PayPal Expanded CardFields/Express, and Stripe Card Elements
   const handlePayment = async () => {
+    if (!isSelectedPaymentAvailable) {
+      const unavailableMsg =
+        paymentMethod === 'WALLET'
+          ? 'Your Wallet balance is lower than the order total. Apply your Wallet credit with PayPal or Stripe to cover the remaining balance.'
+          : paymentMethod === 'PAYPAL'
+            ? paymentAvailability.paypal.notice
+            : paymentAvailability.stripe.notice
+      setErrorMessage(unavailableMsg)
+      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      return
+    }
     if (!validateShippingBeforeCheckout()) return
 
     if (
@@ -791,10 +947,25 @@ const CheckoutForm: React.FC = () => {
     setIsProcessing(true)
 
     try {
+      if (paymentMethod === 'WALLET') {
+        if (!isAuthenticated || walletBalance < grandTotal) {
+          throw new Error('Your Wallet balance is insufficient to cover the full order total.')
+        }
+        setProcessingStep('Settling order directly with your DriveFlyElectric Wallet...')
+        const walletRef = `WALLET-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+        await finalizeSettledOrder('WALLET', walletRef, 'DriveFlyElectric Wallet Balance')
+        return
+      }
+
       if (paymentMethod === 'PAYPAL') {
         // Redirect fallback or direct order settlement when submitting via primary summary button
         setProcessingStep('Connecting to PayPal Express Checkout...')
         const ppRes = await paymentApi.createPayPalOrder(paymentPayload)
+        if (ppRes.success && ppRes.data?.coveredByWallet) {
+          const walletRef = `WALLET-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+          await finalizeSettledOrder('WALLET', walletRef, 'DriveFlyElectric Wallet Balance')
+          return
+        }
         if (!ppRes.success || !ppRes.data?.orderId) {
           throw new Error(ppRes.error || 'Failed to connect to PayPal.')
         }
@@ -807,6 +978,7 @@ const CheckoutForm: React.FC = () => {
           const orderPayload = {
             items: items.map(i => ({ productId: i.productId, quantity: i.quantity })),
             paymentMethod: 'PAYPAL' as const,
+            useWallet: isAuthenticated && useWalletCredit,
             shippingAddress: {
               firstName: shippingData.firstName,
               lastName: shippingData.lastName,
@@ -822,7 +994,7 @@ const CheckoutForm: React.FC = () => {
             },
             createAccount: shouldCreateAccount,
             password: shouldCreateAccount ? accountPassword : '',
-            notes: `Express Worldwide Dispatch to ${shippingData.city}${shippingData.state ? `, ${shippingData.state}` : ''}, ${shippingData.country} (${shippingData.zipCode}). Paid & Settled via PAYPAL (${ppOrderId})`
+            notes: `Express Worldwide Dispatch to ${shippingData.city}${shippingData.state ? `, ${shippingData.state}` : ''}, ${shippingData.country} (${shippingData.zipCode}). Paid & Settled via PAYPAL${isAuthenticated && useWalletCredit ? ' + Wallet Balance' : ''} (${ppOrderId})`
           }
 
           localStorage.setItem('pending_paypal_order', JSON.stringify({
@@ -866,6 +1038,11 @@ const CheckoutForm: React.FC = () => {
 
         setProcessingStep('Initializing secure USD card transaction with Stripe...')
         const intentRes = await paymentApi.createStripePaymentIntent(paymentPayload)
+        if (intentRes.success && intentRes.data?.coveredByWallet) {
+          const walletRef = `WALLET-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`
+          await finalizeSettledOrder('WALLET', walletRef, 'DriveFlyElectric Wallet Balance')
+          return
+        }
         if (!intentRes.success || !intentRes.data?.clientSecret) {
           throw new Error(intentRes.error || 'Failed to initialize card payment with Stripe.')
         }
@@ -933,6 +1110,25 @@ const CheckoutForm: React.FC = () => {
       },
     },
   }
+
+  const openCheckoutSupport = useCallback(() => {
+    window.dispatchEvent(
+      new CustomEvent('dfe:open-livechat', {
+        detail: {
+          topic: 'Payment Queries',
+          source: 'checkout',
+          items: items.map((i) => ({
+            id: i.product.id,
+            name: i.product.name,
+            sku: i.product.sku,
+            price: i.product.price,
+            category: i.product.category,
+            image: i.product.images?.[0] || ''
+          }))
+        }
+      })
+    )
+  }, [items])
 
   if (items.length === 0) {
     return (
@@ -1247,7 +1443,30 @@ const CheckoutForm: React.FC = () => {
               </form>
             </div>
 
-            {/* 2. Payment Method — PayPal Primary (Integrated Card Fields + Wallet) & Stripe Secondary Card */}
+            {/* Support Guidance Tag Note Before Payment */}
+            <div className="rounded-2xl border border-creamy-500/40 bg-creamy-50/70 dark:bg-creamy-500/10 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <MessageCircle className="w-5 h-5 text-creamy-600 dark:text-creamy-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-bold text-gray-900 dark:text-white leading-snug">
+                    It&apos;s always safe to contact support before completing payment for easy direction and guide — chat support for directions.
+                  </p>
+                  <p className="text-[11px] text-gray-600 dark:text-neutral-300 mt-0.5">
+                    Get real-time help with payment confirmation, local taxes, and total cost to your doorstep.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={openCheckoutSupport}
+                className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[11px] shrink-0 transition-colors shadow-sm"
+              >
+                <MessageCircle className="w-3.5 h-3.5" />
+                Chat Support for Directions
+              </button>
+            </div>
+
+            {/* 2. Payment Method — DriveFlyElectric Wallet, PayPal Primary & Stripe Secondary Card */}
             <div className="bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-6 transition-colors">
               <div className="flex items-center justify-between mb-4 border-b border-gray-100 dark:border-neutral-800 pb-3">
                 <h2 className="text-base font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-2">
@@ -1260,18 +1479,134 @@ const CheckoutForm: React.FC = () => {
               </div>
 
               <div className="space-y-4">
+                {/* DriveFlyElectric Wallet Option */}
+                <div
+                  onClick={() => {
+                    if (canPayFullWithWallet) {
+                      setPaymentMethod('WALLET')
+                      setUseWalletCredit(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }
+                  }}
+                  className={`p-4 border rounded-xl transition-all ${
+                    isFullWalletSelected
+                      ? 'border-creamy-500 bg-creamy-50/40 dark:bg-creamy-500/10 shadow-sm cursor-pointer'
+                      : canPayFullWithWallet
+                        ? 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24] cursor-pointer'
+                        : 'border-gray-200 dark:border-neutral-800 bg-gray-50/60 dark:bg-[#181b22]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-3">
+                      {canPayFullWithWallet && (
+                        <input
+                          type="radio"
+                          name="paymentMethod"
+                          value="WALLET"
+                          checked={paymentMethod === 'WALLET'}
+                          onChange={() => {
+                            setPaymentMethod('WALLET')
+                            setUseWalletCredit(false)
+                            if (errorMessage) setErrorMessage(null)
+                          }}
+                          className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        />
+                      )}
+                      <div className="w-7 h-7 rounded-lg bg-creamy-500/15 border border-creamy-500/30 flex items-center justify-center text-creamy-600 dark:text-creamy-400 shrink-0">
+                        <Wallet className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white flex items-center gap-2">
+                          DriveFlyElectric Wallet
+                          <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-creamy-500/15 text-creamy-600 dark:text-creamy-400">
+                            {!isAuthenticated
+                              ? 'Sign In Required'
+                              : walletLoading
+                                ? 'Loading...'
+                                : `Balance: ${formatPrice(walletBalance)}`}
+                          </span>
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          {!isAuthenticated
+                            ? 'Sign in to apply deposited return refunds or store wallet balance at checkout.'
+                            : canPayFullWithWallet
+                              ? 'Your Wallet balance covers 100% of this order — pay instantly with zero card charges.'
+                              : walletBalance > 0
+                                ? `Apply ${formatPrice(Math.min(walletBalance, grandTotal))} Wallet credit and pay the remaining ${formatPrice(Math.max(0, grandTotal - walletBalance))} via PayPal or Stripe.`
+                                : 'Same-day return refunds deposited into your Wallet can be spent here anytime.'}
+                        </p>
+                      </div>
+                    </div>
+
+                    {isAuthenticated && walletBalance > 0 && !canPayFullWithWallet && (
+                      <label
+                        onClick={(e) => e.stopPropagation()}
+                        className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-creamy-500/40 bg-white dark:bg-[#14171f] text-xs font-bold text-gray-900 dark:text-white cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={useWalletCredit}
+                          onChange={(e) => setUseWalletCredit(e.target.checked)}
+                          className="w-4 h-4 text-creamy-500 rounded accent-creamy-500"
+                        />
+                        Apply -{formatPrice(Math.min(walletBalance, grandTotal))}
+                      </label>
+                    )}
+
+                    {!isAuthenticated && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          navigate('/login', { state: { from: '/checkout' } })
+                        }}
+                        className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 text-xs font-bold text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors"
+                      >
+                        Sign In
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {hasUnavailablePaymentOption && (
+                  <div className="p-3.5 rounded-xl border border-red-300 dark:border-red-900/60 bg-red-50 dark:bg-red-950/30 text-red-800 dark:text-red-200 flex items-start gap-2.5">
+                    <ShieldAlert className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                    <div className="text-xs space-y-1">
+                      <p className="font-black uppercase tracking-wider text-red-700 dark:text-red-300">
+                        Unavailable Payment Option{!isPayPalAvailable && !isStripeAvailable ? 's' : ''} — Do Not Use
+                      </p>
+                      {!isPayPalAvailable && (
+                        <p className="leading-snug">
+                          <strong>PayPal Checkout:</strong> {paymentAvailability.paypal.notice}
+                        </p>
+                      )}
+                      {!isStripeAvailable && (
+                        <p className="leading-snug">
+                          <strong>Stripe Card Gateway:</strong> {paymentAvailability.stripe.notice}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {/* Option 1 (Primary): PayPal Checkout — Integrated Card Processing & Express Wallet */}
                 <div
                   onClick={() => {
+                    if (!isPayPalAvailable) {
+                      setErrorMessage(paymentAvailability.paypal.notice)
+                      return
+                    }
                     if (paymentMethod !== 'PAYPAL') {
                       setPaymentMethod('PAYPAL')
                       if (errorMessage) setErrorMessage(null)
                     }
                   }}
-                  className={`p-4 border rounded-xl transition-all cursor-pointer ${paymentMethod === 'PAYPAL'
-                    ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
-                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
-                    }`}
+                  className={`p-4 border rounded-xl transition-all ${
+                    !isPayPalAvailable
+                      ? 'border-red-300/80 dark:border-red-900/50 bg-red-50/40 dark:bg-red-950/15 opacity-90 cursor-not-allowed'
+                      : paymentMethod === 'PAYPAL'
+                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm cursor-pointer'
+                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24] cursor-pointer'
+                  }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-3">
@@ -1279,12 +1614,14 @@ const CheckoutForm: React.FC = () => {
                         type="radio"
                         name="paymentMethod"
                         value="PAYPAL"
-                        checked={paymentMethod === 'PAYPAL'}
+                        disabled={!isPayPalAvailable}
+                        checked={isPayPalAvailable && paymentMethod === 'PAYPAL'}
                         onChange={() => {
+                          if (!isPayPalAvailable) return
                           setPaymentMethod('PAYPAL')
                           if (errorMessage) setErrorMessage(null)
                         }}
-                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500 disabled:opacity-40"
                       />
                       <div className="w-6 h-6 rounded bg-[#003087] flex items-center justify-center font-black text-white text-xs shrink-0">
                         P
@@ -1294,6 +1631,12 @@ const CheckoutForm: React.FC = () => {
                           <p className="font-bold text-sm text-gray-900 dark:text-white">
                             PayPal &amp; Debit or Credit Card
                           </p>
+                          {!isPayPalAvailable && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-500/15 text-red-600 dark:text-red-400 border border-red-500/30">
+                              <Ban className="w-3 h-3" />
+                              Unavailable • Do Not Use
+                            </span>
+                          )}
                         </div>
                         <p className="text-[11px] text-gray-500 dark:text-neutral-400">
                           Supports PayPal Wallet &amp; Debit or Credit Card (no PayPal account needed)
@@ -1302,11 +1645,18 @@ const CheckoutForm: React.FC = () => {
                     </div>
                   </div>
 
+                  {!isPayPalAvailable && (
+                    <div className="mt-3 p-3 rounded-lg bg-red-100/70 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                      <span className="font-medium leading-snug">{paymentAvailability.paypal.notice}</span>
+                    </div>
+                  )}
+
                   {/* Keep PayPal iframe container permanently mounted in the DOM and toggle via CSS */}
                   <div
                     onClick={(e) => e.stopPropagation()}
                     className={
-                      paymentMethod === 'PAYPAL'
+                      isPayPalAvailable && paymentMethod === 'PAYPAL'
                         ? 'mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-4 cursor-default'
                         : 'hidden'
                     }
@@ -1443,46 +1793,70 @@ const CheckoutForm: React.FC = () => {
                 {/* Option 2 (Secondary): Direct Credit / Debit Card via Stripe Hosted Elements */}
                 <div
                   onClick={() => {
+                    if (!isStripeAvailable) {
+                      setErrorMessage(paymentAvailability.stripe.notice)
+                      return
+                    }
                     if (paymentMethod !== 'STRIPE') {
                       setPaymentMethod('STRIPE')
                       if (errorMessage) setErrorMessage(null)
                     }
                   }}
-                  className={`p-4 border rounded-xl transition-all cursor-pointer ${paymentMethod === 'STRIPE'
-                    ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
-                    : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
-                    }`}
+                  className={`p-4 border rounded-xl transition-all ${
+                    !isStripeAvailable
+                      ? 'border-red-300/80 dark:border-red-900/50 bg-red-50/40 dark:bg-red-950/15 opacity-90 cursor-not-allowed'
+                      : paymentMethod === 'STRIPE'
+                      ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm cursor-pointer'
+                      : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24] cursor-pointer'
+                  }`}
                 >
-                  <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center justify-between mb-1 gap-2">
                     <div className="flex items-center gap-3">
                       <input
                         type="radio"
                         name="paymentMethod"
                         value="STRIPE"
-                        checked={paymentMethod === 'STRIPE'}
+                        disabled={!isStripeAvailable}
+                        checked={isStripeAvailable && paymentMethod === 'STRIPE'}
                         onChange={() => {
+                          if (!isStripeAvailable) return
                           setPaymentMethod('STRIPE')
                           if (errorMessage) setErrorMessage(null)
                         }}
-                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500 disabled:opacity-40"
                       />
                       <CreditCard className="w-5 h-5 text-creamy-500" />
                       <div>
-                        <p className="font-bold text-sm text-gray-900 dark:text-white">
-                          Credit or Debit Card (Stripe Gateway)
-                        </p>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <p className="font-bold text-sm text-gray-900 dark:text-white">
+                            Credit or Debit Card (Stripe Gateway)
+                          </p>
+                          {!isStripeAvailable && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-red-500/15 text-red-600 dark:text-red-400 border border-red-500/30">
+                              <Ban className="w-3 h-3" />
+                              Unavailable • Do Not Use
+                            </span>
+                          )}
+                        </div>
                         <p className="text-[11px] text-gray-500 dark:text-neutral-400">
                           Alternative card checkout — Visa, Mastercard, Amex, Discover with 3D-Secure
                         </p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-1 text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">
+                    <div className="flex items-center gap-1 text-[10px] font-black uppercase tracking-widest px-2.5 py-1 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 shrink-0">
                       <Lock className="w-3 h-3" />
                       <span>256-Bit SSL</span>
                     </div>
                   </div>
 
-                  {paymentMethod === 'STRIPE' && (
+                  {!isStripeAvailable && (
+                    <div className="mt-3 p-3 rounded-lg bg-red-100/70 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                      <span className="font-medium leading-snug">{paymentAvailability.stripe.notice}</span>
+                    </div>
+                  )}
+
+                  {isStripeAvailable && paymentMethod === 'STRIPE' && (
                     <div
                       onClick={(e) => e.stopPropagation()}
                       className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3.5 cursor-default"
@@ -1604,11 +1978,37 @@ const CheckoutForm: React.FC = () => {
                   <span>Estimated Tax (5%)</span>
                   <span className="font-bold text-gray-900 dark:text-white">{formatPrice(estimatedTax)}</span>
                 </div>
+                {walletAppliedAmount > 0 && (
+                  <div className="flex justify-between text-emerald-600 dark:text-emerald-400 font-bold">
+                    <span>DriveFlyElectric Wallet Applied</span>
+                    <span>-{formatPrice(walletAppliedAmount)}</span>
+                  </div>
+                )}
                 <div className="pt-3 border-t border-gray-200 dark:border-neutral-800 flex justify-between items-baseline">
-                  <span className="text-sm font-black uppercase text-gray-900 dark:text-white">Total USD</span>
-                  <span className="text-2xl font-black text-creamy-500 font-anton">
-                    {formatPrice(grandTotal)}
+                  <span className="text-sm font-black uppercase text-gray-900 dark:text-white">
+                    {walletAppliedAmount > 0 ? 'Remaining Due Now' : 'Total USD'}
                   </span>
+                  <span className="text-2xl font-black text-creamy-500 font-anton">
+                    {formatPrice(walletAppliedAmount > 0 ? remainingGatewayDue : grandTotal)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="mt-4 p-3 rounded-xl border border-creamy-500/30 bg-creamy-50/50 dark:bg-creamy-500/5 text-[11px] text-gray-700 dark:text-neutral-300 flex items-start gap-2">
+                <MessageCircle className="w-4 h-4 text-creamy-500 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold">
+                    It&apos;s always safe to contact support before completing payment for easy direction and guide
+                  </span>{' '}
+                  —{' '}
+                  <button
+                    type="button"
+                    onClick={openCheckoutSupport}
+                    className="font-black text-creamy-600 dark:text-creamy-400 underline hover:text-creamy-500"
+                  >
+                    chat support for directions
+                  </button>
+                  .
                 </div>
               </div>
 
@@ -1621,7 +2021,7 @@ const CheckoutForm: React.FC = () => {
 
               <button
                 onClick={handlePayment}
-                disabled={isProcessing}
+                disabled={isProcessing || !isSelectedPaymentAvailable}
                 className="w-full mt-6 bg-creamy-500 hover:bg-creamy-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-4 px-4 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
               >
                 {isProcessing ? (
@@ -1629,11 +2029,21 @@ const CheckoutForm: React.FC = () => {
                     <div className="w-4 h-4 border-2 border-black border-t-transparent rounded-full animate-spin" />
                     <span>{processingStep || 'Authorizing Checkout...'}</span>
                   </>
+                ) : !isSelectedPaymentAvailable ? (
+                  <span>
+                    {paymentMethod === 'WALLET'
+                      ? 'Insufficient Wallet Balance'
+                      : !isPayPalAvailable && !isStripeAvailable
+                        ? 'Checkout Payment Options Unavailable'
+                        : 'Selected Payment Option Unavailable'}
+                  </span>
                 ) : (
                   <span>
-                    {paymentMethod === 'PAYPAL'
-                      ? `Continue & Pay ${formatPrice(grandTotal)} via PayPal`
-                      : `Confirm & Pay ${formatPrice(grandTotal)} with Card (Stripe)`}
+                    {paymentMethod === 'WALLET'
+                      ? `Confirm & Pay ${formatPrice(grandTotal)} via Wallet Balance`
+                      : paymentMethod === 'PAYPAL'
+                        ? `Continue & Pay ${formatPrice(remainingGatewayDue)} via PayPal`
+                        : `Confirm & Pay ${formatPrice(remainingGatewayDue)} with Card (Stripe)`}
                   </span>
                 )}
               </button>
@@ -1660,7 +2070,7 @@ export const CheckoutPage = () => {
   useEffect(() => {
     let active = true
     paymentApi
-      .getConfig()
+      .getConfig(true)
       .then((res) => {
         if (!active || !res.success || !res.data?.stripePublishableKey) return
         const liveKey = res.data.stripePublishableKey.trim()

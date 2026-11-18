@@ -9,7 +9,8 @@ const INTERNAL_EVENT_CATEGORIES = new Set([
   'SYSTEM_ACTIVITY',
   'CART_REMINDER',
   'SITE_VISIT',
-  'PRODUCT_VIEW'
+  'PRODUCT_VIEW',
+  'STORE_SETTING'
 ])
 
 /**
@@ -32,7 +33,7 @@ export const getEvents = async (req: Request, res: Response) => {
     let queryBuilder = supabase
       .from('events')
       .select('*', { count: 'exact' })
-      .or('category.is.null,and(category.neq.LIVECHAT_SESSION,category.neq.PRODUCT_REVIEW,category.neq.PRODUCT_BOOKING,category.neq.SYSTEM_ACTIVITY,category.neq.CART_REMINDER,category.neq.SITE_VISIT,category.neq.PRODUCT_VIEW)')
+      .or('category.is.null,and(category.neq.LIVECHAT_SESSION,category.neq.PRODUCT_REVIEW,category.neq.PRODUCT_BOOKING,category.neq.SYSTEM_ACTIVITY,category.neq.CART_REMINDER,category.neq.SITE_VISIT,category.neq.PRODUCT_VIEW,category.neq.STORE_SETTING)')
 
     if (category) {
       queryBuilder = queryBuilder.ilike('category', String(category).trim().slice(0, 60))

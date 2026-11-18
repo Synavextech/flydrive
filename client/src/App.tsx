@@ -14,6 +14,8 @@ import AdminDashboard from './pages/AdminDashboard'
 import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
 import OrderSuccessPage from './pages/OrderSuccessPage'
+import AccountPage from './pages/AccountPage'
+import FaqPage from './pages/FaqPage'
 import ProtectedRoute from './components/ProtectedRoute'
 import WhatsAppButton from './components/WhatsAppButton'
 
@@ -49,6 +51,15 @@ function App() {
                 <Route path="/cart" element={<CartPage />} />
                 <Route path="/checkout" element={<CheckoutPage />} />
                 <Route path="/order-success" element={<OrderSuccessPage />} />
+                <Route path="/faq" element={<FaqPage />} />
+                <Route
+                  path="/account"
+                  element={
+                    <ProtectedRoute>
+                      <AccountPage />
+                    </ProtectedRoute>
+                  }
+                />
                 <Route
                   path="/admin"
                   element={

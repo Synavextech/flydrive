@@ -22,8 +22,16 @@ import {
   replySupportSession,
   updateSupportSessionStatus,
   getProductBookings,
-  updateProductBookingStatus
+  updateProductBookingStatus,
+  getPaymentOptions,
+  updatePaymentOptions
 } from '../controllers/adminController.js'
+import {
+  getAdminReturns,
+  processAdminReturnRequest,
+  getAdminWallets,
+  adjustUserWallet
+} from '../controllers/walletReturnController.js'
 import { protect, authorize } from '../middleware/auth.js'
 import { isAllowedMediaExtension, validateUploadedFiles } from '../middleware/security.js'
 
@@ -117,6 +125,8 @@ router.post('/upload', upload.any(), (req, res) => {
 // Dashboard and analytics
 router.get('/dashboard', getDashboard)
 router.get('/analytics', getAnalytics)
+router.get('/payment-options', getPaymentOptions)
+router.put('/payment-options', updatePaymentOptions)
 
 // Product management
 router.get('/products', getProducts)
@@ -145,5 +155,11 @@ router.put('/users/:id/status', updateUserStatus)
 router.get('/support/sessions', getSupportSessions)
 router.post('/support/sessions/:id/reply', replySupportSession)
 router.put('/support/sessions/:id/status', updateSupportSessionStatus)
+
+// Return Policy (21-Day) & Customer Wallet management
+router.get('/returns', getAdminReturns)
+router.put('/returns/:id/process', processAdminReturnRequest)
+router.get('/wallets', getAdminWallets)
+router.post('/wallets/:userId/adjust', adjustUserWallet)
 
 export default router

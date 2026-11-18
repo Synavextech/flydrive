@@ -9,6 +9,9 @@ import type {
   Cart,
   CartItem,
   Order,
+  OrderStatus,
+  PaymentMethod,
+  PaymentStatus,
   Address,
   SystemActivityRecord,
   CartReminderItem,
@@ -18,15 +21,26 @@ import type {
   ProductViewRecord,
   ProductViewSource,
   SiteVisitRecord,
-  TrafficAnalyticsSummary
+  TrafficAnalyticsSummary,
+  PaymentOptionAvailability,
+  PaymentOptionsConfig,
+  Wallet,
+  WalletTransaction,
+  WalletTransactionType,
+  WalletTransactionDirection,
+  ReturnRequest,
+  ReturnReasonType,
+  ReturnRequestStatus,
+  ReturnRequestItem
 } from '../types/database.js'
 import crypto from 'crypto'
 import {
   sanitizePostgrestSearch,
-  getAdminContactEmail,
-  getFormattedSupportWhatsApp,
   isValidEmailAddress
 } from '../middleware/security.js'
+
+const RETURN_REQUEST_SELECT =
+  '*, orders!return_requests_order_id_fkey(*), users!return_requests_user_id_fkey(id, email, first_name, last_name), exchange_product:products!return_requests_exchange_product_id_fkey(*)'
 
 const { Pool } = pg
 
@@ -38,6 +52,7 @@ export class DatabaseService {
   private siteVisitsMemoryCache: SiteVisitRecord[] = []
   private productViewsMemoryCache: ProductViewRecord[] = []
   private analyticsDedupeCache: Map<string, number> = new Map()
+  private paymentOptionsCache: { data: PaymentOptionsConfig; expiresAt: number } | null = null
 
   constructor(client: SupabaseClient = supabase) {
     this.supabase = client
@@ -176,6 +191,8 @@ export class DatabaseService {
       shippingAddressId: raw.shipping_address_id || null,
       billingAddressId: raw.billing_address_id || null,
       notes: cleanedNotes,
+      deliveredAt: raw.delivered_at ? new Date(raw.delivered_at) : null,
+      walletAmountUsed: Number(raw.wallet_amount_used || 0),
       createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
       updatedAt: raw.updated_at ? new Date(raw.updated_at) : new Date(),
       items: Array.isArray(raw.order_items) ? raw.order_items.map((oi: any) => ({
@@ -207,11 +224,12 @@ export class DatabaseService {
     role?: 'CUSTOMER' | 'ADMIN'
   }): Promise<User> {
     const id = crypto.randomUUID()
+    const normalizedEmail = userData.email.trim().toLowerCase()
     const { data, error } = await this.supabase
       .from('users')
       .insert({
         id,
-        email: userData.email,
+        email: normalizedEmail,
         password: userData.password,
         first_name: userData.firstName,
         last_name: userData.lastName,
@@ -227,18 +245,37 @@ export class DatabaseService {
   }
 
   async findUserByEmail(email: string): Promise<User | null> {
+    const normalizedEmail = (email || '').trim().toLowerCase()
+    if (!normalizedEmail) return null
+
     try {
-      const { data, error } = await this.supabase
+      const { data: exactData, error: exactError } = await this.supabase
         .from('users')
         .select('*')
-        .eq('email', email)
+        .eq('email', normalizedEmail)
         .maybeSingle()
 
-      if (error) throw error
-      return data ? this.mapUser(data) : null
+      if (exactError) throw exactError
+      if (exactData) return this.mapUser(exactData)
+
+      // Case-insensitive fallback for legacy mixed-case accounts (e.g., seeded admin emails)
+      const { data: ilikeRows, error: ilikeError } = await this.supabase
+        .from('users')
+        .select('*')
+        .ilike('email', normalizedEmail)
+        .limit(10)
+
+      if (ilikeError) throw ilikeError
+      const matched = (ilikeRows || []).find(
+        (row: any) => String(row.email || '').trim().toLowerCase() === normalizedEmail
+      )
+      return matched ? this.mapUser(matched) : null
     } catch (err) {
       if (this.pool) {
-        const res = await this.pool.query('SELECT * FROM users WHERE email = $1 LIMIT 1', [email])
+        const res = await this.pool.query(
+          'SELECT * FROM users WHERE LOWER(email) = $1 LIMIT 1',
+          [normalizedEmail]
+        )
         return res.rows[0] ? this.mapUser(res.rows[0]) : null
       }
       throw err
@@ -697,15 +734,18 @@ export class DatabaseService {
     tax?: number
     shipping?: number
     discount?: number
-    paymentMethod: 'STRIPE' | 'PAYPAL'
+    walletAmountUsed?: number
+    paymentMethod: PaymentMethod
     paymentId?: string
-    paymentStatus?: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
+    paymentStatus?: PaymentStatus
     paymentVerified?: boolean
     receiptToken?: string | null
-    status?: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
+    status?: OrderStatus
+    deliveredAt?: Date | string | null
     shippingAddressId?: string
     billingAddressId?: string
     notes?: string
+    skipCartClear?: boolean
     items: Array<{
       productId: string
       quantity: number
@@ -746,7 +786,9 @@ export class DatabaseService {
         ...baseInsertPayload,
         tracking_number: trackingNumber,
         payment_verified: Boolean(orderData.paymentVerified),
-        receipt_token: orderData.receiptToken || null
+        receipt_token: orderData.receiptToken || null,
+        wallet_amount_used: Number(orderData.walletAmountUsed || 0),
+        ...(orderData.deliveredAt ? { delivered_at: new Date(orderData.deliveredAt).toISOString() } : {})
       })
       .select()
       .single()
@@ -812,8 +854,8 @@ export class DatabaseService {
       }
     }
 
-    // Clear user cart only when associated with an authenticated account
-    if (orderData.userId) {
+    // Clear user cart only when associated with an authenticated checkout (skip for admin exchange replacements)
+    if (orderData.userId && !orderData.skipCartClear) {
       await this.clearCart(orderData.userId).catch(() => {})
     }
 
@@ -1137,9 +1179,10 @@ export class DatabaseService {
   async updateOrderPaymentAndStatus(
     id: string,
     updates: {
-      status?: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
-      paymentStatus?: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
+      status?: OrderStatus
+      paymentStatus?: PaymentStatus
       paymentVerified?: boolean
+      deliveredAt?: Date | string | null
     }
   ): Promise<Order> {
     const payload: Record<string, any> = {
@@ -1149,6 +1192,15 @@ export class DatabaseService {
     if (updates.paymentStatus !== undefined) payload.payment_status = updates.paymentStatus
     if (updates.paymentVerified !== undefined) payload.payment_verified = updates.paymentVerified
 
+    if (updates.deliveredAt !== undefined && updates.deliveredAt !== null) {
+      payload.delivered_at = new Date(updates.deliveredAt).toISOString()
+    } else if (updates.status === 'DELIVERED') {
+      const existing = await this.findOrderById(id).catch(() => null)
+      if (!existing?.deliveredAt) {
+        payload.delivered_at = new Date().toISOString()
+      }
+    }
+
     const { data, error } = await this.supabase
       .from('orders')
       .update(payload)
@@ -1156,8 +1208,9 @@ export class DatabaseService {
       .select('*, order_items(*, products(*)), users(*), shipping_address:addresses!orders_shipping_address_id_fkey(*)')
       .single()
 
-    if (error && updates.paymentVerified !== undefined) {
+    if (error && (updates.paymentVerified !== undefined || payload.delivered_at !== undefined)) {
       delete payload.payment_verified
+      delete payload.delivered_at
       const retry = await this.supabase
         .from('orders')
         .update(payload)
@@ -1366,34 +1419,25 @@ export class DatabaseService {
 
   private enrichSupportSession(session: any): any {
     const presence = this.formatRelativePresence(session.lastSeenAt, session.isOnline)
-    const messages = Array.isArray(session.messages) ? session.messages : []
-    const aiMode = session.aiMode || messages[0]?.metadata?.aiMode || 'AUTO'
-    const recentAdminMsg = messages
-      .slice()
-      .reverse()
-      .find((m: any) => m.senderRole === 'ADMIN')
-    const adminWithinCooldown =
-      Boolean(recentAdminMsg) &&
-      Date.now() - new Date(recentAdminMsg.createdAt).getTime() < 30 * 60 * 1000
-
-    const aiPaused =
-      session.status === 'RESOLVED'
-        ? false
-        : aiMode === 'PAUSED'
-        ? true
-        : aiMode === 'ACTIVE'
-        ? false
-        : adminWithinCooldown
+    const messages = (Array.isArray(session.messages) ? session.messages : []).filter(
+      (m: any) => m && m.senderRole !== 'AI_ASSISTANT'
+    )
 
     return {
       ...session,
       isOnline: presence.isOnline,
       lastSeenText: presence.lastSeenText,
       isRegisteredUser: Boolean(session.userId),
-      aiPaused,
+      activeOrderId: session.activeOrderId || null,
       selectedProducts: Array.isArray(session.selectedProducts) ? session.selectedProducts : [],
       messages
     }
+  }
+
+  async listSupportSessionsByUserId(userId: string): Promise<any[]> {
+    if (!userId) return []
+    const all = await this.listSupportSessions()
+    return all.filter((s) => s.userId === userId)
   }
 
   async findSupportSessionByUserId(userId: string, email?: string): Promise<any | null> {
@@ -1483,48 +1527,69 @@ export class DatabaseService {
 
     // 1. Try dedicated support_sessions & support_messages tables first
     try {
-      const { error: sessionErr } = await this.supabase
+      const sessionPayload: Record<string, any> = {
+        id: session.id,
+        visitor_id: session.visitorId || session.id,
+        user_id: session.userId || null,
+        visitor_name: session.visitorName || 'Customer',
+        visitor_email: session.visitorEmail || null,
+        visitor_phone: session.visitorPhone || null,
+        topic: session.topic || 'General Inquiry',
+        selected_products: session.selectedProducts || [],
+        active_order_id: session.activeOrderId || null,
+        status: session.status || 'OPEN',
+        is_online: Boolean(session.isOnline),
+        last_seen_at: session.lastSeenAt || new Date().toISOString(),
+        unread_admin_count: Number(session.unreadAdminCount || 0),
+        unread_client_count: Number(session.unreadClientCount || 0),
+        created_at: session.createdAt || new Date().toISOString(),
+        updated_at: session.updatedAt || new Date().toISOString()
+      }
+
+      let { error: sessionErr } = await this.supabase
         .from('support_sessions')
-        .upsert({
-          id: session.id,
-          visitor_id: session.visitorId || session.id,
-          user_id: session.userId || null,
-          visitor_name: session.visitorName || 'Store Visitor',
-          visitor_email: session.visitorEmail || null,
-          visitor_phone: session.visitorPhone || null,
-          topic: session.topic || 'General Inquiry',
-          selected_products: session.selectedProducts || [],
-          status: session.status || 'OPEN',
-          is_online: Boolean(session.isOnline),
-          last_seen_at: session.lastSeenAt || new Date().toISOString(),
-          unread_admin_count: Number(session.unreadAdminCount || 0),
-          unread_client_count: Number(session.unreadClientCount || 0),
-          created_at: session.createdAt || new Date().toISOString(),
-          updated_at: session.updatedAt || new Date().toISOString()
-        }, { onConflict: 'id' })
+        .upsert(sessionPayload, { onConflict: 'id' })
+
+      if (sessionErr) {
+        delete sessionPayload.active_order_id
+        const retrySession = await this.supabase
+          .from('support_sessions')
+          .upsert(sessionPayload, { onConflict: 'id' })
+        sessionErr = retrySession.error
+      }
 
       if (!sessionErr) {
         const validMessages = Array.isArray(session.messages)
-          ? session.messages.filter((m: any) => m && m.id)
+          ? session.messages.filter((m: any) => m && m.id && m.senderRole !== 'AI_ASSISTANT')
           : []
 
         if (validMessages.length === 0) {
           return
         }
 
-        const messageRows = validMessages.map((m: any) => ({
+        const messageRowsWithSender = validMessages.map((m: any) => ({
           id: m.id,
           session_id: session.id,
+          sender_user_id: m.senderUserId || null,
           sender_role: m.senderRole || 'CLIENT',
-          sender_name: m.senderName || session.visitorName || 'Store Visitor',
+          sender_name: m.senderName || session.visitorName || 'Customer',
           content: m.content || '',
           metadata: m.metadata || {},
           created_at: m.createdAt || new Date().toISOString()
         }))
 
+        const firstMsgInsert = await this.supabase
+          .from('support_messages')
+          .upsert(messageRowsWithSender, { onConflict: 'id' })
+
+        if (!firstMsgInsert.error) {
+          return
+        }
+
+        const legacyMsgRows = messageRowsWithSender.map(({ sender_user_id: _s, ...rest }: any) => rest)
         const { error: msgErr } = await this.supabase
           .from('support_messages')
-          .upsert(messageRows, { onConflict: 'id' })
+          .upsert(legacyMsgRows, { onConflict: 'id' })
 
         if (!msgErr) {
           return
@@ -1582,6 +1647,7 @@ export class DatabaseService {
           visitorPhone: row.visitor_phone || '',
           topic: row.topic || 'General Inquiry',
           selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+          activeOrderId: row.active_order_id || null,
           status: row.status || 'OPEN',
           isOnline: Boolean(row.is_online),
           lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
@@ -1592,6 +1658,7 @@ export class DatabaseService {
           messages: (msgRows || []).map((m: any) => ({
             id: m.id,
             sessionId: m.session_id,
+            senderUserId: m.sender_user_id || undefined,
             senderRole: m.sender_role,
             senderName: m.sender_name,
             content: m.content,
@@ -1681,9 +1748,10 @@ export class DatabaseService {
             visitorName: row.visitor_name || 'Store Visitor',
             visitorEmail: row.visitor_email || '',
             visitorPhone: row.visitor_phone || '',
-            topic: row.topic || 'General Inquiry',
-            selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
-            status: row.status || 'OPEN',
+          topic: row.topic || 'General Inquiry',
+          selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+          activeOrderId: row.active_order_id || null,
+          status: row.status || 'OPEN',
             isOnline: Boolean(row.is_online),
             lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
             unreadAdminCount: Number(row.unread_admin_count || 0),
@@ -1754,9 +1822,9 @@ export class DatabaseService {
     visitorPhone?: string
     topic?: string
     selectedProducts?: any[]
+    activeOrderId?: string | null
     resumeOnly?: boolean
   }): Promise<any | null> {
-    const requestedSessionId = payload.sessionId || payload.visitorId || `chat_${crypto.randomUUID()}`
     const nowIso = new Date().toISOString()
 
     const authUser =
@@ -1766,39 +1834,21 @@ export class DatabaseService {
         ? await this.findUserById(payload.userId).catch(() => null)
         : null
 
+    if (!authUser?.id) {
+      throw new Error('Authentication is required to access or create a persistent support thread.')
+    }
+
+    const requestedSessionId = payload.sessionId || `chat_user_${authUser.id}`
     let existing = await this.getSupportSession(requestedSessionId)
+    if (existing && existing.userId && existing.userId !== authUser.id && authUser.role !== 'ADMIN') {
+      existing = null
+    }
 
-    // For registered users, link/resume their canonical account-owned session so history & admin replies follow them across logins/devices
-    let canonicalSessionId = requestedSessionId
-    if (authUser?.id) {
-      const accountSession = await this.findSupportSessionByUserId(authUser.id, authUser.email)
-      if (accountSession) {
-        if (existing && existing.id !== accountSession.id) {
-          const transferableMessages = (existing.messages || []).filter(
-            (m: any) => !(m.senderRole === 'AI_ASSISTANT' && m.metadata?.type === 'welcome')
-          )
-          const existingMsgIds = new Set((accountSession.messages || []).map((m: any) => m.id))
-          const mergedMessages = [
-            ...(accountSession.messages || []),
-            ...transferableMessages
-              .filter((m: any) => m.id && !existingMsgIds.has(m.id))
-              .map((m: any) => ({ ...m, sessionId: accountSession.id }))
-          ].sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-
-          const existingProdIds = new Set((accountSession.selectedProducts || []).map((p: any) => p.id))
-          const mergedGuestProducts = [
-            ...(accountSession.selectedProducts || []),
-            ...((existing.selectedProducts || []).filter((p: any) => p?.id && !existingProdIds.has(p.id)))
-          ]
-          accountSession.messages = mergedMessages
-          accountSession.selectedProducts = mergedGuestProducts
-          if (existing.unreadAdminCount) {
-            accountSession.unreadAdminCount = Number(accountSession.unreadAdminCount || 0) + Number(existing.unreadAdminCount || 0)
-          }
-        }
-        existing = accountSession
-        canonicalSessionId = accountSession.id
-      }
+    const accountSession = await this.findSupportSessionByUserId(authUser.id, authUser.email)
+    let canonicalSessionId = existing?.id || `chat_user_${authUser.id}`
+    if (accountSession) {
+      existing = accountSession
+      canonicalSessionId = accountSession.id
     }
 
     if (payload.resumeOnly && !existing) {
@@ -1818,12 +1868,13 @@ export class DatabaseService {
     const session: any = {
       id: canonicalSessionId,
       visitorId: existing?.visitorId || payload.visitorId || canonicalSessionId,
-      userId: authUser?.id || payload.userId || existing?.userId,
-      visitorName: payload.visitorName || existing?.visitorName || 'Store Visitor',
-      visitorEmail: payload.visitorEmail || existing?.visitorEmail || '',
+      userId: authUser.id,
+      visitorName: payload.visitorName || existing?.visitorName || 'Customer',
+      visitorEmail: payload.visitorEmail || existing?.visitorEmail || authUser.email || '',
       visitorPhone: payload.visitorPhone || existing?.visitorPhone || '',
       topic: nextTopic,
       selectedProducts: mergedProducts,
+      activeOrderId: payload.activeOrderId !== undefined ? payload.activeOrderId : (existing?.activeOrderId || null),
       status: existing?.status || 'OPEN',
       isOnline: true,
       lastSeenAt: nowIso,
@@ -1831,30 +1882,14 @@ export class DatabaseService {
       unreadClientCount: existing?.unreadClientCount || 0,
       createdAt: existing?.createdAt || nowIso,
       updatedAt: nowIso,
-      messages: existing?.messages || []
+      messages: (existing?.messages || []).filter((m: any) => m && m.senderRole !== 'AI_ASSISTANT')
     }
 
-    if (authUser) {
-      this.applyRegisteredUserToSession(session, authUser, {
-        visitorName: payload.visitorName,
-        visitorEmail: payload.visitorEmail,
-        visitorPhone: payload.visitorPhone
-      })
-    }
-
-    // Seed welcome message if new session
-    if (session.messages.length === 0) {
-      const welcomeMsg = {
-        id: `msg_${crypto.randomUUID()}`,
-        sessionId: canonicalSessionId,
-        senderRole: 'AI_ASSISTANT',
-        senderName: 'DriveFlyElectric Concierge',
-        content: `Welcome to DriveFlyElectric Support! Select an inquiry topic above (Payment Issue, Item Purchase, General Inquiry, or Shipping Issue) or pick the rigs you're looking to buy today from our catalogue, and I'll assist you immediately or connect you with a live specialist.`,
-        metadata: { type: 'welcome' },
-        createdAt: nowIso
-      }
-      session.messages.push(welcomeMsg)
-    }
+    this.applyRegisteredUserToSession(session, authUser, {
+      visitorName: payload.visitorName,
+      visitorEmail: payload.visitorEmail,
+      visitorPhone: payload.visitorPhone
+    })
 
     await this.persistSupportSessionToDb(session)
     return this.enrichSupportSession(session)
@@ -1891,26 +1926,6 @@ export class DatabaseService {
     return this.enrichSupportSession(existing)
   }
 
-  async setSupportSessionAiMode(sessionId: string, aiPaused: boolean): Promise<any | null> {
-    const existing = await this.getSupportSession(sessionId)
-    if (!existing) return null
-
-    const nextMode = aiPaused ? 'PAUSED' : 'ACTIVE'
-    existing.aiMode = nextMode
-    if (Array.isArray(existing.messages) && existing.messages.length > 0) {
-      existing.messages[0] = {
-        ...existing.messages[0],
-        metadata: {
-          ...(existing.messages[0].metadata || {}),
-          aiMode: nextMode
-        }
-      }
-    }
-    existing.updatedAt = new Date().toISOString()
-    await this.persistSupportSessionToDb(existing)
-    return this.enrichSupportSession(existing)
-  }
-
   async updateSupportSessionStatus(sessionId: string, status: 'OPEN' | 'RESOLVED'): Promise<any | null> {
     const existing = await this.getSupportSession(sessionId)
     if (!existing) return null
@@ -1918,119 +1933,22 @@ export class DatabaseService {
     existing.status = status
     if (status === 'RESOLVED') {
       existing.unreadAdminCount = 0
-      existing.aiMode = 'AUTO'
-      if (Array.isArray(existing.messages) && existing.messages.length > 0 && existing.messages[0]?.metadata?.aiMode) {
-        existing.messages[0] = {
-          ...existing.messages[0],
-          metadata: {
-            ...existing.messages[0].metadata,
-            aiMode: 'AUTO'
-          }
-        }
-      }
     }
     existing.updatedAt = new Date().toISOString()
     await this.persistSupportSessionToDb(existing)
     return this.enrichSupportSession(existing)
   }
 
-  async generateIntelligentSupportReply(session: any, clientMessage: string): Promise<string> {
-    const lowerMsg = (clientMessage || '').toLowerCase()
-    const topic = session.topic || 'General Inquiry'
-    const selectedProducts: any[] = Array.isArray(session.selectedProducts) ? session.selectedProducts : []
-
-    // Detect if the user provided an email or phone inside their message for lead acquisition
-    const emailMatch = clientMessage.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)
-    const phoneMatch = clientMessage.match(/(?:\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/)
-    let capturedContactNote = ''
-    if (emailMatch && !session.visitorEmail) {
-      session.visitorEmail = emailMatch[0]
-      capturedContactNote = `Thank you! We have saved your email (${session.visitorEmail}) to this support ticket so our specialist team can send you direct updates and invoices. `
-    }
-    if (phoneMatch && !session.visitorPhone) {
-      session.visitorPhone = phoneMatch[0]
-      capturedContactNote += `We also logged your phone number (${session.visitorPhone}) for priority dispatch updates. `
-    }
-
-    // Load live catalog products to match product inquiries accurately
-    let catalogProducts: Product[] = []
-    try {
-      catalogProducts = await this.findProducts({ limit: 100 })
-    } catch {
-      catalogProducts = []
-    }
-
-    // Match any product mentioned by name, category, or in selectedProducts
-    const matchedProducts: Product[] = []
-    for (const sp of selectedProducts) {
-      const found = catalogProducts.find(p => p.id === sp.id || p.sku === sp.sku)
-      if (found && !matchedProducts.some(m => m.id === found.id)) {
-        matchedProducts.push(found)
-      }
-    }
-    for (const prod of catalogProducts) {
-      const pName = (prod.name || '').toLowerCase()
-      const pCat = (prod.category || '').toLowerCase()
-      if (
-        (lowerMsg.includes('heli') && pCat.includes('heli')) ||
-        (lowerMsg.includes('microcar') && pCat.includes('micro')) ||
-        (lowerMsg.includes('jeep') && pName.includes('jeep')) ||
-        (lowerMsg.includes('trike') && pCat.includes('trike')) ||
-        (lowerMsg.includes('kart') && pCat.includes('kart')) ||
-        (lowerMsg.includes('dirt') && pCat.includes('dirt')) ||
-        (pName.length > 5 && lowerMsg.includes(pName.slice(0, 12)))
-      ) {
-        if (!matchedProducts.some(m => m.id === prod.id)) {
-          matchedProducts.push(prod)
-        }
-      }
-    }
-
-    const contactPrompt = !session.visitorEmail
-      ? `\n\n💡 Tip: Please share your email address or phone number in this chat (or in the contact bar above) so our specialist can send you an official spec sheet, custom quote, or direct payment link.`
-      : `\n\n✅ Our live support team has also been notified and can reply directly in this chat window at any moment.`
-
-    // 1. Handle Topic: Payment Issue
-    if (topic === 'Payment Issue' || lowerMsg.includes('payment') || lowerMsg.includes('stripe') || lowerMsg.includes('paypal') || lowerMsg.includes('card') || lowerMsg.includes('declin')) {
-      const totalSelected = matchedProducts.reduce((sum, p) => sum + Number(p.price || 0), 0)
-      const selectedSummary = matchedProducts.length > 0
-        ? `\n• Selected Rig(s): ${matchedProducts.map(p => `${p.name} ($${Number(p.price).toLocaleString()} USD)`).join(', ')} — Subtotal: $${totalSelected.toLocaleString()} USD.`
-        : ''
-      return `${capturedContactNote}💳 **DriveFlyElectric Payment Support**:\n• We accept **Stripe Instant Card** (Visa, Mastercard, Amex, Discover) and **PayPal Express Checkout** in USD ($).${selectedSummary}\n• If your card is declined on high-value rigs (such as MiniHeliCopters or Microcars), it is usually a bank 3D-Secure or daily limit hold—authorizing the transaction with your bank or choosing **PayPal** at checkout resolves it immediately.\n• Every completed checkout automatically generates an official **DriveFlyElectric PDF Purchase Receipt** emailed to you immediately.${contactPrompt}`
-    }
-
-    // 2. Handle Topic: Shipping Issue
-    if (topic === 'Shipping Issue' || lowerMsg.includes('ship') || lowerMsg.includes('deliver') || lowerMsg.includes('track') || lowerMsg.includes('freight') || lowerMsg.includes('warehouse')) {
-      const deliveryWindow = matchedProducts[0]?.averageDeliveryTime || '14-25 business days (Global Express Crated Freight)'
-      return `${capturedContactNote}🚚 **DriveFlyElectric Shipping & Freight Support**:\n• **100% Free Express Doorstep Shipping** is included on all orders.\n• **Dispatch & Transit Window**: ${deliveryWindow}, with international dispatch coordination from our operations centers.\n• All MiniHeliCopters, Microcars, Go Karts, Trikes, and Dirtbikes ship in reinforced steel-framed crates with full customs clearance and tracking.\n• For instant live freight & tracking assistance, you can also click the **green WhatsApp Support button** at the bottom-right (${getFormattedSupportWhatsApp()}).${contactPrompt}`
-    }
-
-    // 3. Handle Matched / Selected Catalogue Items or Item Purchase Inquiry
-    if (matchedProducts.length > 0 || topic === 'Item Purchase') {
-      if (matchedProducts.length > 0) {
-        const lines = matchedProducts.slice(0, 3).map(p => {
-          const stockStatus = p.stock > 0 ? `In Stock (${p.stock} units ready)` : 'Built to Order'
-          return `• **${p.name}** (SKU: \`${p.sku}\` | Category: ${p.category}) — **$${Number(p.price).toLocaleString(undefined, { minimumFractionDigits: 2 })} USD** | ${stockStatus} | Delivery: ${p.averageDeliveryTime || '14-25 business days'}`
-        }).join('\n')
-
-        return `${capturedContactNote}⚡ **DriveFlyElectric Product & Purchase Breakdown**:\n${lines}\n\nYou can add ${matchedProducts.length === 1 ? 'this rig' : 'these rigs'} directly to your cart and complete checkout via Stripe or PayPal with **Free Express Shipping** and a **12-Month Powertrain & Avionics Warranty**. Would you like a specialist to prepare an order or answer a technical question about ${matchedProducts[0].name}?${contactPrompt}`
-      }
-
-      return `${capturedContactNote}⚡ **DriveFlyElectric Fleet Purchase Concierge**:\nWe currently stock 5 flagship categories in USD:\n1. **MiniHeliCopters** (Personal Single-Seat & Twin-Rotor Ultralights from $4,800 USD)\n2. **Microcars** (Enclosed Electric Microcars & 200cc Adult Mini Jeep Willys from $850 USD)\n3. **Go Karts** (Off-Road Racing Buggies & Drift Karts)\n4. **Trikes** (3000W Brushless Electric Drift Trikes)\n5. **Dirtbikes** (High-Discharge Lithium Off-Road Trail Bikes)\n\nUse the **"What are you looking to buy today?"** catalogue selector above to pick the exact rig(s) you're interested in!${contactPrompt}`
-    }
-
-    // 4. General Inquiry & Store Details Acquisition
-    return `${capturedContactNote}🏢 **DriveFlyElectric Store & Support Details**:\n• **Brand**: DriveFlyElectric (https://driveflyelectric.shop)\n• **Fleet Categories**: MiniHeliCopters, Electric Microcars, Go Karts, Electric Drift Trikes & Dirtbikes\n• **Head Office**: Austin, Texas, USA\n• **Official Support Email**: ${getAdminContactEmail()}\n• **WhatsApp Support Line**: ${getFormattedSupportWhatsApp()}\n• **Warranty & Shipping**: 100% Free Express Shipping + 12-Month Factory Warranty.\n\nHow can we help you with your fleet selection today?${contactPrompt}`
-  }
-
   async appendSupportMessage(
     sessionId: string,
     messageInput: {
-      senderRole: 'CLIENT' | 'ADMIN' | 'AI_ASSISTANT'
+      senderRole: 'CLIENT' | 'ADMIN' | 'SYSTEM'
+      senderUserId?: string
       senderName?: string
       content: string
       topic?: string
       selectedProducts?: any[]
+      activeOrderId?: string | null
       userId?: string
       registeredUser?: any
       visitorName?: string
@@ -2055,13 +1973,15 @@ export class DatabaseService {
         visitorEmail: messageInput.visitorEmail,
         visitorPhone: messageInput.visitorPhone,
         topic: messageInput.topic,
-        selectedProducts: messageInput.selectedProducts
+        selectedProducts: messageInput.selectedProducts,
+        activeOrderId: messageInput.activeOrderId
       })
     }
 
     const nowIso = new Date().toISOString()
     if (messageInput.topic) session.topic = messageInput.topic
     if (messageInput.selectedProducts !== undefined) session.selectedProducts = messageInput.selectedProducts
+    if (messageInput.activeOrderId !== undefined) session.activeOrderId = messageInput.activeOrderId
     if (messageInput.visitorName) session.visitorName = messageInput.visitorName
     if (messageInput.visitorEmail) session.visitorEmail = messageInput.visitorEmail
     if (messageInput.visitorPhone) session.visitorPhone = messageInput.visitorPhone
@@ -2080,23 +2000,28 @@ export class DatabaseService {
     const primaryMsg = {
       id: `msg_${crypto.randomUUID()}`,
       sessionId: session.id,
+      senderUserId: messageInput.senderUserId || authUser?.id || undefined,
       senderRole: messageInput.senderRole,
       senderName:
         messageInput.senderName ||
         (messageInput.senderRole === 'ADMIN'
           ? 'DriveFlyElectric Support Specialist'
-          : messageInput.senderRole === 'AI_ASSISTANT'
-          ? 'DriveFlyElectric Concierge'
-          : session.visitorName || 'Store Visitor'),
+          : messageInput.senderRole === 'SYSTEM'
+          ? 'DriveFlyElectric System'
+          : session.visitorName || 'Customer'),
       content: messageInput.content,
       metadata: {
         topic: session.topic,
+        activeOrderId: session.activeOrderId || null,
         selectedProductIds: (session.selectedProducts || []).map((p: any) => p.id)
       },
       createdAt: nowIso
     }
 
-    session.messages = [...(session.messages || []), primaryMsg]
+    session.messages = [
+      ...(session.messages || []).filter((m: any) => m && m.senderRole !== 'AI_ASSISTANT'),
+      primaryMsg
+    ]
     session.updatedAt = nowIso
     session.lastSeenAt = nowIso
 
@@ -2107,48 +2032,12 @@ export class DatabaseService {
     } else if (messageInput.senderRole === 'ADMIN') {
       session.unreadClientCount = Number(session.unreadClientCount || 0) + 1
       session.unreadAdminCount = 0
-      if (session.aiMode === 'ACTIVE' || session.messages?.[0]?.metadata?.aiMode === 'ACTIVE') {
-        session.aiMode = 'AUTO'
-        if (session.messages?.[0]) {
-          session.messages[0] = {
-            ...session.messages[0],
-            metadata: {
-              ...(session.messages[0].metadata || {}),
-              aiMode: 'AUTO'
-            }
-          }
-        }
-      }
     }
 
     await this.persistSupportSessionToDb(session)
-    const createdList: any[] = [primaryMsg]
-
-    // Generate immediate AI Concierge reply for CLIENT messages unless Admin is actively handling the ticket or explicitly paused AI
-    if (messageInput.senderRole === 'CLIENT') {
-      const enrichedBeforeAi = this.enrichSupportSession(session)
-
-      if (!enrichedBeforeAi.aiPaused) {
-        const aiReplyContent = await this.generateIntelligentSupportReply(session, messageInput.content)
-        const aiMsg = {
-          id: `msg_${crypto.randomUUID()}`,
-          sessionId: session.id,
-          senderRole: 'AI_ASSISTANT',
-          senderName: 'DriveFlyElectric Intelligent Assistant',
-          content: aiReplyContent,
-          metadata: { automated: true, topic: session.topic },
-          createdAt: new Date(Date.now() + 250).toISOString()
-        }
-        session.messages = [...session.messages, aiMsg]
-        session.updatedAt = aiMsg.createdAt
-        await this.persistSupportSessionToDb(session)
-        createdList.push(aiMsg)
-      }
-    }
-
     return {
       session: this.enrichSupportSession(session),
-      newMessages: createdList
+      newMessages: [primaryMsg]
     }
   }
 
@@ -3713,6 +3602,895 @@ export class DatabaseService {
       recentVisits: visits.slice(0, 40),
       recentProductViews: views.slice(0, 40)
     }
+  }
+
+  // ==================== CHECKOUT PAYMENT OPTIONS AVAILABILITY ====================
+
+  private getDefaultPaymentUnavailableNotice(gateway: 'paypal' | 'stripe'): string {
+    return gateway === 'paypal'
+      ? 'PayPal checkout is currently unavailable. Please do not use this option — select another active payment method below.'
+      : 'Credit or Debit Card (Stripe Gateway) is currently unavailable. Please do not use this option — select another active payment method below.'
+  }
+
+  private normalizePaymentOptionEntry(
+    gateway: 'paypal' | 'stripe',
+    raw: any,
+    fallbackUpdatedAt?: string | null,
+    fallbackUpdatedBy?: string | null
+  ): PaymentOptionAvailability {
+    const defaultNotice = this.getDefaultPaymentUnavailableNotice(gateway)
+    const rawNotice = typeof raw?.notice === 'string' ? raw.notice.trim() : ''
+    return {
+      available: raw?.available !== undefined ? Boolean(raw.available) : true,
+      notice: (rawNotice || defaultNotice).slice(0, 400),
+      updatedAt: raw?.updatedAt ?? fallbackUpdatedAt ?? null,
+      updatedBy: raw?.updatedBy ?? fallbackUpdatedBy ?? null
+    }
+  }
+
+  private normalizePaymentOptionsConfig(
+    raw: any,
+    updatedAt?: string | null,
+    updatedBy?: string | null
+  ): PaymentOptionsConfig {
+    return {
+      paypal: this.normalizePaymentOptionEntry('paypal', raw?.paypal, updatedAt, updatedBy),
+      stripe: this.normalizePaymentOptionEntry('stripe', raw?.stripe, updatedAt, updatedBy)
+    }
+  }
+
+  async getPaymentOptionsConfig(bypassCache: boolean = false): Promise<PaymentOptionsConfig> {
+    if (!bypassCache && this.paymentOptionsCache && this.paymentOptionsCache.expiresAt > Date.now()) {
+      return this.paymentOptionsCache.data
+    }
+
+    const cacheAndReturn = (cfg: PaymentOptionsConfig) => {
+      this.paymentOptionsCache = { data: cfg, expiresAt: Date.now() + 5000 }
+      return cfg
+    }
+
+    try {
+      const { data, error } = await this.supabase
+        .from('store_settings')
+        .select('key, value, updated_by, updated_at')
+        .eq('key', 'payment_options')
+        .maybeSingle()
+
+      if (!error && data?.value) {
+        return cacheAndReturn(
+          this.normalizePaymentOptionsConfig(data.value, data.updated_at || null, data.updated_by || null)
+        )
+      }
+    } catch {
+      // Fallback below
+    }
+
+    if (this.pool) {
+      try {
+        const res = await this.pool.query(
+          'SELECT value, updated_by, updated_at FROM public.store_settings WHERE key = $1 LIMIT 1',
+          ['payment_options']
+        )
+        if (res.rows[0]?.value) {
+          return cacheAndReturn(
+            this.normalizePaymentOptionsConfig(
+              res.rows[0].value,
+              res.rows[0].updated_at ? new Date(res.rows[0].updated_at).toISOString() : null,
+              res.rows[0].updated_by || null
+            )
+          )
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    try {
+      const { data: ev } = await this.supabase
+        .from('events')
+        .select('description, updated_at, location')
+        .eq('id', 'setting_payment_options')
+        .eq('category', 'STORE_SETTING')
+        .maybeSingle()
+
+      if (ev?.description) {
+        const parsed = JSON.parse(ev.description)
+        return cacheAndReturn(
+          this.normalizePaymentOptionsConfig(parsed, ev.updated_at || null, ev.location || null)
+        )
+      }
+    } catch {
+      // Return defaults
+    }
+
+    if (this.paymentOptionsCache?.data) {
+      return this.paymentOptionsCache.data
+    }
+
+    return cacheAndReturn(this.normalizePaymentOptionsConfig({}))
+  }
+
+  async setPaymentOptionsConfig(input: {
+    paypalAvailable?: boolean
+    paypalNotice?: string
+    stripeAvailable?: boolean
+    stripeNotice?: string
+    updatedBy?: string | null
+  }): Promise<PaymentOptionsConfig> {
+    const current = await this.getPaymentOptionsConfig(true)
+    const nowIso = new Date().toISOString()
+    const actor = input.updatedBy ? String(input.updatedBy).slice(0, 160) : null
+
+    const mergeGateway = (
+      gateway: 'paypal' | 'stripe',
+      prev: PaymentOptionAvailability,
+      nextAvailable?: boolean,
+      nextNotice?: string
+    ): PaymentOptionAvailability => {
+      const cleanNotice = typeof nextNotice === 'string' ? nextNotice.trim() : undefined
+      return {
+        available: nextAvailable !== undefined ? Boolean(nextAvailable) : prev.available,
+        notice:
+          cleanNotice !== undefined
+            ? (cleanNotice || this.getDefaultPaymentUnavailableNotice(gateway)).slice(0, 400)
+            : prev.notice,
+        updatedAt: nowIso,
+        updatedBy: actor || prev.updatedBy || null
+      }
+    }
+
+    const nextConfig: PaymentOptionsConfig = {
+      paypal: mergeGateway('paypal', current.paypal, input.paypalAvailable, input.paypalNotice),
+      stripe: mergeGateway('stripe', current.stripe, input.stripeAvailable, input.stripeNotice)
+    }
+
+    this.paymentOptionsCache = { data: nextConfig, expiresAt: Date.now() + 5000 }
+
+    let persisted = false
+    try {
+      const { error } = await this.supabase.from('store_settings').upsert(
+        {
+          key: 'payment_options',
+          value: nextConfig,
+          updated_by: actor,
+          updated_at: nowIso
+        },
+        { onConflict: 'key' }
+      )
+      if (!error) persisted = true
+    } catch {
+      // Fallback below
+    }
+
+    if (!persisted && this.pool) {
+      try {
+        await this.pool.query(
+          `INSERT INTO public.store_settings (key, value, updated_by, updated_at)
+           VALUES ($1, $2::jsonb, $3, $4)
+           ON CONFLICT (key) DO UPDATE SET
+             value = EXCLUDED.value,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = EXCLUDED.updated_at`,
+          ['payment_options', JSON.stringify(nextConfig), actor, nowIso]
+        )
+        persisted = true
+      } catch {
+        // Fallback below
+      }
+    }
+
+    if (!persisted) {
+      try {
+        await this.supabase.from('events').upsert(
+          {
+            id: 'setting_payment_options',
+            title: 'SETTING:payment_options',
+            description: JSON.stringify(nextConfig),
+            date: nowIso.slice(0, 10),
+            time: nowIso,
+            location: actor || 'admin',
+            category: 'STORE_SETTING',
+            status: 'past',
+            updated_at: nowIso
+          },
+          { onConflict: 'id' }
+        )
+      } catch {
+        // Memory cache preserves state until DB is ready
+      }
+    }
+
+    return nextConfig
+  }
+
+  // ==================== ACTIVE SHIPPING, WALLET & 21-DAY RETURN OPERATIONS ====================
+  public readonly RETURN_WINDOW_DAYS = 21
+  public readonly EXCHANGE_TOLERANCE_RATIO = 0.1
+
+  public roundCurrency(amount: number): number {
+    return Math.round((Number(amount || 0) + Number.EPSILON) * 100) / 100
+  }
+
+  public isWithinExchangeValueTolerance(baseCatalogValue: number, candidatePrice: number): boolean {
+    const cleanBase = Number(baseCatalogValue || 0)
+    const cleanCandidate = Number(candidatePrice || 0)
+    if (!Number.isFinite(cleanBase) || cleanBase <= 0 || !Number.isFinite(cleanCandidate) || cleanCandidate <= 0) {
+      return false
+    }
+    const tolerance = Math.max(25, this.roundCurrency(cleanBase * this.EXCHANGE_TOLERANCE_RATIO))
+    return Math.abs(cleanCandidate - cleanBase) <= tolerance
+  }
+
+  public computeOrderReturnEligibility(order: Order): {
+    eligible: boolean
+    expired: boolean
+    reason?: string
+    anchorDate: Date
+    eligibleUntil: Date
+    daysRemaining: number
+  } {
+    const anchorDate = order.deliveredAt ? new Date(order.deliveredAt) : new Date(order.createdAt)
+    const eligibleUntil = new Date(anchorDate.getTime() + this.RETURN_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+    const msRemaining = eligibleUntil.getTime() - Date.now()
+    const expired = msRemaining < 0
+    const daysRemaining = Math.max(0, Math.ceil(msRemaining / (24 * 60 * 60 * 1000)))
+
+    const eligibleStatuses: OrderStatus[] = ['PROCESSING', 'SHIPPED', 'DELIVERED']
+    if (!eligibleStatuses.includes(order.status)) {
+      return {
+        eligible: false,
+        expired,
+        reason: `Orders in ${order.status} status are not eligible for return.`,
+        anchorDate,
+        eligibleUntil,
+        daysRemaining
+      }
+    }
+    if (order.paymentStatus !== 'COMPLETED') {
+      return {
+        eligible: false,
+        expired,
+        reason: 'Only settled paid orders are eligible for a return or exchange.',
+        anchorDate,
+        eligibleUntil,
+        daysRemaining
+      }
+    }
+    if (expired) {
+      return {
+        eligible: false,
+        expired: true,
+        reason: `The ${this.RETURN_WINDOW_DAYS}-day return window expired on ${eligibleUntil.toISOString().slice(0, 10)}.`,
+        anchorDate,
+        eligibleUntil,
+        daysRemaining: 0
+      }
+    }
+
+    return {
+      eligible: true,
+      expired: false,
+      anchorDate,
+      eligibleUntil,
+      daysRemaining
+    }
+  }
+
+  async getActiveShippingOrders(userId: string): Promise<{
+    hasActiveShipping: boolean
+    orders: Order[]
+  }> {
+    if (!userId) {
+      return { hasActiveShipping: false, orders: [] }
+    }
+    const allUserOrders = await this.findOrdersByUserId(userId)
+    const activeOrders = allUserOrders.filter(
+      (order) => order.status === 'PROCESSING' || order.status === 'SHIPPED'
+    )
+    return {
+      hasActiveShipping: activeOrders.length > 0,
+      orders: activeOrders
+    }
+  }
+
+  public mapWallet(raw: any): Wallet {
+    return {
+      id: raw.id,
+      userId: raw.user_id || raw.userId,
+      balance: this.roundCurrency(Number(raw.balance || 0)),
+      currency: raw.currency || 'USD',
+      createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
+      updatedAt: raw.updated_at ? new Date(raw.updated_at) : new Date()
+    }
+  }
+
+  public mapWalletTransaction(raw: any): WalletTransaction {
+    return {
+      id: raw.id,
+      walletId: raw.wallet_id || raw.walletId,
+      userId: raw.user_id || raw.userId,
+      type: raw.type,
+      direction: raw.direction || (raw.type === 'CHECKOUT_PAYMENT' ? 'DEBIT' : 'CREDIT'),
+      amount: this.roundCurrency(Number(raw.amount || 0)),
+      balanceBefore: this.roundCurrency(Number(raw.balance_before ?? raw.balanceBefore ?? 0)),
+      balanceAfter: this.roundCurrency(Number(raw.balance_after ?? raw.balanceAfter ?? 0)),
+      orderId: raw.order_id || raw.orderId || null,
+      returnRequestId: raw.return_request_id || raw.returnRequestId || null,
+      referenceId: raw.reference_id || raw.referenceId || null,
+      description: raw.description || '',
+      createdBy: raw.created_by || raw.createdBy || null,
+      createdAt: raw.created_at ? new Date(raw.created_at) : new Date()
+    }
+  }
+
+  public mapReturnRequest(raw: any): ReturnRequest {
+    return {
+      id: raw.id,
+      returnNumber: raw.return_number || raw.returnNumber,
+      orderId: raw.order_id || raw.orderId,
+      orderNumber: raw.orders?.order_number || raw.order_number || null,
+      orderTrackingNumber:
+        raw.orders?.tracking_number ||
+        (raw.orders ? this.extractTrackingFromNotes(raw.orders.notes, raw.orders.order_number) : null),
+      userId: raw.user_id || raw.userId,
+      userEmail: raw.users?.email || raw.user_email || null,
+      userName: raw.users
+        ? `${raw.users.first_name || ''} ${raw.users.last_name || ''}`.trim() || raw.users.email
+        : raw.user_name || null,
+      reasonType: raw.reason_type || raw.reasonType,
+      reasonDetails: raw.reason_details || raw.reasonDetails || null,
+      items: Array.isArray(raw.items) ? raw.items : [],
+      exchangeProductId: raw.exchange_product_id || raw.exchangeProductId || null,
+      exchangeProduct: raw.exchange_product ? this.mapProduct(raw.exchange_product) : null,
+      exchangeOrderId: raw.exchange_order_id || raw.exchangeOrderId || null,
+      refundAmount: this.roundCurrency(Number(raw.refund_amount ?? raw.refundAmount ?? 0)),
+      exchangePriceDelta: this.roundCurrency(Number(raw.exchange_price_delta ?? raw.exchangePriceDelta ?? 0)),
+      status: raw.status || 'PENDING_REVIEW',
+      walletCredited: Boolean(raw.wallet_credited ?? raw.walletCredited ?? false),
+      walletTransactionId: raw.wallet_transaction_id || raw.walletTransactionId || null,
+      returnTrackingNumber: raw.return_tracking_number || raw.returnTrackingNumber || null,
+      eligibleUntil: raw.eligible_until ? new Date(raw.eligible_until) : new Date(),
+      processedBy: raw.processed_by || raw.processedBy || null,
+      adminNotes: raw.admin_notes || raw.adminNotes || null,
+      processedAt: raw.processed_at ? new Date(raw.processed_at) : null,
+      createdAt: raw.created_at ? new Date(raw.created_at) : new Date(),
+      updatedAt: raw.updated_at ? new Date(raw.updated_at) : new Date()
+    }
+  }
+
+  async getOrCreateWallet(userId: string): Promise<Wallet> {
+    if (!userId) throw new Error('User ID is required to access wallet.')
+
+    const { data: existing, error: fetchError } = await this.supabase
+      .from('wallets')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle()
+
+    if (fetchError) {
+      throw new Error(fetchError.message || 'Wallet tables are not yet initialized in the database.')
+    }
+    if (existing) {
+      return this.mapWallet(existing)
+    }
+
+    const walletId = crypto.randomUUID()
+    const { data: inserted, error: insertError } = await this.supabase
+      .from('wallets')
+      .upsert(
+        {
+          id: walletId,
+          user_id: userId,
+          balance: 0,
+          currency: 'USD'
+        },
+        { onConflict: 'user_id', ignoreDuplicates: true }
+      )
+      .select()
+      .maybeSingle()
+
+    if (inserted) {
+      return this.mapWallet(inserted)
+    }
+
+    const { data: refetch, error: refetchErr } = await this.supabase
+      .from('wallets')
+      .select('*')
+      .eq('user_id', userId)
+      .single()
+
+    if (refetchErr || !refetch) {
+      throw insertError || refetchErr || new Error('Unable to initialize user wallet.')
+    }
+    return this.mapWallet(refetch)
+  }
+
+  async getWalletSummary(
+    userId: string,
+    limit: number = 50
+  ): Promise<{ wallet: Wallet; transactions: WalletTransaction[] }> {
+    const wallet = await this.getOrCreateWallet(userId)
+    const { data: txRows, error } = await this.supabase
+      .from('wallet_transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit)
+
+    if (error) {
+      throw new Error(error.message || 'Unable to load wallet transaction history.')
+    }
+
+    return {
+      wallet,
+      transactions: (txRows || []).map((row) => this.mapWalletTransaction(row))
+    }
+  }
+
+  async listAllWallets(limit: number = 100): Promise<Array<Wallet & { user?: Partial<User>; recentTransactions?: WalletTransaction[] }>> {
+    const { data: rows, error } = await this.supabase
+      .from('wallets')
+      .select('*, users(id, email, first_name, last_name, phone, role)')
+      .order('updated_at', { ascending: false })
+      .limit(limit)
+
+    if (error) {
+      throw new Error(error.message || 'Unable to fetch customer wallets.')
+    }
+
+    const wallets = rows || []
+    const userIds = wallets.map((w: any) => w.user_id).filter(Boolean)
+    const txByUser = new Map<string, WalletTransaction[]>()
+
+    if (userIds.length > 0) {
+      const { data: txRows } = await this.supabase
+        .from('wallet_transactions')
+        .select('*')
+        .in('user_id', userIds)
+        .order('created_at', { ascending: false })
+        .limit(300)
+
+      for (const tx of txRows || []) {
+        const mapped = this.mapWalletTransaction(tx)
+        const list = txByUser.get(mapped.userId) || []
+        if (list.length < 10) {
+          list.push(mapped)
+          txByUser.set(mapped.userId, list)
+        }
+      }
+    }
+
+    return wallets.map((row: any) => ({
+      ...this.mapWallet(row),
+      user: row.users
+        ? {
+            id: row.users.id,
+            email: row.users.email,
+            firstName: row.users.first_name || null,
+            lastName: row.users.last_name || null,
+            phone: row.users.phone || null,
+            role: row.users.role || 'CUSTOMER'
+          }
+        : undefined,
+      recentTransactions: txByUser.get(row.user_id) || []
+    }))
+  }
+
+  async applyWalletTransaction(params: {
+    userId: string
+    type: WalletTransactionType
+    direction: WalletTransactionDirection
+    amount: number
+    description: string
+    orderId?: string | null
+    returnRequestId?: string | null
+    referenceId?: string | null
+    createdBy?: string | null
+  }): Promise<{
+    walletId: string
+    currency: string
+    balance: number
+    balanceBefore: number
+    balanceAfter: number
+    transactionId: string
+    idempotent: boolean
+  }> {
+    const cleanAmount = this.roundCurrency(params.amount)
+    if (!Number.isFinite(cleanAmount) || cleanAmount <= 0) {
+      throw new Error('Wallet transaction amount must be greater than zero.')
+    }
+
+    const { data, error } = await this.supabase.rpc('apply_wallet_transaction', {
+      p_user_id: params.userId,
+      p_type: params.type,
+      p_direction: params.direction,
+      p_amount: cleanAmount,
+      p_description: params.description,
+      p_order_id: params.orderId || null,
+      p_return_request_id: params.returnRequestId || null,
+      p_reference_id: params.referenceId || null,
+      p_created_by: params.createdBy || null
+    })
+
+    if (!error && data) {
+      return {
+        walletId: data.walletId,
+        currency: data.currency || 'USD',
+        balance: this.roundCurrency(Number(data.balance)),
+        balanceBefore: this.roundCurrency(Number(data.balanceBefore)),
+        balanceAfter: this.roundCurrency(Number(data.balanceAfter)),
+        transactionId: data.transactionId,
+        idempotent: Boolean(data.idempotent)
+      }
+    }
+
+    if (error?.message?.includes('INSUFFICIENT_WALLET_BALANCE')) {
+      throw new Error('Insufficient wallet balance for this transaction.')
+    }
+
+    if (this.pool) {
+      const client = await this.pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query(
+          `INSERT INTO public.wallets (user_id, balance, currency)
+           VALUES ($1, 0, 'USD')
+           ON CONFLICT (user_id) DO NOTHING`,
+          [params.userId]
+        )
+
+        const walletRes = await client.query(
+          `SELECT id, balance, currency
+             FROM public.wallets
+            WHERE user_id = $1
+            FOR UPDATE`,
+          [params.userId]
+        )
+        const walletRow = walletRes.rows[0]
+        if (!walletRow) {
+          throw new Error('Wallet could not be initialized.')
+        }
+
+        const cleanRef = params.referenceId?.trim() || null
+        if (cleanRef) {
+          const dupRes = await client.query(
+            `SELECT id, balance_before, balance_after
+               FROM public.wallet_transactions
+              WHERE reference_id = $1
+              LIMIT 1`,
+            [cleanRef]
+          )
+          if (dupRes.rows[0]) {
+            await client.query('COMMIT')
+            return {
+              walletId: walletRow.id,
+              currency: walletRow.currency || 'USD',
+              balance: this.roundCurrency(Number(walletRow.balance)),
+              balanceBefore: this.roundCurrency(Number(dupRes.rows[0].balance_before)),
+              balanceAfter: this.roundCurrency(Number(dupRes.rows[0].balance_after)),
+              transactionId: dupRes.rows[0].id,
+              idempotent: true
+            }
+          }
+        }
+
+        const balanceBefore = this.roundCurrency(Number(walletRow.balance))
+        let balanceAfter: number
+        if (params.direction === 'CREDIT') {
+          balanceAfter = this.roundCurrency(balanceBefore + cleanAmount)
+        } else {
+          if (balanceBefore < cleanAmount) {
+            throw new Error('Insufficient wallet balance for this transaction.')
+          }
+          balanceAfter = this.roundCurrency(balanceBefore - cleanAmount)
+        }
+
+        await client.query(
+          `UPDATE public.wallets SET balance = $1, updated_at = NOW() WHERE id = $2`,
+          [balanceAfter, walletRow.id]
+        )
+
+        const txId = crypto.randomUUID()
+        await client.query(
+          `INSERT INTO public.wallet_transactions (
+             id, wallet_id, user_id, type, direction, amount, balance_before, balance_after,
+             order_id, return_request_id, reference_id, description, created_by, created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
+          [
+            txId,
+            walletRow.id,
+            params.userId,
+            params.type,
+            params.direction,
+            cleanAmount,
+            balanceBefore,
+            balanceAfter,
+            params.orderId || null,
+            params.returnRequestId || null,
+            cleanRef,
+            params.description || params.type,
+            params.createdBy || null
+          ]
+        )
+
+        await client.query('COMMIT')
+        return {
+          walletId: walletRow.id,
+          currency: walletRow.currency || 'USD',
+          balance: balanceAfter,
+          balanceBefore,
+          balanceAfter,
+          transactionId: txId,
+          idempotent: false
+        }
+      } catch (poolErr) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw poolErr
+      } finally {
+        client.release()
+      }
+    }
+
+    throw new Error(error?.message || 'Unable to execute wallet transaction. Apply Update_for_database_config.sql first.')
+  }
+
+  async creditWalletAtomic(params: {
+    userId: string
+    type: 'REFUND_DEPOSIT' | 'EXCHANGE_CREDIT' | 'ADMIN_ADJUSTMENT'
+    amount: number
+    description: string
+    orderId?: string | null
+    returnRequestId?: string | null
+    referenceId?: string | null
+    createdBy?: string | null
+  }) {
+    return this.applyWalletTransaction({
+      ...params,
+      direction: 'CREDIT'
+    })
+  }
+
+  async debitWalletAtomic(params: {
+    userId: string
+    type: 'CHECKOUT_PAYMENT' | 'ADMIN_ADJUSTMENT'
+    amount: number
+    description: string
+    orderId?: string | null
+    returnRequestId?: string | null
+    referenceId?: string | null
+    createdBy?: string | null
+  }) {
+    return this.applyWalletTransaction({
+      ...params,
+      direction: 'DEBIT'
+    })
+  }
+
+  async linkWalletTransactionOrderId(transactionId: string, orderId: string): Promise<void> {
+    if (!transactionId || !orderId) return
+    await this.supabase
+      .from('wallet_transactions')
+      .update({ order_id: orderId })
+      .eq('id', transactionId)
+  }
+
+  async findReturnRequestById(id: string): Promise<ReturnRequest | null> {
+    if (!id) return null
+    const { data, error } = await this.supabase
+      .from('return_requests')
+      .select(RETURN_REQUEST_SELECT)
+      .eq('id', id)
+      .maybeSingle()
+
+    if (error) {
+      throw new Error(error.message || 'Unable to fetch return request.')
+    }
+    return data ? this.mapReturnRequest(data) : null
+  }
+
+  async findActiveReturnRequestByOrderId(orderId: string): Promise<ReturnRequest | null> {
+    if (!orderId) return null
+    const { data, error } = await this.supabase
+      .from('return_requests')
+      .select(RETURN_REQUEST_SELECT)
+      .eq('order_id', orderId)
+      .in('status', ['PENDING_REVIEW', 'WALLET_CREDITED', 'EXCHANGE_APPROVED', 'COMPLETED'])
+      .maybeSingle()
+
+    if (error) {
+      throw new Error(error.message || 'Unable to check existing return requests.')
+    }
+    return data ? this.mapReturnRequest(data) : null
+  }
+
+  async listReturnRequests(options?: {
+    userId?: string
+    status?: string
+    limit?: number
+  }): Promise<ReturnRequest[]> {
+    let query = this.supabase
+      .from('return_requests')
+      .select(RETURN_REQUEST_SELECT)
+      .order('created_at', { ascending: false })
+
+    if (options?.userId) query = query.eq('user_id', options.userId)
+    if (options?.status) query = query.eq('status', options.status)
+    query = query.limit(options?.limit || 100)
+
+    const { data, error } = await query
+    if (error) {
+      throw new Error(error.message || 'Unable to load return requests.')
+    }
+    return (data || []).map((row) => this.mapReturnRequest(row))
+  }
+
+  async getEligibleExchangeProducts(
+    baseCatalogValue: number,
+    excludeProductIds: string[] = []
+  ): Promise<Array<Product & { priceDifference: number; exactMatch: boolean }>> {
+    const excludeSet = new Set(excludeProductIds.filter(Boolean))
+    const allProducts = await this.findProducts({ includeInactive: false, limit: 200 })
+
+    return allProducts
+      .filter((prod) => {
+        if (!prod.isActive || prod.isComingSoon || Number(prod.stock || 0) < 1) return false
+        if (excludeSet.has(prod.id)) return false
+        return this.isWithinExchangeValueTolerance(baseCatalogValue, Number(prod.price || 0))
+      })
+      .map((prod) => {
+        const diff = this.roundCurrency(Number(prod.price || 0) - baseCatalogValue)
+        return {
+          ...prod,
+          priceDifference: diff,
+          exactMatch: Math.abs(diff) < 0.01
+        }
+      })
+      .sort((a, b) => Math.abs(a.priceDifference) - Math.abs(b.priceDifference))
+  }
+
+  async createReturnRequest(input: {
+    orderId: string
+    userId: string
+    reasonType: ReturnReasonType
+    reasonDetails?: string
+    exchangeProductId?: string | null
+    returnTrackingNumber?: string | null
+  }): Promise<ReturnRequest> {
+    const order = await this.findOrderById(input.orderId)
+    if (!order || order.userId !== input.userId) {
+      throw new Error('Order not found for your account.')
+    }
+
+    const eligibility = this.computeOrderReturnEligibility(order)
+    if (!eligibility.eligible) {
+      throw new Error(eligibility.reason || 'This order is not eligible for return.')
+    }
+
+    const existingActive = await this.findActiveReturnRequestByOrderId(order.id)
+    if (existingActive) {
+      throw new Error(
+        `A return/exchange request (${existingActive.returnNumber}) already exists for order #${order.orderNumber}.`
+      )
+    }
+
+    const itemsSnapshot: ReturnRequestItem[] = (order.items || []).map((item) => ({
+      productId: item.productId,
+      name: item.product?.name || 'DriveFlyElectric Unit',
+      sku: item.product?.sku || null,
+      quantity: Number(item.quantity || 1),
+      unitPrice: this.roundCurrency(Number(item.price || 0)),
+      totalPrice: this.roundCurrency(Number(item.total || Number(item.price || 0) * Number(item.quantity || 1)))
+    }))
+
+    const refundAmount = this.roundCurrency(Number(order.total || 0))
+    const baseCatalogValue = this.roundCurrency(Number(order.subtotal || order.total || 0))
+    let exchangeProductId: string | null = null
+    let exchangePriceDelta = 0
+
+    if (input.reasonType === 'EXCHANGE_EQUAL_VALUE') {
+      if (!input.exchangeProductId) {
+        throw new Error('Please select a replacement item from our catalog for your exchange.')
+      }
+      const orderProductIds = new Set(itemsSnapshot.map((it) => it.productId))
+      if (orderProductIds.has(input.exchangeProductId)) {
+        throw new Error('Please select a different item from our catalog for your exchange.')
+      }
+      const exchangeProduct = await this.findProductById(input.exchangeProductId)
+      if (!exchangeProduct || !exchangeProduct.isActive || exchangeProduct.isComingSoon) {
+        throw new Error('Selected replacement item is not currently available.')
+      }
+      if (Number(exchangeProduct.stock || 0) < 1) {
+        throw new Error(`${exchangeProduct.name} is currently out of stock.`)
+      }
+      if (!this.isWithinExchangeValueTolerance(baseCatalogValue, Number(exchangeProduct.price))) {
+        throw new Error(
+          `${exchangeProduct.name} ($${Number(exchangeProduct.price).toFixed(2)}) is outside the equal/close-value exchange window for your item ($${baseCatalogValue.toFixed(2)}).`
+        )
+      }
+
+      exchangePriceDelta = this.roundCurrency(Number(exchangeProduct.price) - baseCatalogValue)
+      if (exchangePriceDelta > 0) {
+        const wallet = await this.getOrCreateWallet(input.userId)
+        if (wallet.balance < exchangePriceDelta) {
+          throw new Error(
+            `${exchangeProduct.name} costs $${exchangePriceDelta.toFixed(2)} more than your original item. Your wallet balance ($${wallet.balance.toFixed(2)}) must cover the difference, or choose an equal/lower-priced item.`
+          )
+        }
+      }
+      exchangeProductId = exchangeProduct.id
+    }
+
+    const id = crypto.randomUUID()
+    const returnNumber = `RET-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`
+    const returnTrackingNumber =
+      input.returnTrackingNumber?.trim() || `RTN-${order.orderNumber || order.id.slice(0, 8)}`
+    const nowIso = new Date().toISOString()
+
+    const { error } = await this.supabase.from('return_requests').insert({
+      id,
+      return_number: returnNumber,
+      order_id: order.id,
+      user_id: input.userId,
+      reason_type: input.reasonType,
+      reason_details: input.reasonDetails?.trim() || null,
+      items: itemsSnapshot,
+      exchange_product_id: exchangeProductId,
+      refund_amount: refundAmount,
+      exchange_price_delta: exchangePriceDelta,
+      status: 'PENDING_REVIEW',
+      wallet_credited: false,
+      return_tracking_number: returnTrackingNumber,
+      eligible_until: eligibility.eligibleUntil.toISOString(),
+      created_at: nowIso,
+      updated_at: nowIso
+    })
+
+    if (error) {
+      throw new Error(error.message || 'Unable to submit return request.')
+    }
+
+    const created = await this.findReturnRequestById(id)
+    if (!created) throw new Error('Return request created but could not be reloaded.')
+    return created
+  }
+
+  async updateReturnRequest(
+    id: string,
+    updates: {
+      status?: ReturnRequestStatus
+      walletCredited?: boolean
+      walletTransactionId?: string | null
+      exchangeOrderId?: string | null
+      returnTrackingNumber?: string | null
+      processedBy?: string | null
+      adminNotes?: string | null
+      processedAt?: string | null
+    }
+  ): Promise<ReturnRequest> {
+    const payload: Record<string, any> = {
+      updated_at: new Date().toISOString()
+    }
+    if (updates.status !== undefined) payload.status = updates.status
+    if (updates.walletCredited !== undefined) payload.wallet_credited = updates.walletCredited
+    if (updates.walletTransactionId !== undefined) payload.wallet_transaction_id = updates.walletTransactionId
+    if (updates.exchangeOrderId !== undefined) payload.exchange_order_id = updates.exchangeOrderId
+    if (updates.returnTrackingNumber !== undefined) payload.return_tracking_number = updates.returnTrackingNumber
+    if (updates.processedBy !== undefined) payload.processed_by = updates.processedBy
+    if (updates.adminNotes !== undefined) payload.admin_notes = updates.adminNotes
+    if (updates.processedAt !== undefined) payload.processed_at = updates.processedAt
+
+    const { error } = await this.supabase
+      .from('return_requests')
+      .update(payload)
+      .eq('id', id)
+
+    if (error) {
+      throw new Error(error.message || 'Failed to update return request.')
+    }
+
+    const updated = await this.findReturnRequestById(id)
+    if (!updated) throw new Error('Return request not found after update.')
+    return updated
   }
 
   // ==================== CONTROLLER COMPATIBILITY LAYER ====================

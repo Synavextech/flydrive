@@ -709,6 +709,35 @@ WhatsApp Support: ${supportPhone} (https://wa.me/${whatsAppDigits})
               </div>
             </div>
 
+            {/* Tag Real Catalog Product Directly in Support LiveChat */}
+            <button
+              type="button"
+              onClick={() => {
+                window.dispatchEvent(
+                  new CustomEvent('dfe:open-livechat', {
+                    detail: {
+                      topic: 'Item Purchase',
+                      source: 'product_detail',
+                      items: [
+                        {
+                          id: currentProduct.id,
+                          name: currentProduct.name,
+                          sku: currentProduct.sku,
+                          price: currentProduct.price,
+                          category: currentProduct.category,
+                          image: currentProduct.images?.[0] || ''
+                        }
+                      ]
+                    }
+                  })
+                )
+              }}
+              className="w-full py-3 px-4 rounded-xl border border-creamy-500/40 bg-creamy-50/60 dark:bg-creamy-500/10 hover:bg-creamy-500/20 text-gray-900 dark:text-white font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-colors"
+            >
+              <MessageSquare className="w-4 h-4 text-creamy-600 dark:text-creamy-400" />
+              <span>Ask Support / Tag Item in LiveChat</span>
+            </button>
+
             {/* Download Product Information Card matching reference screenshot */}
             <div
               onClick={handleDownloadSpecs}

@@ -9,6 +9,7 @@ export interface ServerOrderReceiptData {
   userName: string
   address: string
   paymentSource: string
+  walletApplied?: string
   initialCharge: string
   finalCost: string
   totalRefund: string
@@ -82,10 +83,17 @@ export const buildReceiptDataFromOrder = (
       ? 'Credit / Debit Card (Stripe)'
       : ord.paymentMethod === 'PAYPAL'
         ? 'PayPal Express'
-        : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
+        : ord.paymentMethod === 'WALLET'
+          ? 'DriveFlyElectric Wallet Balance'
+          : ord.paymentMethod === 'WALLET_STRIPE'
+            ? 'DriveFlyElectric Wallet + Stripe Card'
+            : ord.paymentMethod === 'WALLET_PAYPAL'
+              ? 'DriveFlyElectric Wallet + PayPal Express'
+              : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
 
   const initialChargeVal = Number(ord.subtotal || ord.total || 0)
   const finalCostVal = Number(ord.total || 0)
+  const walletUsedVal = Number(ord.walletAmountUsed || 0)
   const isRefunded = ord.status === 'REFUNDED' || ord.paymentStatus === 'REFUNDED'
 
   const orderNumberStr = ord.orderNumber || ord.id
@@ -103,6 +111,7 @@ export const buildReceiptDataFromOrder = (
     userName: customerName,
     address: formattedAddress,
     paymentSource,
+    ...(walletUsedVal > 0 ? { walletApplied: formatUsd(walletUsedVal) } : {}),
     initialCharge: formatUsd(initialChargeVal),
     finalCost: formatUsd(finalCostVal),
     totalRefund: isRefunded ? formatUsd(finalCostVal) : '$0.00',
@@ -139,6 +148,7 @@ export const generateReceiptText = (r: ServerOrderReceiptData): string => {
     `User Name      : ${r.userName}`,
     `Address        : ${r.address}`,
     `Payment source : ${r.paymentSource}`,
+    ...(r.walletApplied ? [`Wallet Applied : ${r.walletApplied}`] : []),
     `Initial Charge : ${r.initialCharge}`,
     `Final Cost     : ${r.finalCost}`,
     `Total Refund   : ${r.totalRefund || '$0.00'}`,

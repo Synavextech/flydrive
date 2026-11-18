@@ -78,7 +78,12 @@ const OrderSuccessPage = () => {
   )
   const [copiedTracking, setCopiedTracking] = useState(false)
   const [paymentMethod, setPaymentMethod] = useState<string>(
-    state.paymentMethod || (initialReceipt?.paymentSource?.includes('PayPal') ? 'PAYPAL' : 'STRIPE')
+    state.paymentMethod ||
+      (initialReceipt?.paymentSource?.includes('Wallet') && !initialReceipt?.paymentSource?.includes('PayPal') && !initialReceipt?.paymentSource?.includes('Stripe')
+        ? 'WALLET'
+        : initialReceipt?.paymentSource?.includes('PayPal')
+          ? 'PAYPAL'
+          : 'STRIPE')
   )
   const [total, setTotal] = useState<number | null>(
     state.total || (initialReceipt?.finalCost ? parseFloat(initialReceipt.finalCost.replace(/[^0-9.]/g, '')) : null)

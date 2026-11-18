@@ -2,6 +2,7 @@ import express from 'express'
 import {
   createOrder,
   getOrders,
+  getActiveShippingOrders,
   getOrder,
   updateOrderStatus,
   cancelOrder,
@@ -45,6 +46,7 @@ router.get('/:id/receipt.pdf', receiptRateLimit, optionalAuth, downloadOrderRece
 // Protected customer and admin routes
 router.use(protect)
 router.get('/', getOrders)
+router.get('/active-shipping', getActiveShippingOrders)
 router.get('/stats', authorize('ADMIN'), getOrderStats)
 router.get('/:id', getOrder)
 router.put('/:id/cancel', cancelOrder)

@@ -9,6 +9,7 @@ export interface OrderReceiptData {
   userName: string
   address: string
   paymentSource: string
+  walletApplied?: string
   initialCharge: string
   finalCost: string
   totalRefund: string
@@ -76,6 +77,7 @@ export const generateReceiptText = (r: OrderReceiptData): string => {
     `User Name      : ${r.userName}`,
     `Address        : ${r.address}`,
     `Payment source : ${r.paymentSource}`,
+    ...(r.walletApplied ? [`Wallet Applied : ${r.walletApplied}`] : []),
     `Initial Charge : ${r.initialCharge}`,
     `Final Cost     : ${r.finalCost}`,
     `Total Refund   : ${r.totalRefund || '$0.00'}`,

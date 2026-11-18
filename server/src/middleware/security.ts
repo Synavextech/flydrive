@@ -18,6 +18,12 @@ export function validateStartupEnvironment(): void {
   }
 }
 
+export function isSecureCookieRequest(req: Request): boolean {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase()
+  const originHeader = String(req.headers.origin || '').toLowerCase()
+  return Boolean(req.secure || forwardedProto.includes('https') || originHeader.startsWith('https://'))
+}
+
 export function getAllowedOrigins(): string[] {
   const envAllowed = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
