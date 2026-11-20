@@ -490,6 +490,12 @@ $schema_setup$;
 -- ----------------------------------------------------------------------------
 -- 3. Automatic updated_at Triggers on Core New Tables
 -- ----------------------------------------------------------------------------
+DROP TRIGGER IF EXISTS trg_support_sessions_updated_at ON public.support_sessions;
+CREATE TRIGGER trg_support_sessions_updated_at
+  BEFORE UPDATE ON public.support_sessions
+  FOR EACH ROW
+  EXECUTE FUNCTION public.set_row_updated_at();
+
 DROP TRIGGER IF EXISTS trg_wallets_updated_at ON public.wallets;
 CREATE TRIGGER trg_wallets_updated_at
   BEFORE UPDATE ON public.wallets

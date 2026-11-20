@@ -646,11 +646,11 @@ export const AccountPage: React.FC = () => {
                         onClick={() =>
                           window.dispatchEvent(
                             new CustomEvent('dfe:open-livechat', {
-                              detail: { topic: sess.topic }
+                              detail: { sessionId: sess.id, topic: sess.topic }
                             })
                           )
                         }
-                        className="px-3 py-1.5 rounded-lg bg-creamy-500 text-black font-black text-[11px] uppercase"
+                        className="px-3 py-1.5 rounded-lg bg-creamy-500 text-black font-black text-[11px] uppercase hover:bg-creamy-400 transition-colors"
                       >
                         Resume in LiveChat
                       </button>

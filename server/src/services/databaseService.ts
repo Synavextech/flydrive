@@ -1436,6 +1436,74 @@ export class DatabaseService {
 
   async listSupportSessionsByUserId(userId: string): Promise<any[]> {
     if (!userId) return []
+    try {
+      const { data: rows, error } = await this.supabase
+        .from('support_sessions')
+        .select('*')
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(50)
+
+      if (!error && Array.isArray(rows) && rows.length > 0) {
+        const sessionIds = rows.map((r: any) => r.id)
+        const { data: allMsgs } = await this.supabase
+          .from('support_messages')
+          .select('*')
+          .in('session_id', sessionIds)
+          .order('created_at', { ascending: true })
+
+        const msgsBySession = new Map<string, any[]>()
+        for (const m of allMsgs || []) {
+          const list = msgsBySession.get(m.session_id) || []
+          list.push({
+            id: m.id,
+            sessionId: m.session_id,
+            senderUserId: m.sender_user_id || undefined,
+            senderRole: m.sender_role,
+            senderName: m.sender_name,
+            content: m.content,
+            metadata: m.metadata || {},
+            createdAt: m.created_at
+          })
+          msgsBySession.set(m.session_id, list)
+        }
+
+        const sessionMap = new Map<string, any>()
+        for (const row of rows) {
+          const built = {
+            id: row.id,
+            visitorId: row.visitor_id,
+            userId: row.user_id || undefined,
+            visitorName: row.visitor_name || 'Store Visitor',
+            visitorEmail: row.visitor_email || '',
+            visitorPhone: row.visitor_phone || '',
+            topic: row.topic || 'General Inquiry',
+            selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+            activeOrderId: row.active_order_id || null,
+            status: row.status || 'OPEN',
+            isOnline: Boolean(row.is_online),
+            lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
+            unreadAdminCount: Number(row.unread_admin_count || 0),
+            unreadClientCount: Number(row.unread_client_count || 0),
+            createdAt: row.created_at || new Date().toISOString(),
+            updatedAt: row.updated_at || new Date().toISOString(),
+            messages: msgsBySession.get(row.id) || []
+          }
+          sessionMap.set(row.id, built)
+          this.supportMemoryCache.set(row.id, built)
+        }
+
+        return Array.from(sessionMap.values())
+          .map((s) => this.enrichSupportSession(s))
+          .sort(
+            (a, b) =>
+              new Date(b.updatedAt || b.lastSeenAt).getTime() - new Date(a.updatedAt || a.lastSeenAt).getTime()
+          )
+      }
+    } catch {
+      // Fallback below
+    }
+
     const all = await this.listSupportSessions()
     return all.filter((s) => s.userId === userId)
   }
@@ -1838,17 +1906,26 @@ export class DatabaseService {
       throw new Error('Authentication is required to access or create a persistent support thread.')
     }
 
-    const requestedSessionId = payload.sessionId || `chat_user_${authUser.id}`
-    let existing = await this.getSupportSession(requestedSessionId)
-    if (existing && existing.userId && existing.userId !== authUser.id && authUser.role !== 'ADMIN') {
-      existing = null
-    }
+    const hasExplicitSessionId = Boolean(payload.sessionId && payload.sessionId.trim().length > 0)
+    let existing: any = null
+    let canonicalSessionId: string
 
-    const accountSession = await this.findSupportSessionByUserId(authUser.id, authUser.email)
-    let canonicalSessionId = existing?.id || `chat_user_${authUser.id}`
-    if (accountSession) {
-      existing = accountSession
-      canonicalSessionId = accountSession.id
+    if (hasExplicitSessionId) {
+      canonicalSessionId = payload.sessionId!.trim()
+      existing = await this.getSupportSession(canonicalSessionId)
+      if (existing && existing.userId && existing.userId !== authUser.id && authUser.role !== 'ADMIN') {
+        throw new Error('Not authorized to access this support session.')
+      }
+    } else if (payload.resumeOnly) {
+      existing = await this.findSupportSessionByUserId(authUser.id, authUser.email)
+      if (!existing) {
+        return null
+      }
+      canonicalSessionId = existing.id
+    } else {
+      // Starting a new discrete inquiry thread
+      canonicalSessionId = `chat_${crypto.randomUUID()}`
+      existing = null
     }
 
     if (payload.resumeOnly && !existing) {
