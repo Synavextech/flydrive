@@ -89,7 +89,17 @@ export const buildReceiptDataFromOrder = (
             ? 'DriveFlyElectric Wallet + Stripe Card'
             : ord.paymentMethod === 'WALLET_PAYPAL'
               ? 'DriveFlyElectric Wallet + PayPal Express'
-              : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
+              : ord.paymentMethod === 'BANK_DEPOSIT'
+                ? 'Direct Bank Deposit (Manual Verification)'
+                : ord.paymentMethod === 'CRYPTO'
+                  ? 'Crypto Wallet Transfer (Manual Verification)'
+                  : ord.paymentMethod === 'INVOICE'
+                    ? 'Pay with Invoice (Manual Verification)'
+                    : ord.paymentMethod === 'CHEQUE'
+                      ? 'Write Cheque (Manual Verification)'
+                      : ord.paymentMethod === 'CUSTOM'
+                        ? 'Custom Payment Option (Manual Verification)'
+                        : ord.paymentMethod || 'Credit / Debit Card (Stripe)'
 
   const initialChargeVal = Number(ord.subtotal || ord.total || 0)
   const finalCostVal = Number(ord.total || 0)

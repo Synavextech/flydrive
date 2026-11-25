@@ -9,11 +9,30 @@ import {
   useStripe,
   useElements
 } from '@stripe/react-stripe-js'
-import { CreditCard, Truck, Lock, CheckCircle, AlertCircle, Globe, Search, Ban, ShieldAlert, Wallet, MessageCircle } from 'lucide-react'
+import {
+  CreditCard,
+  Truck,
+  Lock,
+  CheckCircle,
+  AlertCircle,
+  Globe,
+  Search,
+  Ban,
+  ShieldAlert,
+  Wallet,
+  MessageCircle,
+  Building2,
+  Coins,
+  FileText,
+  PenLine,
+  Copy,
+  Check,
+  Clock
+} from 'lucide-react'
 import { useCart } from '../contexts/CartContext'
 import { useAuth } from '../contexts/AuthContext'
 import { orderApi, paymentApi, addressApi, cartApi, walletApi } from '../services/api'
-import { PaymentOptionsConfig } from '../types'
+import { PaymentOptionsConfig, ManualPaymentConfig } from '../types'
 import { COUNTRIES, POPULAR_COUNTRY_CODES, resolveClientCountryIso2 } from '../data/countries'
 
 // Safe URL encoder for filenames with spaces or special characters
@@ -83,8 +102,23 @@ const CheckoutForm: React.FC = () => {
   const [createAccount, setCreateAccount] = useState(false)
   const [accountPassword, setAccountPassword] = useState('')
 
-  // Supported payment modes: DriveFlyElectric Wallet, PayPal Primary (Standard SDK: PayPal + Card) or Stripe Secondary Card
-  const [paymentMethod, setPaymentMethod] = useState<'PAYPAL' | 'STRIPE' | 'WALLET'>('PAYPAL')
+  // Supported payment modes: Automatic (Wallet, PayPal, Stripe) + Manual Admin-Verified (Bank Deposit, Crypto, Invoice, Cheque, Custom)
+  type CheckoutPaymentMethod =
+    | 'PAYPAL'
+    | 'STRIPE'
+    | 'WALLET'
+    | 'BANK_DEPOSIT'
+    | 'CRYPTO'
+    | 'INVOICE'
+    | 'CHEQUE'
+    | 'CUSTOM'
+  const MANUAL_PAYMENT_METHODS: CheckoutPaymentMethod[] = ['BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM']
+
+  const [paymentMethod, setPaymentMethod] = useState<CheckoutPaymentMethod>('PAYPAL')
+  const [manualConfig, setManualConfig] = useState<ManualPaymentConfig | null>(null)
+  const [manualPaidConfirmed, setManualPaidConfirmed] = useState<boolean>(false)
+  const [manualPaymentReference, setManualPaymentReference] = useState<string>('')
+  const [copiedFieldKey, setCopiedFieldKey] = useState<string | null>(null)
   const [walletBalance, setWalletBalance] = useState<number>(0)
   const [walletLoading, setWalletLoading] = useState<boolean>(false)
   const [useWalletCredit, setUseWalletCredit] = useState<boolean>(false)
@@ -148,7 +182,7 @@ const CheckoutForm: React.FC = () => {
     grandTotal: 0,
     estimatedTax: 0,
     shippingCost: 0,
-    paymentMethod: 'PAYPAL' as 'PAYPAL' | 'STRIPE' | 'WALLET',
+    paymentMethod: 'PAYPAL' as CheckoutPaymentMethod,
     useWalletCredit: false,
     walletAppliedAmount: 0,
     remainingGatewayDue: 0
@@ -174,12 +208,15 @@ const CheckoutForm: React.FC = () => {
         ? Math.min(walletBalance, grandTotal)
         : 0
   const remainingGatewayDue = Math.max(0, Math.round((grandTotal - walletAppliedAmount) * 100) / 100)
+  const isManualMethodSelected = MANUAL_PAYMENT_METHODS.includes(paymentMethod)
   const isSelectedPaymentAvailable =
-    paymentMethod === 'WALLET'
-      ? canPayFullWithWallet
-      : paymentMethod === 'PAYPAL'
-        ? isPayPalAvailable
-        : isStripeAvailable
+    isManualMethodSelected
+      ? true
+      : paymentMethod === 'WALLET'
+        ? canPayFullWithWallet
+        : paymentMethod === 'PAYPAL'
+          ? isPayPalAvailable
+          : isStripeAvailable
 
   useEffect(() => {
     latestCheckoutRef.current = {
@@ -578,6 +615,9 @@ const CheckoutForm: React.FC = () => {
             applyPaymentAvailability(cfgRes.data.paymentAvailability)
             paypalEnabled = cfgRes.data.paymentAvailability.paypal.available
           }
+          if (cfgRes.data.manualPaymentConfig) {
+            setManualConfig(cfgRes.data.manualPaymentConfig)
+          }
           if (cfgRes.data.paypalClientId) {
             clientId = cfgRes.data.paypalClientId
           }
@@ -917,6 +957,12 @@ const CheckoutForm: React.FC = () => {
     }
     if (!validateShippingBeforeCheckout()) return
 
+    if (isManualMethodSelected && !manualPaidConfirmed) {
+      setErrorMessage('Please confirm by checking the "I have paid" checkbox before completing your purchase.')
+      setTimeout(() => errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50)
+      return
+    }
+
     if (
       paymentMethod === 'PAYPAL' &&
       paypalCardFieldsRef.current &&
@@ -947,6 +993,130 @@ const CheckoutForm: React.FC = () => {
     setIsProcessing(true)
 
     try {
+      if (isManualMethodSelected) {
+        setProcessingStep('Submitting your order for Admin payment verification...')
+        const shouldCreateAccount = !isAuthenticated && createAccount
+        const manualLabelMap: Record<string, string> = {
+          BANK_DEPOSIT: 'Direct Bank Deposit (Manual Verification)',
+          CRYPTO: 'Crypto Wallet Transfer (Manual Verification)',
+          INVOICE: 'Pay with Invoice (Manual Verification)',
+          CHEQUE: 'Write Cheque (Manual Verification)',
+          CUSTOM: 'Custom Payment Option (Manual Verification)'
+        }
+        const manualRef =
+          manualPaymentReference.trim() ||
+          `MANUAL-${paymentMethod}-${Date.now().toString(36).toUpperCase()}`
+
+        const orderRes = await orderApi.createOrder({
+          items: items.map(i => ({ productId: i.productId, quantity: i.quantity })),
+          paymentMethod: paymentMethod as any,
+          paymentReference: manualRef,
+          paymentStatus: 'PENDING',
+          useWallet: isAuthenticated && useWalletCredit,
+          shippingAddress: {
+            firstName: shippingData.firstName,
+            lastName: shippingData.lastName,
+            email: shippingData.email,
+            phone: shippingData.phone,
+            address1: shippingData.address1,
+            address2: shippingData.address2,
+            city: shippingData.city,
+            state: shippingData.state,
+            postalCode: shippingData.zipCode,
+            country: shippingData.country,
+            countryCode
+          },
+          createAccount: shouldCreateAccount,
+          password: shouldCreateAccount ? accountPassword : '',
+          notes: `Express Worldwide Dispatch to ${shippingData.city}${shippingData.state ? `, ${shippingData.state}` : ''}, ${shippingData.country} (${shippingData.zipCode}). Manual Payment (${paymentMethod}) awaiting Admin verification.`
+        })
+
+        if (!orderRes.success || !orderRes.data) {
+          throw new Error(orderRes.error || 'Failed to submit manual payment order.')
+        }
+
+        if (orderRes.token && orderRes.user) {
+          setAuthenticatedUser(orderRes.user, orderRes.token)
+        }
+
+        const orderId = orderRes.data.id || ''
+        const receiptToken = orderRes.data.receiptToken || undefined
+        const orderNumber = orderRes.data?.orderNumber || ''
+        const trackingNumber =
+          orderRes.data?.trackingNumber ||
+          (orderNumber ? `TRK-${orderNumber}` : '')
+        const formattedOrderDate = new Date().toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric'
+        })
+        const locationPart = [shippingData.city, shippingData.state, shippingData.zipCode].filter(Boolean).join(', ')
+        const fullAddressString = `${shippingData.address1}${shippingData.address2 ? `, ${shippingData.address2}` : ''}, ${locationPart}, ${shippingData.country}`
+
+        const receiptData = {
+          orderId,
+          receiptToken,
+          date: formattedOrderDate,
+          orderDate: formattedOrderDate,
+          orderNumber,
+          trackingNumber,
+          transactionId: orderRes.data.paymentId || manualRef,
+          userName: `${shippingData.firstName} ${shippingData.lastName}`.trim() || 'Valued Customer',
+          address: fullAddressString,
+          paymentSource: manualLabelMap[paymentMethod] || paymentMethod,
+          ...(walletAppliedAmount > 0 ? { walletApplied: `$${walletAppliedAmount.toFixed(2)}` } : {}),
+          initialCharge: `$${totalPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+          finalCost: `$${grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+          totalRefund: '$0.00',
+          refundTrans: 'N/A',
+          shippingCost: '$0.00 (Free Express Shipping)',
+          tax: `$${estimatedTax.toFixed(2)}`,
+          paymentStatus: 'PENDING',
+          items: items.map(i => ({
+            name: i.product.name,
+            quantity: i.quantity,
+            price: `$${i.product.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            total: `$${(i.quantity * i.product.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+          }))
+        }
+
+        localStorage.setItem('latest_order_receipt', JSON.stringify(receiptData))
+        try {
+          const prevTrackings = JSON.parse(localStorage.getItem('dfe_recent_trackings') || '[]')
+          const nextEntry = {
+            orderNumber,
+            trackingNumber,
+            date: formattedOrderDate,
+            total: grandTotal,
+            destination: `${locationPart}, ${shippingData.country}`,
+            status: 'PENDING',
+            items: receiptData.items
+          }
+          const deduped = [nextEntry, ...prevTrackings.filter((t: any) => t.trackingNumber !== trackingNumber && t.orderNumber !== orderNumber)].slice(0, 8)
+          localStorage.setItem('dfe_recent_trackings', JSON.stringify(deduped))
+        } catch {
+          // Ignore storage error
+        }
+        clearCart()
+
+        navigate('/order-success', {
+          state: {
+            orderId,
+            receiptToken,
+            orderNumber,
+            trackingNumber,
+            total: grandTotal,
+            paymentMethod,
+            paymentStatus: 'PENDING',
+            paymentReference: manualRef,
+            manualConfig,
+            shippingAddress: fullAddressString,
+            receiptData
+          }
+        })
+        return
+      }
+
       if (paymentMethod === 'WALLET') {
         if (!isAuthenticated || walletBalance < grandTotal) {
           throw new Error('Your Wallet balance is insufficient to cover the full order total.')
@@ -1111,11 +1281,11 @@ const CheckoutForm: React.FC = () => {
     },
   }
 
-  const openCheckoutSupport = useCallback(() => {
+  const openCheckoutSupport = useCallback((customTopic?: string) => {
     window.dispatchEvent(
       new CustomEvent('dfe:open-livechat', {
         detail: {
-          topic: 'Payment Queries',
+          topic: typeof customTopic === 'string' && customTopic ? customTopic : 'Payment Queries',
           source: 'checkout',
           items: items.map((i) => ({
             id: i.product.id,
@@ -1129,6 +1299,17 @@ const CheckoutForm: React.FC = () => {
       })
     )
   }, [items])
+
+  const handleCopyField = useCallback(async (key: string, value: string) => {
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopiedFieldKey(key)
+      setTimeout(() => setCopiedFieldKey((prev) => (prev === key ? null : prev)), 2000)
+    } catch {
+      // Ignore clipboard error
+    }
+  }, [])
 
   if (items.length === 0) {
     return (
@@ -1458,7 +1639,7 @@ const CheckoutForm: React.FC = () => {
               </div>
               <button
                 type="button"
-                onClick={openCheckoutSupport}
+                onClick={() => openCheckoutSupport()}
                 className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[11px] shrink-0 transition-colors shadow-sm"
               >
                 <MessageCircle className="w-3.5 h-3.5" />
@@ -1904,6 +2085,427 @@ const CheckoutForm: React.FC = () => {
                     </div>
                   )}
                 </div>
+
+                {/* ========================================================= */}
+                {/* MANUAL PAYMENT OPTIONS (REQUIRES ADMIN VERIFICATION)      */}
+                {/* ========================================================= */}
+                <div className="pt-4 mt-2 border-t border-gray-200 dark:border-neutral-800 space-y-3">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div>
+                      <h3 className="text-xs font-black uppercase tracking-wider text-gray-900 dark:text-white flex items-center gap-1.5">
+                        <Clock className="w-4 h-4 text-amber-500" />
+                        Manual Payment Options
+                      </h3>
+                      <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                        Select a manual method below, complete your transfer or request, check &ldquo;I have paid&rdquo;, and await manual Admin verification.
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30">
+                      Admin Verification
+                    </span>
+                  </div>
+
+                  {/* Option 3: Direct Bank Deposit */}
+                  <div
+                    onClick={() => {
+                      setPaymentMethod('BANK_DEPOSIT')
+                      setManualPaidConfirmed(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }}
+                    className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                      paymentMethod === 'BANK_DEPOSIT'
+                        ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                        : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="paymentMethod"
+                          value="BANK_DEPOSIT"
+                          checked={paymentMethod === 'BANK_DEPOSIT'}
+                          onChange={() => {
+                            setPaymentMethod('BANK_DEPOSIT')
+                            setManualPaidConfirmed(false)
+                          }}
+                          className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        />
+                        <Building2 className="w-5 h-5 text-creamy-500 shrink-0" />
+                        <div>
+                          <p className="font-bold text-sm text-gray-900 dark:text-white">
+                            Direct Bank Deposit
+                          </p>
+                          <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                            ACH / Wire / SEPA transfer — request or view bank details below
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {paymentMethod === 'BANK_DEPOSIT' && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3 cursor-default"
+                      >
+                        <div className="p-3.5 rounded-xl bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800 space-y-2 text-xs">
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <span className="text-[11px] font-black uppercase tracking-wider text-creamy-600 dark:text-creamy-400">
+                              Official Bank Deposit Details
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => openCheckoutSupport('Direct Bank Deposit Details')}
+                              className="text-[11px] font-bold text-creamy-600 dark:text-creamy-400 underline hover:text-creamy-500"
+                            >
+                              Request Bank Details via Support
+                            </button>
+                          </div>
+                          {[
+                            { key: 'bankName', label: 'Bank Name', value: manualConfig?.bankDeposit.bankName || 'JPMorgan Chase Bank, N.A.' },
+                            { key: 'accountName', label: 'Account Name', value: manualConfig?.bankDeposit.accountName || 'Eurotop Aerospace Inc. (DriveFlyElectric)' },
+                            { key: 'accountNumber', label: 'Account Number', value: manualConfig?.bankDeposit.accountNumber || '9872451928' },
+                            { key: 'routingNumber', label: 'Routing Number', value: manualConfig?.bankDeposit.routingNumber || '111000614' },
+                            { key: 'swiftBic', label: 'SWIFT / BIC', value: manualConfig?.bankDeposit.swiftBic || 'CHASUS33' }
+                          ].map((row) => (
+                            <div key={row.key} className="flex items-center justify-between gap-2 py-1 border-b border-gray-100 dark:border-neutral-800/70 last:border-b-0">
+                              <span className="text-gray-500 dark:text-neutral-400 text-[11px]">{row.label}:</span>
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono font-bold text-gray-900 dark:text-white text-[11px]">{row.value}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyField(row.key, row.value)}
+                                  className="p-1 rounded hover:bg-gray-100 dark:hover:bg-neutral-800 text-gray-400 hover:text-creamy-500"
+                                  title={`Copy ${row.label}`}
+                                >
+                                  {copiedFieldKey === row.key ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Option 4: Pay with Crypto Wallet Address (Prefer Anonymous) */}
+                  <div
+                    onClick={() => {
+                      setPaymentMethod('CRYPTO')
+                      setManualPaidConfirmed(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }}
+                    className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                      paymentMethod === 'CRYPTO'
+                        ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                        : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="paymentMethod"
+                          value="CRYPTO"
+                          checked={paymentMethod === 'CRYPTO'}
+                          onChange={() => {
+                            setPaymentMethod('CRYPTO')
+                            setManualPaidConfirmed(false)
+                          }}
+                          className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        />
+                        <Coins className="w-5 h-5 text-creamy-500 shrink-0" />
+                        <div>
+                          <p className="font-bold text-sm text-gray-900 dark:text-white">
+                            Pay with Crypto Wallet Address (Prefer Anonymous)
+                          </p>
+                          <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                            BTC, ETH, USDT (TRC-20 / ERC-20), SOL — or text support for further direction
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {paymentMethod === 'CRYPTO' && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-3 cursor-default"
+                      >
+                        <div className="p-3.5 rounded-xl bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800 space-y-2.5">
+                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                            <span className="text-[11px] font-black uppercase tracking-wider text-creamy-600 dark:text-creamy-400">
+                              Verified Crypto Wallet Tags
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => openCheckoutSupport('Crypto Wallet Payment')}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-creamy-500/15 hover:bg-creamy-500/25 text-creamy-600 dark:text-creamy-400 font-bold text-[11px] transition-colors"
+                            >
+                              <MessageCircle className="w-3 h-3" />
+                              Text Support for Further Direction
+                            </button>
+                          </div>
+
+                          {(() => {
+                            const cryptoEntries = [
+                              { key: 'btc', label: 'Bitcoin (BTC)', addr: manualConfig?.crypto.btcWallet },
+                              { key: 'eth', label: 'Ethereum (ETH)', addr: manualConfig?.crypto.ethWallet },
+                              { key: 'usdt_trc20', label: 'USDT (TRC-20)', addr: manualConfig?.crypto.usdtTrc20Wallet },
+                              { key: 'usdt_erc20', label: 'USDT (ERC-20)', addr: manualConfig?.crypto.usdtErc20Wallet },
+                              { key: 'sol', label: 'Solana (SOL)', addr: manualConfig?.crypto.solWallet }
+                            ].filter((c) => Boolean(c.addr))
+
+                            if (cryptoEntries.length === 0) {
+                              return (
+                                <p className="text-[11px] text-amber-600 dark:text-amber-400 font-medium">
+                                  Crypto wallet tags are issued directly by our support desk for anonymous transfers. Click &ldquo;Text Support for Further Direction&rdquo; above.
+                                </p>
+                              )
+                            }
+
+                            return cryptoEntries.map((c) => (
+                              <div key={c.key} className="p-2.5 rounded-lg bg-gray-50 dark:bg-[#1a1d24] border border-gray-200 dark:border-neutral-800 flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <span className="block text-[10px] font-black uppercase text-gray-500 dark:text-neutral-400">{c.label}</span>
+                                  <span className="block font-mono text-[11px] font-bold text-gray-900 dark:text-white truncate">{c.addr}</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyField(`crypto_${c.key}`, c.addr || '')}
+                                  className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-700 text-[10px] font-bold text-gray-700 dark:text-gray-200 hover:border-creamy-500"
+                                >
+                                  {copiedFieldKey === `crypto_${c.key}` ? (
+                                    <>
+                                      <Check className="w-3 h-3 text-emerald-500" />
+                                      Copied
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy className="w-3 h-3" />
+                                      Copy
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            ))
+                          })()}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Option 5: Pay with Invoice */}
+                  <div
+                    onClick={() => {
+                      setPaymentMethod('INVOICE')
+                      setManualPaidConfirmed(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }}
+                    className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                      paymentMethod === 'INVOICE'
+                        ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                        : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        name="paymentMethod"
+                        value="INVOICE"
+                        checked={paymentMethod === 'INVOICE'}
+                        onChange={() => {
+                          setPaymentMethod('INVOICE')
+                          setManualPaidConfirmed(false)
+                        }}
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                      />
+                      <FileText className="w-5 h-5 text-creamy-500 shrink-0" />
+                      <div>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white">
+                          Pay with Invoice
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Request an invoice to make payment — get payment link and pay at your convenience
+                        </p>
+                      </div>
+                    </div>
+
+                    {paymentMethod === 'INVOICE' && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 text-xs text-gray-600 dark:text-neutral-300 space-y-2 cursor-default"
+                      >
+                        <div className="p-3 rounded-xl bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800">
+                          <p className="font-bold text-gray-900 dark:text-white mb-1">How Invoice Payment Works:</p>
+                          <p className="text-[11px] leading-relaxed">
+                            {manualConfig?.invoice.instruction || 'Complete your order below to generate your official invoice and payment link. You can pay at your convenience, and our Admin team will verify and approve your order once settled.'}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Option 6: Write Cheque */}
+                  <div
+                    onClick={() => {
+                      setPaymentMethod('CHEQUE')
+                      setManualPaidConfirmed(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }}
+                    className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                      paymentMethod === 'CHEQUE'
+                        ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                        : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        name="paymentMethod"
+                        value="CHEQUE"
+                        checked={paymentMethod === 'CHEQUE'}
+                        onChange={() => {
+                          setPaymentMethod('CHEQUE')
+                          setManualPaidConfirmed(false)
+                        }}
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                      />
+                      <PenLine className="w-5 h-5 text-creamy-500 shrink-0" />
+                      <div>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white">
+                          Write Cheque
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Request bank / payee details and mail or deposit a certified cheque
+                        </p>
+                      </div>
+                    </div>
+
+                    {paymentMethod === 'CHEQUE' && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-2 text-xs cursor-default"
+                      >
+                        <div className="p-3.5 rounded-xl bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800 space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-black uppercase tracking-wider text-creamy-600 dark:text-creamy-400">
+                              Cheque Payee &amp; Bank Details
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => openCheckoutSupport('Cheque & Bank Details')}
+                              className="text-[11px] font-bold text-creamy-600 dark:text-creamy-400 underline hover:text-creamy-500"
+                            >
+                              Request Bank Details
+                            </button>
+                          </div>
+                          <p className="text-[11px]"><strong>Payable To:</strong> {manualConfig?.cheque.payee || 'Eurotop Aerospace Inc. (DriveFlyElectric)'}</p>
+                          <p className="text-[11px]"><strong>Mailing Address:</strong> {manualConfig?.cheque.mailingAddress || '1000 DriveFly Electric Way, Suite 400, Austin, TX 78701'}</p>
+                          <p className="text-[11px] text-gray-500 dark:text-neutral-400">{manualConfig?.cheque.memoInstruction || 'Include your Order Number on the Cheque memo line.'}</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Option 7: Custom Payment Options */}
+                  <div
+                    onClick={() => {
+                      setPaymentMethod('CUSTOM')
+                      setManualPaidConfirmed(false)
+                      if (errorMessage) setErrorMessage(null)
+                    }}
+                    className={`p-4 border rounded-xl transition-all cursor-pointer ${
+                      paymentMethod === 'CUSTOM'
+                        ? 'border-creamy-500 bg-creamy-50/30 dark:bg-creamy-500/5 shadow-sm'
+                        : 'border-gray-300 dark:border-neutral-700 bg-gray-50/50 dark:bg-[#1a1d24]'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        name="paymentMethod"
+                        value="CUSTOM"
+                        checked={paymentMethod === 'CUSTOM'}
+                        onChange={() => {
+                          setPaymentMethod('CUSTOM')
+                          setManualPaidConfirmed(false)
+                        }}
+                        className="w-4 h-4 text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                      />
+                      <MessageCircle className="w-5 h-5 text-creamy-500 shrink-0" />
+                      <div>
+                        <p className="font-bold text-sm text-gray-900 dark:text-white">
+                          Custom Payment Options
+                        </p>
+                        <p className="text-[11px] text-gray-500 dark:text-neutral-400">
+                          Chat support for further guides on which payment options we accommodate
+                        </p>
+                      </div>
+                    </div>
+
+                    {paymentMethod === 'CUSTOM' && (
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-800 space-y-2.5 cursor-default"
+                      >
+                        <div className="p-3.5 rounded-xl bg-white dark:bg-[#14171f] border border-gray-200 dark:border-neutral-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <p className="text-[11px] text-gray-600 dark:text-neutral-300 leading-relaxed">
+                            {manualConfig?.custom.supportPrompt || 'Chat with our support desk for tailored payment arrangements (escrow, split transfers, local currency options).'}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => openCheckoutSupport('Custom Payment Options')}
+                            className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-creamy-500 hover:bg-creamy-400 text-black font-black uppercase tracking-wider text-[10px]"
+                          >
+                            <MessageCircle className="w-3.5 h-3.5" />
+                            Chat Support
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Shared Manual Payment Reference & "I have paid" Confirmation Box */}
+                  {isManualMethodSelected && (
+                    <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-800/60 bg-amber-50/70 dark:bg-amber-950/20 space-y-3">
+                      <div>
+                        <label className="block text-[11px] font-bold text-gray-800 dark:text-gray-200 mb-1">
+                          Payment Reference / Transaction Hash / Cheque # (Optional)
+                        </label>
+                        <input
+                          type="text"
+                          value={manualPaymentReference}
+                          onChange={(e) => setManualPaymentReference(e.target.value)}
+                          placeholder={
+                            paymentMethod === 'CRYPTO'
+                              ? 'Paste TX hash or sender wallet tag...'
+                              : paymentMethod === 'CHEQUE'
+                                ? 'Enter cheque number or courier tracking...'
+                                : paymentMethod === 'INVOICE'
+                                  ? 'Enter PO number or billing note...'
+                                  : 'Enter bank transfer reference or sender name...'
+                          }
+                          className={inputClasses}
+                        />
+                      </div>
+
+                      <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={manualPaidConfirmed}
+                          onChange={(e) => {
+                            setManualPaidConfirmed(e.target.checked)
+                            if (errorMessage) setErrorMessage(null)
+                          }}
+                          className="mt-0.5 w-4 h-4 rounded text-creamy-500 focus:ring-creamy-400 accent-creamy-500"
+                        />
+                        <span className="text-xs font-bold text-gray-900 dark:text-white leading-snug">
+                          I have paid{paymentMethod === 'INVOICE' ? ' / requested my invoice payment link' : ''} and understand my order will await manual Admin verification in the Admin Dashboard.
+                        </span>
+                      </label>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -2003,7 +2605,7 @@ const CheckoutForm: React.FC = () => {
                   —{' '}
                   <button
                     type="button"
-                    onClick={openCheckoutSupport}
+                    onClick={() => openCheckoutSupport()}
                     className="font-black text-creamy-600 dark:text-creamy-400 underline hover:text-creamy-500"
                   >
                     chat support for directions
@@ -2021,7 +2623,7 @@ const CheckoutForm: React.FC = () => {
 
               <button
                 onClick={handlePayment}
-                disabled={isProcessing || !isSelectedPaymentAvailable}
+                disabled={isProcessing || !isSelectedPaymentAvailable || (isManualMethodSelected && !manualPaidConfirmed)}
                 className="w-full mt-6 bg-creamy-500 hover:bg-creamy-400 disabled:bg-gray-400 dark:disabled:bg-neutral-700 text-black font-black uppercase tracking-wider py-4 px-4 rounded-xl shadow-lg shadow-creamy-500/20 disabled:cursor-not-allowed transition-all text-xs flex items-center justify-center gap-2"
               >
                 {isProcessing ? (
@@ -2036,6 +2638,14 @@ const CheckoutForm: React.FC = () => {
                       : !isPayPalAvailable && !isStripeAvailable
                         ? 'Checkout Payment Options Unavailable'
                         : 'Selected Payment Option Unavailable'}
+                  </span>
+                ) : isManualMethodSelected ? (
+                  <span>
+                    {!manualPaidConfirmed
+                      ? 'Check "I Have Paid" to Complete Purchase'
+                      : paymentMethod === 'INVOICE'
+                        ? `Request Invoice & Complete Purchase (${formatPrice(remainingGatewayDue)})`
+                        : `Complete Purchase (${formatPrice(remainingGatewayDue)}) — Await Admin Approval`}
                   </span>
                 ) : (
                   <span>

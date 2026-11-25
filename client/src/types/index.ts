@@ -145,7 +145,17 @@ export interface Order {
   tax: number
   shipping: number
   discount: number
-  paymentMethod: 'STRIPE' | 'PAYPAL' | 'WALLET' | 'WALLET_STRIPE' | 'WALLET_PAYPAL'
+  paymentMethod:
+    | 'STRIPE'
+    | 'PAYPAL'
+    | 'WALLET'
+    | 'WALLET_STRIPE'
+    | 'WALLET_PAYPAL'
+    | 'BANK_DEPOSIT'
+    | 'CRYPTO'
+    | 'INVOICE'
+    | 'CHEQUE'
+    | 'CUSTOM'
   paymentStatus: 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
   paymentId?: string
   receiptToken?: string
@@ -514,4 +524,33 @@ export interface EligibleExchangeResponse {
     daysRemaining: number
   }
   products: Array<Product & { priceDifference: number; exactMatch: boolean }>
+}
+
+export interface ManualPaymentConfig {
+  bankDeposit: {
+    bankName: string
+    accountName: string
+    accountNumber: string
+    routingNumber: string
+    swiftBic: string
+    bankAddress: string
+  }
+  crypto: {
+    btcWallet: string
+    ethWallet: string
+    usdtTrc20Wallet: string
+    usdtErc20Wallet: string
+    solWallet: string
+  }
+  cheque: {
+    payee: string
+    mailingAddress: string
+    memoInstruction: string
+  }
+  invoice: {
+    instruction: string
+  }
+  custom: {
+    supportPrompt: string
+  }
 }

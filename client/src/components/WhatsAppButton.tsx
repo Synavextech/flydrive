@@ -9,17 +9,13 @@ import {
   CreditCard,
   HelpCircle,
   RotateCcw,
-  BookOpen,
   Headphones,
-  ExternalLink,
   AlertCircle,
   Clock,
   Lock,
-  CheckCircle2,
   Trash2,
   History,
   ArrowLeft,
-  PlusCircle,
   ChevronRight
 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
@@ -34,27 +30,6 @@ const CATEGORY_OPTIONS: Array<{ id: SupportTopic; label: string; shortDesc: stri
   { id: 'Item Purchase', label: 'Item Purchase', shortDesc: 'Price, stock & listing specs', icon: ShoppingBag },
   { id: 'Payment Queries', label: 'Payment Queries', shortDesc: 'Taxes, fees & doorstep cost', icon: CreditCard },
   { id: 'Return Policy', label: 'Return Policy', shortDesc: '21-day returns & wallet deposit', icon: RotateCcw },
-]
-
-const PAYMENT_SUB_QUESTIONS: Array<{ id: string; question: string; guidance: string }> = [
-  {
-    id: 'making-payment',
-    question: 'I have a question about making payment',
-    guidance:
-      'Checkout accepts your DriveFlyElectric Wallet Balance, PayPal (plus Debit/Credit Card), and Stripe 3D-Secure cards in USD. You can also combine Wallet Balance with PayPal or Stripe.'
-  },
-  {
-    id: 'country-taxes',
-    question: 'Are taxes integrated for my country?',
-    guidance:
-      'Yes — estimated tax (5%) and applicable checkout totals are calculated and displayed transparently in USD before you confirm payment.'
-  },
-  {
-    id: 'doorstep-cost',
-    question: 'Help me understand total costs to my doorstep',
-    guidance:
-      'Standard crated doorstep freight is $0.00 (Free Express Shipping) worldwide. Your doorstep total shown in Checkout includes vehicle subtotal + estimated tax with zero hidden dispatch fees.'
-  }
 ]
 
 const PENDING_LIVECHAT_KEY = 'dfe_pending_livechat_intent'
@@ -79,8 +54,6 @@ export const WhatsAppButton: React.FC = () => {
   const [hoveredBtn, setHoveredBtn] = useState<'whatsapp' | 'livechat' | null>(null)
   const [isChatOpen, setIsChatOpen] = useState(false)
   const [viewMode, setViewMode] = useState<SupportViewMode>('ACTIVE_THREAD')
-  const [showWelcomeInHub, setShowWelcomeInHub] = useState(false)
-  const [showCustomComposerInHub, setShowCustomComposerInHub] = useState(false)
 
   const [sessionsList, setSessionsList] = useState<SupportSession[]>([])
   const [sessionId, setSessionId] = useState<string>('')
@@ -90,13 +63,10 @@ export const WhatsAppButton: React.FC = () => {
 
   const [selectedTopic, setSelectedTopic] = useState<SupportTopic>('General Inquiry')
   const [selectedProducts, setSelectedProducts] = useState<SupportSelectedProduct[]>([])
-  const [selectedPaymentSubId, setSelectedPaymentSubId] = useState<string | null>(null)
 
   const [activeShippingOrders, setActiveShippingOrders] = useState<Order[]>([])
   const [hasActiveShipping, setHasActiveShipping] = useState(false)
-  const [loadingShipping, setLoadingShipping] = useState(false)
   const [selectedActiveOrderId, setSelectedActiveOrderId] = useState<string | null>(null)
-  const [whatsAppGateNotice, setWhatsAppGateNotice] = useState<string | null>(null)
 
   const [messageInput, setMessageInput] = useState('')
   const [isSending, setIsSending] = useState(false)
@@ -143,7 +113,6 @@ export const WhatsAppButton: React.FC = () => {
       setHasActiveShipping(false)
       return false
     }
-    setLoadingShipping(true)
     try {
       const res = await orderApi.getActiveShipping()
       if (res.success && res.data) {
@@ -158,8 +127,6 @@ export const WhatsAppButton: React.FC = () => {
       }
     } catch {
       // Ignore error
-    } finally {
-      setLoadingShipping(false)
     }
     return false
   }, [isAuthenticated, user?.id, selectedActiveOrderId])
@@ -303,7 +270,6 @@ export const WhatsAppButton: React.FC = () => {
       }
       if (intent?.activeOrderId) setSelectedActiveOrderId(intent.activeOrderId)
 
-      setWhatsAppGateNotice(null)
       setIsChatOpen(true)
 
       // When opening with an explicit intent or thread, switch directly to conversation view
@@ -540,20 +506,13 @@ export const WhatsAppButton: React.FC = () => {
       return
     }
     setSelectedTopic('Shipping Inquiry')
-    setWhatsAppGateNotice(
-      'WhatsApp Shipping Support is available only when your account has an active shipping order (PROCESSING / SHIPPED). Use LiveChat below for pre-purchase or cart shipping questions.'
-    )
     await openAuthenticatedSupport({ topic: 'Shipping Inquiry' })
   }
 
   // Starts or selects an inquiry topic: immediately transitions to ACTIVE_THREAD so templates disappear
   const handleStartInquiryTopic = async (topic: SupportTopic, initialMessage?: string) => {
     setSelectedTopic(topic)
-    setSelectedPaymentSubId(null)
-    setWhatsAppGateNotice(null)
     setChatError(null)
-    setShowWelcomeInHub(false)
-    setShowCustomComposerInHub(false)
 
     // Switch immediately to conversation view — all category selectors vanish
     setViewMode('ACTIVE_THREAD')
@@ -613,26 +572,6 @@ export const WhatsAppButton: React.FC = () => {
     await handleStartInquiryTopic('Shipping Inquiry', initialText)
   }
 
-  const handleTagActiveOrder = async (ord: Order) => {
-    setSelectedActiveOrderId(ord.id)
-    setWhatsAppGateNotice(null)
-    const orderItemsAsProducts: SupportSelectedProduct[] = (ord.items || [])
-      .filter((i) => i.product)
-      .map((i) => ({
-        id: i.product.id,
-        name: i.product.name,
-        sku: i.product.sku || '',
-        price: Number(i.price || i.product.price || 0),
-        category: i.product.category || '',
-        image: i.product.images?.[0] || ''
-      }))
-    if (orderItemsAsProducts.length > 0) {
-      setSelectedProducts(orderItemsAsProducts)
-    }
-    const initialText = `Shipping inquiry for Order #${ord.orderNumber} (Tracking: ${ord.trackingNumber || `TRK-${ord.orderNumber}`}, Status: ${ord.status}).`
-    await handleStartInquiryTopic('Shipping Inquiry', initialText)
-  }
-
   const handleSendMessage = async (e?: React.FormEvent, explicitContent?: string, targetSessionIdOverride?: string) => {
     if (e) e.preventDefault()
     if (!isAuthenticated || !user?.id) {
@@ -685,18 +624,6 @@ export const WhatsAppButton: React.FC = () => {
     }
   }
 
-  const handleBrowseCatalogForTag = () => {
-    setIsChatOpen(false)
-    if (location.pathname !== '/') {
-      navigate('/#store-catalog')
-      return
-    }
-    const el = document.getElementById('store-catalog')
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth' })
-    }
-  }
-
   const handleStartCustomMessage = () => {
     handleStartInquiryTopic(selectedTopic || 'General Inquiry')
   }
@@ -705,7 +632,6 @@ export const WhatsAppButton: React.FC = () => {
   const lastMessageIsClient =
     messages.length > 0 && messages[messages.length - 1]?.senderRole === 'CLIENT'
   const showReplyTimeBanner = isAuthenticated && (recentlySentNotice || lastMessageIsClient)
-  const verifiedWaUrl = buildActiveShippingWhatsAppUrl()
 
   return (
     <>

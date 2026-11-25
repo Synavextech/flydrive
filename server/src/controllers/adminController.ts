@@ -410,6 +410,134 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
   }
 }
 
+// @desc    Approve a manual payment order (Admin)
+// @route   PUT /api/admin/orders/:id/approve-payment
+// @access  Private/Admin
+export const approveManualPayment = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const orderId = req.params.id
+    const existing = await databaseService.findOrderById(orderId)
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      })
+    }
+
+    if (existing.paymentStatus === 'COMPLETED' && existing.paymentVerified) {
+      return res.status(200).json({
+        success: true,
+        message: 'Order payment is already verified and completed.',
+        data: existing
+      })
+    }
+
+    const nextStatus = existing.status === 'PENDING' ? 'PROCESSING' : existing.status
+    const updatedOrder = await databaseService.updateOrderPaymentAndStatus(orderId, {
+      paymentStatus: 'COMPLETED',
+      paymentVerified: true,
+      status: nextStatus
+    })
+
+    emailService
+      .sendManualPaymentApproved(updatedOrder)
+      .catch((err) => console.error('Manual payment approval email error:', err))
+
+    res.status(200).json({
+      success: true,
+      message: `Manual payment approved for Order #${updatedOrder.orderNumber}.`,
+      data: updatedOrder
+    })
+  } catch (error) {
+    console.error('Error approving manual payment:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to approve manual payment.'
+    })
+  }
+}
+
+// @desc    Reject a manual payment order (Admin)
+// @route   PUT /api/admin/orders/:id/reject-payment
+// @access  Private/Admin
+export const rejectManualPayment = async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required'
+      })
+    }
+
+    const orderId = req.params.id
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 300) : ''
+    const existing = await databaseService.findOrderById(orderId)
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      })
+    }
+
+    const updatedOrder = await databaseService.updateOrderPaymentAndStatus(orderId, {
+      paymentStatus: 'FAILED',
+      paymentVerified: false,
+      status: 'CANCELLED'
+    })
+
+    // Restore product stock for cancelled/rejected order
+    if (Array.isArray(existing.items)) {
+      for (const item of existing.items) {
+        try {
+          const prod = await databaseService.findProductById(item.productId)
+          if (prod) {
+            await databaseService.updateProduct(item.productId, {
+              stock: Number(prod.stock || 0) + Number(item.quantity || 1)
+            })
+          }
+        } catch {
+          // Non-fatal
+        }
+      }
+    }
+
+    emailService.recordActivity({
+      type: 'MANUAL_PAYMENT_REJECTED',
+      title: `Manual Payment Rejected • #${updatedOrder.orderNumber}`,
+      message: `Admin rejected manual payment (${updatedOrder.paymentMethod}) for Order #${updatedOrder.orderNumber}.${reason ? ` Reason: ${reason}` : ''}`,
+      userEmail: updatedOrder.user?.email || undefined,
+      orderNumber: updatedOrder.orderNumber,
+      amount: Number(updatedOrder.total || 0),
+      metadata: { orderId: updatedOrder.id, reason },
+      emailDispatched: false,
+      systemMailDispatched: false
+    })
+
+    emailService
+      .sendOrderStatusUpdate(updatedOrder, updatedOrder.user?.email)
+      .catch((err) => console.error('Manual payment rejection email error:', err))
+
+    res.status(200).json({
+      success: true,
+      message: `Manual payment rejected and Order #${updatedOrder.orderNumber} cancelled.`,
+      data: updatedOrder
+    })
+  } catch (error) {
+    console.error('Error rejecting manual payment:', error)
+    res.status(500).json({
+      success: false,
+      error: 'Unable to reject manual payment.'
+    })
+  }
+}
+
 // @desc    Get all users (Admin)
 // @route   GET /api/admin/users
 // @access  Private/Admin

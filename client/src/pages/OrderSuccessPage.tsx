@@ -11,7 +11,8 @@ import {
   Copy,
   Check,
   FileText,
-  Truck
+  Truck,
+  Clock
 } from 'lucide-react'
 import { paymentApi, orderApi } from '../services/api'
 import { useCart } from '../contexts/CartContext'
@@ -35,6 +36,9 @@ interface LocationState {
   trackingNumber?: string
   total?: number
   paymentMethod?: string
+  paymentStatus?: string
+  paymentReference?: string
+  manualConfig?: any
   shippingAddress?: string
   receiptData?: OrderReceiptData
 }
@@ -274,9 +278,14 @@ const OrderSuccessPage = () => {
       }
     : null
 
+  const isPendingManualOrder =
+    state.paymentStatus === 'PENDING' ||
+    (receipt as any)?.paymentStatus === 'PENDING' ||
+    ['BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM'].includes(paymentMethod)
+
   // Automatically generate and download PDF receipt once when a verified purchase completes
   useEffect(() => {
-    if (!loadingPayPal && !payPalError && hasVerifiedOrder && activeReceipt?.orderNumber) {
+    if (!isPendingManualOrder && !loadingPayPal && !payPalError && hasVerifiedOrder && activeReceipt?.orderNumber) {
       const autoKey = `auto_pdf_receipt_${activeReceipt.orderNumber}`
       if (!sessionStorage.getItem(autoKey)) {
         sessionStorage.setItem(autoKey, 'true')
@@ -287,7 +296,7 @@ const OrderSuccessPage = () => {
         }
       }
     }
-  }, [loadingPayPal, payPalError, hasVerifiedOrder, activeReceipt?.orderNumber])
+  }, [isPendingManualOrder, loadingPayPal, payPalError, hasVerifiedOrder, activeReceipt?.orderNumber])
 
   if (loadingPayPal) {
     return (
@@ -432,20 +441,41 @@ const OrderSuccessPage = () => {
 
         {/* Order Confirmation Hero Banner (no-print) */}
         <div className="no-print bg-white dark:bg-[#16181e] border border-gray-200 dark:border-neutral-800 rounded-2xl shadow-xl p-6 sm:p-8 text-center transition-colors">
-          <div className="w-16 h-16 sm:w-20 sm:h-20 bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-5 shadow-inner">
-            <CheckCircle className="w-10 h-10 sm:w-12 sm:h-12" />
-          </div>
+          {isPendingManualOrder ? (
+            <>
+              <div className="w-16 h-16 sm:w-20 sm:h-20 bg-amber-500/10 text-amber-500 border border-amber-500/20 rounded-full flex items-center justify-center mx-auto mb-5 shadow-inner">
+                <Clock className="w-10 h-10 sm:w-12 sm:h-12" />
+              </div>
 
-          <span className="text-[10px] font-black uppercase tracking-widest text-emerald-500 bg-emerald-500/10 px-3 py-1 rounded-full border border-emerald-500/20">
-            Payment Verified & Settled
-          </span>
+              <span className="text-[10px] font-black uppercase tracking-widest text-amber-500 bg-amber-500/10 px-3 py-1 rounded-full border border-amber-500/20">
+                Awaiting Manual Admin Verification
+              </span>
 
-          <h1 className="text-2xl sm:text-4xl font-black uppercase tracking-tight text-gray-900 dark:text-white mt-3 font-anton">
-            Order Confirmed!
-          </h1>
-          <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 max-w-xl mx-auto mt-2 font-medium">
-            Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been placed and scheduled for Worldwide Express Dispatch.
-          </p>
+              <h1 className="text-2xl sm:text-4xl font-black uppercase tracking-tight text-gray-900 dark:text-white mt-3 font-anton">
+                Order Submitted!
+              </h1>
+              <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 max-w-xl mx-auto mt-2 font-medium">
+                Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been recorded and is currently awaiting manual payment verification by our Admin team. Once verified, you will receive your official settled PDF receipt and dispatch confirmation.
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="w-16 h-16 sm:w-20 sm:h-20 bg-emerald-500/10 text-emerald-500 border border-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-5 shadow-inner">
+                <CheckCircle className="w-10 h-10 sm:w-12 sm:h-12" />
+              </div>
+
+              <span className="text-[10px] font-black uppercase tracking-widest text-emerald-500 bg-emerald-500/10 px-3 py-1 rounded-full border border-emerald-500/20">
+                Payment Verified & Settled
+              </span>
+
+              <h1 className="text-2xl sm:text-4xl font-black uppercase tracking-tight text-gray-900 dark:text-white mt-3 font-anton">
+                Order Confirmed!
+              </h1>
+              <p className="text-xs sm:text-sm text-gray-600 dark:text-neutral-300 max-w-xl mx-auto mt-2 font-medium">
+                Thank you for choosing <span className="text-creamy-500 font-bold">DriveFlyElectric</span>. Your order has been placed and scheduled for Worldwide Express Dispatch.
+              </p>
+            </>
+          )}
 
           <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3 bg-gray-50 dark:bg-[#1a1d24] rounded-xl p-4 border border-gray-200 dark:border-neutral-800 text-left">
             <div>

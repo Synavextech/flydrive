@@ -130,6 +130,7 @@ export const AdminDashboard: React.FC = () => {
 
   // Order status filter
   const [orderFilter, setOrderFilter] = useState<string>('ALL')
+  const [processingManualOrderId, setProcessingManualOrderId] = useState<string | null>(null)
   const [selectedReceiptOrder, setSelectedReceiptOrder] = useState<any | null>(null)
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null)
   const [notificationsList, setNotificationsList] = useState<any[]>([])
@@ -507,9 +508,18 @@ export const AdminDashboard: React.FC = () => {
     try {
       setIsLoading(true)
       const currentFilter = orderFilterRef.current
-      const res = await adminApi.getAllOrders(currentFilter === 'ALL' ? undefined : { status: currentFilter as any })
+      const apiStatus = currentFilter === 'ALL' || currentFilter === 'PENDING_MANUAL' ? undefined : (currentFilter as any)
+      const res = await adminApi.getAllOrders(apiStatus ? { status: apiStatus } : undefined)
       if (res.success && res.data) {
-        setOrdersList(res.data)
+        const list =
+          currentFilter === 'PENDING_MANUAL'
+            ? res.data.filter(
+                (o: any) =>
+                  o.paymentStatus === 'PENDING' &&
+                  ['BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM'].includes(o.paymentMethod)
+              )
+            : res.data
+        setOrdersList(list)
       }
     } catch (err: any) {
       notify('error', err.message || 'Failed to load orders')
@@ -731,6 +741,42 @@ export const AdminDashboard: React.FC = () => {
       }
     } catch (err: any) {
       notify('error', err.message || 'Failed to update order status')
+    }
+  }
+
+  // Handle Manual Payment Approval (Bank Deposit, Crypto, Invoice, Cheque, Custom)
+  const handleApproveManualPayment = async (orderId: string, orderNumber?: string) => {
+    if (processingManualOrderId) return
+    try {
+      setProcessingManualOrderId(orderId)
+      const res = await adminApi.approveManualPayment(orderId)
+      if (res.success) {
+        notify('success', res.message || `Manual payment approved for #${orderNumber || orderId}.`)
+        await Promise.all([fetchOrders(), fetchDashboardStats()])
+      }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to approve manual payment')
+    } finally {
+      setProcessingManualOrderId(null)
+    }
+  }
+
+  // Handle Manual Payment Rejection
+  const handleRejectManualPayment = async (orderId: string, orderNumber?: string) => {
+    if (processingManualOrderId) return
+    const reason = window.prompt(`Optional reason for rejecting manual payment for #${orderNumber || orderId}:`)
+    if (reason === null) return
+    try {
+      setProcessingManualOrderId(orderId)
+      const res = await adminApi.rejectManualPayment(orderId, reason.trim() || undefined)
+      if (res.success) {
+        notify('success', res.message || `Manual payment rejected for #${orderNumber || orderId}.`)
+        await Promise.all([fetchOrders(), fetchDashboardStats()])
+      }
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to reject manual payment')
+    } finally {
+      setProcessingManualOrderId(null)
     }
   }
 
@@ -1302,15 +1348,15 @@ export const AdminDashboard: React.FC = () => {
                     {notificationsList.map((act: any) => {
                       const typeStr = String(act.type || 'ACTIVITY')
                       const badgeClass =
-                        typeStr === 'ORDER_PURCHASED' || typeStr === 'PAYMENT_CAPTURED' || typeStr === 'PRODUCT_REVIEW_SUBMITTED'
+                        typeStr === 'ORDER_PURCHASED' || typeStr === 'PAYMENT_CAPTURED' || typeStr === 'PRODUCT_REVIEW_SUBMITTED' || typeStr === 'MANUAL_PAYMENT_APPROVED'
                           ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30'
                           : typeStr === 'PAYMENT_AUTHORIZED'
                           ? 'bg-blue-500/15 text-blue-500 border border-blue-500/30'
-                          : typeStr === 'PAYMENT_FAILED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED' || typeStr === 'PRODUCT_DELETED'
+                          : typeStr === 'PAYMENT_FAILED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED' || typeStr === 'PRODUCT_DELETED' || typeStr === 'MANUAL_PAYMENT_REJECTED'
                           ? 'bg-red-500/15 text-red-500 border border-red-500/30'
                           : typeStr === 'SUPPORT_INQUIRY' || typeStr === 'SUPPORT_REPLY' || typeStr === 'SUPPORT_STATUS_UPDATED'
                           ? 'bg-purple-500/15 text-purple-400 border border-purple-500/30'
-                          : typeStr === 'PRODUCT_BOOKING_CREATED' || typeStr === 'PRODUCT_BOOKING_UPDATED' || typeStr === 'PRODUCT_BOOKING' || typeStr === 'CART_REMINDER_SENT'
+                          : typeStr === 'PRODUCT_BOOKING_CREATED' || typeStr === 'PRODUCT_BOOKING_UPDATED' || typeStr === 'PRODUCT_BOOKING' || typeStr === 'CART_REMINDER_SENT' || typeStr === 'MANUAL_PAYMENT_SUBMITTED'
                           ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30'
                           : typeStr === 'USER_REGISTERED' || typeStr === 'USER_LOGIN' || typeStr === 'USER_STATUS_UPDATED'
                           ? 'bg-indigo-500/15 text-indigo-400 border border-indigo-500/30'
@@ -1354,7 +1400,7 @@ export const AdminDashboard: React.FC = () => {
                                 View Booking
                               </button>
                             )}
-                            {(typeStr === 'ORDER_PURCHASED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED') && (
+                            {(typeStr === 'ORDER_PURCHASED' || typeStr === 'ORDER_CANCELLED' || typeStr === 'ORDER_REFUNDED' || typeStr === 'MANUAL_PAYMENT_SUBMITTED' || typeStr === 'MANUAL_PAYMENT_APPROVED' || typeStr === 'MANUAL_PAYMENT_REJECTED') && (
                               <button
                                 type="button"
                                 onClick={() => setActiveTab('orders')}
@@ -1601,7 +1647,7 @@ export const AdminDashboard: React.FC = () => {
             <div className="p-6 border-b border-gray-200 dark:border-neutral-800 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               <div>
                 <h3 className="text-lg font-black uppercase text-gray-900 dark:text-white font-anton">Orders & Settlements</h3>
-                <p className="text-xs text-gray-500 dark:text-gray-400">Orders captured via Stripe and PayPal.</p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">Automatic settlements (Wallet, Stripe, PayPal) and Manual Payment orders awaiting Admin verification.</p>
               </div>
 
               {/* Status Filter */}
@@ -1613,6 +1659,7 @@ export const AdminDashboard: React.FC = () => {
                   className="px-3 py-1.5 text-xs font-bold border border-gray-300 dark:border-neutral-700 rounded-xl bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
                 >
                   <option value="ALL">All Statuses</option>
+                  <option value="PENDING_MANUAL">Pending Manual Approvals</option>
                   <option value="PENDING">Pending</option>
                   <option value="PROCESSING">Processing</option>
                   <option value="SHIPPED">Shipped</option>
@@ -1643,8 +1690,15 @@ export const AdminDashboard: React.FC = () => {
                       </td>
                     </tr>
                   ) : (
-                    ordersList.map((ord: any) => (
-                      <tr key={ord.id} className="hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors">
+                    ordersList.map((ord: any) => {
+                      const isManualMethod = ['BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM'].includes(ord.paymentMethod)
+                      const needsManualVerification =
+                        isManualMethod && ord.paymentStatus !== 'COMPLETED' && ord.status !== 'CANCELLED' && ord.status !== 'REFUNDED'
+                      const refMatch = typeof ord.notes === 'string' ? ord.notes.match(/\[Payment Reference:\s*([^\]]+)\]/i) : null
+                      const paymentRefText = refMatch?.[1]?.trim() || ord.paymentId
+
+                      return (
+                      <tr key={ord.id} className={`hover:bg-gray-50/60 dark:hover:bg-[#191b22] transition-colors ${needsManualVerification ? 'bg-amber-50/40 dark:bg-amber-950/10' : ''}`}>
                         <td className="px-6 py-4">
                           <p className="font-mono font-bold text-gray-900 dark:text-white text-xs">#{ord.orderNumber}</p>
                           <p className="font-mono text-[10px] font-bold text-creamy-500 mt-0.5">
@@ -1667,24 +1721,63 @@ export const AdminDashboard: React.FC = () => {
                         </td>
 
                         <td className="px-6 py-4">
-                          <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
-                            {ord.paymentMethod || 'STRIPE'}
-                          </span>
+                          <div className="space-y-1">
+                            <span className={`inline-block text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded ${
+                              isManualMethod
+                                ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300'
+                                : 'bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300'
+                            }`}>
+                              {ord.paymentMethod || 'STRIPE'}
+                            </span>
+                            {needsManualVerification && (
+                              <span className="block text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                                Awaiting Verification
+                              </span>
+                            )}
+                            {isManualMethod && paymentRefText && (
+                              <span className="block font-mono text-[10px] text-gray-500 dark:text-gray-400 max-w-[160px] truncate" title={paymentRefText}>
+                                Ref: {paymentRefText}
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         <td className="px-6 py-4">
-                          <select
-                            value={ord.status}
-                            onChange={(e) => handleUpdateOrderStatus(ord.id, e.target.value as any)}
-                            className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
-                          >
-                            <option value="PENDING">PENDING</option>
-                            <option value="PROCESSING">PROCESSING</option>
-                            <option value="SHIPPED">SHIPPED</option>
-                            <option value="DELIVERED">DELIVERED</option>
-                            <option value="CANCELLED">CANCELLED</option>
-                            <option value="REFUNDED">REFUNDED</option>
-                          </select>
+                          <div className="space-y-2">
+                            <select
+                              value={ord.status}
+                              onChange={(e) => handleUpdateOrderStatus(ord.id, e.target.value as any)}
+                              className="text-xs font-bold px-3 py-1.5 rounded-lg border border-gray-300 dark:border-neutral-700 bg-white dark:bg-[#1a1d24] text-gray-900 dark:text-white focus:ring-2 focus:ring-creamy-500"
+                            >
+                              <option value="PENDING">PENDING</option>
+                              <option value="PROCESSING">PROCESSING</option>
+                              <option value="SHIPPED">SHIPPED</option>
+                              <option value="DELIVERED">DELIVERED</option>
+                              <option value="CANCELLED">CANCELLED</option>
+                              <option value="REFUNDED">REFUNDED</option>
+                            </select>
+
+                            {needsManualVerification && (
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={processingManualOrderId === ord.id}
+                                  onClick={() => handleApproveManualPayment(ord.id, ord.orderNumber)}
+                                  className="px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-black font-black uppercase tracking-wider text-[10px] transition-colors"
+                                >
+                                  {processingManualOrderId === ord.id ? 'Working...' : 'Approve & Settle'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={processingManualOrderId === ord.id}
+                                  onClick={() => handleRejectManualPayment(ord.id, ord.orderNumber)}
+                                  className="px-2.5 py-1 rounded-lg bg-red-500/15 hover:bg-red-500 text-red-600 dark:text-red-400 hover:text-white border border-red-500/30 disabled:opacity-50 font-black uppercase tracking-wider text-[10px] transition-colors"
+                                >
+                                  Reject
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </td>
 
                         <td className="px-6 py-4 text-right">
@@ -1708,7 +1801,8 @@ export const AdminDashboard: React.FC = () => {
                           </div>
                         </td>
                       </tr>
-                    ))
+                      )
+                    })
                   )}
                 </tbody>
               </table>

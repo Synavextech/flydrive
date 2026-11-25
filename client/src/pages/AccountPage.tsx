@@ -411,8 +411,13 @@ export const AccountPage: React.FC = () => {
                             {ord.status}
                           </span>
                           <span className="px-2 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-300 text-[10px] font-black uppercase">
-                            {ord.paymentMethod}
+                            {ord.paymentMethod.replace(/_/g, ' ')}
                           </span>
+                          {ord.paymentStatus === 'PENDING' && (
+                            <span className="px-2 py-0.5 rounded bg-amber-500/15 text-amber-600 dark:text-amber-400 text-[10px] font-black uppercase">
+                              Pending Admin Verification
+                            </span>
+                          )}
                           {Number(ord.walletAmountUsed || 0) > 0 && (
                             <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-500 text-[10px] font-bold">
                               Wallet Used: {formatPrice(ord.walletAmountUsed)}

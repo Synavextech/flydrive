@@ -1,6 +1,16 @@
 export type Role = 'CUSTOMER' | 'ADMIN'
 export type OrderStatus = 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED' | 'REFUNDED'
-export type PaymentMethod = 'STRIPE' | 'PAYPAL' | 'WALLET' | 'WALLET_STRIPE' | 'WALLET_PAYPAL'
+export type PaymentMethod =
+  | 'STRIPE'
+  | 'PAYPAL'
+  | 'WALLET'
+  | 'WALLET_STRIPE'
+  | 'WALLET_PAYPAL'
+  | 'BANK_DEPOSIT'
+  | 'CRYPTO'
+  | 'INVOICE'
+  | 'CHEQUE'
+  | 'CUSTOM'
 export type PaymentStatus = 'PENDING' | 'COMPLETED' | 'FAILED' | 'REFUNDED'
 export type AddressType = 'SHIPPING' | 'BILLING'
 
@@ -185,6 +195,9 @@ export type SystemActivityType =
   | 'SUPPORT_STATUS_UPDATED'
   | 'CART_REMINDER_SENT'
   | 'PAYMENT_GATEWAY_STATUS_UPDATED'
+  | 'MANUAL_PAYMENT_SUBMITTED'
+  | 'MANUAL_PAYMENT_APPROVED'
+  | 'MANUAL_PAYMENT_REJECTED'
 
 export type CartReminderStatus = 'ACTIVE' | 'COMPLETED' | 'CLEARED' | 'EXPIRED'
 
@@ -338,6 +351,35 @@ export interface PaymentOptionAvailability {
 export interface PaymentOptionsConfig {
   paypal: PaymentOptionAvailability
   stripe: PaymentOptionAvailability
+}
+
+export interface ManualPaymentConfig {
+  bankDeposit: {
+    bankName: string
+    accountName: string
+    accountNumber: string
+    routingNumber: string
+    swiftBic: string
+    bankAddress: string
+  }
+  crypto: {
+    btcWallet: string
+    ethWallet: string
+    usdtTrc20Wallet: string
+    usdtErc20Wallet: string
+    solWallet: string
+  }
+  cheque: {
+    payee: string
+    mailingAddress: string
+    memoInstruction: string
+  }
+  invoice: {
+    instruction: string
+  }
+  custom: {
+    supportPrompt: string
+  }
 }
 
 export type WalletTransactionType =

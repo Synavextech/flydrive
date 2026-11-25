@@ -1475,6 +1475,142 @@ class EmailService {
       systemMailDispatched: false
     })
   }
+
+  /**
+   * Sends notification to customer & admin when a manual payment order is placed
+   * (Bank Deposit, Crypto, Invoice, Cheque, or Custom), awaiting manual verification.
+   */
+  async sendManualPaymentOrderReceived(
+    order: any,
+    customerContext?: {
+      accountEmail?: string
+      shippingEmail?: string
+      firstName?: string
+      lastName?: string
+      fullAddress?: string
+      paymentReference?: string
+    }
+  ): Promise<{ userEmailSent: boolean; systemEmailSent: boolean }> {
+    const receiptData = buildReceiptDataFromOrder(order, {
+      firstName: customerContext?.firstName,
+      lastName: customerContext?.lastName,
+      email: customerContext?.accountEmail || customerContext?.shippingEmail,
+      address: customerContext?.fullAddress
+    })
+
+    const userRecipients = resolveOrderCustomerEmails(
+      order,
+      customerContext?.accountEmail,
+      customerContext?.shippingEmail
+    )
+    const { adminContactEmail, systemEmails } = this.getTransporter()
+    const storeUrl = process.env.PRODUCTION_URL || process.env.PRODUCTION_url || 'https://driveflyelectric.shop'
+
+    const safeOrderNumber = escapeHtml(receiptData.orderNumber)
+    const safeTrackingNumber = escapeHtml(receiptData.trackingNumber || `TRK-${receiptData.orderNumber}`)
+    const safeUserName = escapeHtml(receiptData.userName)
+    const safeFinalCost = escapeHtml(receiptData.finalCost)
+    const safePaymentSource = escapeHtml(receiptData.paymentSource)
+    const safeRef = escapeHtml(customerContext?.paymentReference || receiptData.transactionId)
+
+    let userEmailSent = false
+    if (userRecipients.length > 0) {
+      const userHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; color: #111827; border: 1px solid #f59e0b; border-radius: 12px; overflow: hidden;">
+          <div style="background-color: #111318; color: #ffffff; padding: 24px;">
+            <span style="background-color: #f59e0b; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Order Pending Payment Verification</span>
+            <h1 style="margin: 12px 0 4px; font-size: 22px; color: #ffffff;">Order #${safeOrderNumber} Received</h1>
+            <p style="margin: 0; font-size: 13px; color: #9ca3af;">Method: ${safePaymentSource} • Total: ${safeFinalCost}</p>
+          </div>
+          <div style="padding: 24px; font-size: 14px; line-height: 1.6;">
+            <p>Hello <strong>${safeUserName}</strong>,</p>
+            <p>Thank you for your order with <strong>DriveFlyElectric</strong>! Your order has been recorded and is currently <strong>awaiting manual payment verification</strong> by our billing team.</p>
+            <div style="background-color: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 14px 18px; margin: 16px 0; font-size: 13px;">
+              <p style="margin: 4px 0;"><strong>Order Number:</strong> #${safeOrderNumber}</p>
+              <p style="margin: 4px 0;"><strong>Tracking Number:</strong> ${safeTrackingNumber}</p>
+              <p style="margin: 4px 0;"><strong>Payment Method:</strong> ${safePaymentSource}</p>
+              <p style="margin: 4px 0;"><strong>Payment Reference:</strong> ${safeRef}</p>
+              <p style="margin: 4px 0;"><strong>Total Due (USD):</strong> ${safeFinalCost}</p>
+            </div>
+            <p>Once our team verifies your payment in the Admin Dashboard, your order will immediately transition to <strong>Processing</strong> and you will receive an official settled PDF purchase receipt.</p>
+            <p style="font-size: 12px; color: #6b7280; margin-top: 20px;">Questions or need payment directions? Contact <a href="mailto:${escapeHtml(adminContactEmail)}" style="color: #429b58;">${escapeHtml(adminContactEmail)}</a> or visit <a href="${escapeHtml(storeUrl)}" style="color: #429b58;">DriveFlyElectric</a>.</p>
+          </div>
+        </div>
+      `
+      const userRes = await this.dispatchMail({
+        to: userRecipients.join(', '),
+        subject: `Order #${receiptData.orderNumber} Received - Awaiting Payment Verification`,
+        text: `Hello ${receiptData.userName},\n\nYour order #${receiptData.orderNumber} (${receiptData.finalCost}) via ${receiptData.paymentSource} has been received and is awaiting manual payment verification.\nReference: ${customerContext?.paymentReference || receiptData.transactionId}\n\nOnce verified, your official PDF receipt will be emailed to you.\nSupport: ${adminContactEmail}`,
+        html: userHtml
+      })
+      userEmailSent = userRes.success
+    }
+
+    let systemEmailSent = false
+    if (systemEmails.length > 0) {
+      const adminHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; border: 1px solid #f59e0b; border-radius: 12px; overflow: hidden;">
+          <div style="background-color: #111318; color: #ffffff; padding: 20px 24px;">
+            <span style="background-color: #f59e0b; color: #000000; font-size: 11px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase;">Action Required • Manual Payment Verification</span>
+            <h2 style="margin: 10px 0 2px; font-size: 20px; color: #fbbf24;">Manual Payment Order #${safeOrderNumber} (${safeFinalCost})</h2>
+          </div>
+          <div style="padding: 24px; font-size: 13px; line-height: 1.6;">
+            <p><strong>Customer:</strong> ${safeUserName} (${escapeHtml(userRecipients.join(', ') || 'Guest')})</p>
+            <p><strong>Payment Method:</strong> ${safePaymentSource}</p>
+            <p><strong>Reference / Notes:</strong> ${safeRef}</p>
+            <p><strong>Total Amount (USD):</strong> ${safeFinalCost}</p>
+            <p style="margin-top: 16px;">Open the <strong>Admin Dashboard &rarr; Orders &amp; Settlements</strong> to verify and approve this payment.</p>
+          </div>
+        </div>
+      `
+      const sysRes = await this.dispatchMail({
+        to: systemEmails.join(', '),
+        subject: `[ACTION REQUIRED] Manual Payment Order #${receiptData.orderNumber} (${receiptData.finalCost})`,
+        text: `Manual Payment Order #${receiptData.orderNumber} from ${receiptData.userName} (${userRecipients.join(', ')})\nMethod: ${receiptData.paymentSource}\nReference: ${customerContext?.paymentReference || receiptData.transactionId}\nTotal: ${receiptData.finalCost}\nPlease verify in Admin Dashboard.`,
+        html: adminHtml
+      })
+      systemEmailSent = sysRes.success
+    }
+
+    this.recordActivity({
+      type: 'MANUAL_PAYMENT_SUBMITTED',
+      title: `Manual Payment Pending • #${receiptData.orderNumber}`,
+      message: `${receiptData.userName} submitted ${receiptData.finalCost} via ${receiptData.paymentSource} (Ref: ${customerContext?.paymentReference || receiptData.transactionId}). Awaiting Admin Verification.`,
+      userEmail: userRecipients[0],
+      orderNumber: receiptData.orderNumber,
+      amount: Number(order.total || 0),
+      metadata: {
+        orderId: order.id,
+        paymentMethod: order.paymentMethod
+      },
+      emailDispatched: userEmailSent,
+      systemMailDispatched: systemEmailSent
+    })
+
+    return { userEmailSent, systemEmailSent }
+  }
+
+  /**
+   * Dispatches payment approval confirmation + official PDF receipt once Admin verifies a manual payment.
+   */
+  async sendManualPaymentApproved(order: any): Promise<{ userEmailSent: boolean; systemEmailSent: boolean }> {
+    const res = await this.sendPurchaseNotifications(order)
+    this.recordActivity({
+      type: 'MANUAL_PAYMENT_APPROVED',
+      title: `Manual Payment Approved • #${order.orderNumber}`,
+      message: `Admin verified manual payment (${order.paymentMethod}) for Order #${order.orderNumber} (${res.receiptData.finalCost}). Order is now Processing.`,
+      userEmail: res.receiptData.customerEmail || order.user?.email || undefined,
+      orderNumber: order.orderNumber,
+      amount: Number(order.total || 0),
+      metadata: {
+        orderId: order.id,
+        paymentMethod: order.paymentMethod
+      },
+      emailDispatched: res.userEmailSent,
+      systemMailDispatched: res.systemEmailSent
+    })
+    return { userEmailSent: res.userEmailSent, systemEmailSent: res.systemEmailSent }
+  }
 }
 
 export const emailService = new EmailService()

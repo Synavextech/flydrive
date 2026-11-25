@@ -12,6 +12,8 @@ import {
   deleteProduct,
   getOrders,
   updateOrderStatus,
+  approveManualPayment,
+  rejectManualPayment,
   getUsers,
   updateUserStatus,
   getAnalytics,
@@ -138,6 +140,8 @@ router.delete('/products/:id', deleteProduct)
 router.get('/orders', getOrders)
 router.get('/orders/:id/receipt.pdf', downloadAdminOrderReceiptPdf)
 router.put('/orders/:id/status', updateOrderStatus)
+router.put('/orders/:id/approve-payment', approveManualPayment)
+router.put('/orders/:id/reject-payment', rejectManualPayment)
 
 // Coming-soon booking management
 router.get('/bookings', getProductBookings)

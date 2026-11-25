@@ -52,6 +52,11 @@ BEGIN
     EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'WALLET');
     EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'WALLET_STRIPE');
     EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'WALLET_PAYPAL');
+    EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'BANK_DEPOSIT');
+    EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'CRYPTO');
+    EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'INVOICE');
+    EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'CHEQUE');
+    EXECUTE format('ALTER TYPE %I.%I ADD VALUE IF NOT EXISTS %L', v_udt_schema, v_udt_name, 'CUSTOM');
   ELSIF v_data_type IS NOT NULL THEN
     FOR v_con IN
       SELECT c.conname
@@ -68,7 +73,10 @@ BEGIN
 
     ALTER TABLE public.orders
       ADD CONSTRAINT orders_payment_method_check
-      CHECK (payment_method IN ('STRIPE', 'PAYPAL', 'WALLET', 'WALLET_STRIPE', 'WALLET_PAYPAL')) NOT VALID;
+      CHECK (payment_method IN (
+        'STRIPE', 'PAYPAL', 'WALLET', 'WALLET_STRIPE', 'WALLET_PAYPAL',
+        'BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM'
+      )) NOT VALID;
   END IF;
 END
 $orders_pm$;

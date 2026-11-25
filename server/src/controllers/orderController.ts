@@ -47,8 +47,20 @@ const createOrderSchema = z.object({
       countryCode: z.string().trim().max(5).optional()
     })
     .optional(),
-  paymentMethod: z.enum(['STRIPE', 'PAYPAL', 'WALLET']).default('PAYPAL'),
+  paymentMethod: z
+    .enum([
+      'STRIPE',
+      'PAYPAL',
+      'WALLET',
+      'BANK_DEPOSIT',
+      'CRYPTO',
+      'INVOICE',
+      'CHEQUE',
+      'CUSTOM'
+    ])
+    .default('PAYPAL'),
   paymentId: z.string().trim().max(200).optional().default(''),
+  paymentReference: z.string().trim().max(300).optional(),
   paypalOrderId: z.string().trim().max(120).optional(),
   useWallet: z.boolean().optional().default(false),
   notes: z.string().trim().max(2000).optional(),
@@ -90,6 +102,7 @@ export const createOrder = async (req: Request, res: Response) => {
       shippingAddress: shippingAddressInput,
       paymentMethod,
       paymentId: rawPaymentId,
+      paymentReference,
       paypalOrderId,
       useWallet,
       notes,
@@ -98,7 +111,10 @@ export const createOrder = async (req: Request, res: Response) => {
       createAccount
     } = parsed.data
 
-    if (paymentMethod !== 'WALLET' && (!rawPaymentId || rawPaymentId.length < 3)) {
+    const MANUAL_PAYMENT_METHODS = ['BANK_DEPOSIT', 'CRYPTO', 'INVOICE', 'CHEQUE', 'CUSTOM'] as const
+    const isManualMethod = (MANUAL_PAYMENT_METHODS as readonly string[]).includes(paymentMethod)
+
+    if (paymentMethod !== 'WALLET' && !isManualMethod && (!rawPaymentId || rawPaymentId.length < 3)) {
       return res.status(400).json({
         success: false,
         error: 'A verified payment transaction ID is required.'
@@ -110,7 +126,11 @@ export const createOrder = async (req: Request, res: Response) => {
         ? rawPaymentId && rawPaymentId.length >= 3
           ? rawPaymentId
           : `WALLET-${crypto.randomUUID()}`
-        : rawPaymentId
+        : isManualMethod
+          ? rawPaymentId && rawPaymentId.length >= 3
+            ? rawPaymentId
+            : `MANUAL-${paymentMethod}-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`
+          : rawPaymentId
 
     const rawCustomerEmail =
       customer?.email || shippingAddressInput?.email || req.user?.email || ''
@@ -256,7 +276,7 @@ export const createOrder = async (req: Request, res: Response) => {
 
     // 3. Mandatory live gateway verification BEFORE debiting wallet or recording settled order
     let verifiedPaymentId = paymentId
-    if (gatewayDue > 0) {
+    if (gatewayDue > 0 && !isManualMethod) {
       const verification =
         paymentMethod === 'STRIPE'
           ? await verifyStripePaymentIntent(paymentId, gatewayDue)
@@ -295,13 +315,15 @@ export const createOrder = async (req: Request, res: Response) => {
     }
 
     const storedPaymentMethod =
-      walletApplied > 0 && gatewayDue === 0
-        ? 'WALLET'
-        : walletApplied > 0 && gatewayDue > 0
-          ? paymentMethod === 'STRIPE'
-            ? 'WALLET_STRIPE'
-            : 'WALLET_PAYPAL'
-          : paymentMethod
+      isManualMethod
+        ? paymentMethod
+        : walletApplied > 0 && gatewayDue === 0
+          ? 'WALLET'
+          : walletApplied > 0 && gatewayDue > 0
+            ? paymentMethod === 'STRIPE'
+              ? 'WALLET_STRIPE'
+              : 'WALLET_PAYPAL'
+            : paymentMethod
 
     // 4. Persist shipping address record only for resolved user accounts
     let finalShippingAddressId: string | undefined = shippingAddressId || undefined
@@ -338,6 +360,9 @@ export const createOrder = async (req: Request, res: Response) => {
 
     const structuredSegments: string[] = []
     if (notes && notes.trim()) structuredSegments.push(notes.trim())
+    if (paymentReference && paymentReference.trim()) {
+      structuredSegments.push(`[Payment Reference: ${paymentReference.trim()}]`)
+    }
     if (fullAddress) structuredSegments.push(`Delivery to ${fullAddress}.`)
     if (customerEmail || zipValue) {
       structuredSegments.push(
@@ -373,10 +398,10 @@ export const createOrder = async (req: Request, res: Response) => {
         walletAmountUsed: walletApplied,
         paymentMethod: storedPaymentMethod,
         paymentId: verifiedPaymentId,
-        paymentStatus: 'COMPLETED',
-        paymentVerified: true,
+        paymentStatus: isManualMethod ? 'PENDING' : 'COMPLETED',
+        paymentVerified: !isManualMethod,
         receiptToken: generatedReceiptToken,
-        status: 'PROCESSING',
+        status: isManualMethod ? 'PENDING' : 'PROCESSING',
         shippingAddressId: finalShippingAddressId,
         billingAddressId: billingAddressId || undefined,
         notes: mergedNotes,
@@ -443,15 +468,28 @@ export const createOrder = async (req: Request, res: Response) => {
       })
       .catch(() => {})
 
-    emailService
-      .sendPurchaseNotifications(order, {
-        accountEmail: authUserToReturn?.email || req.user?.email || customerEmail,
-        shippingEmail: customerEmail,
-        firstName: shippingAddressInput?.firstName || authUserToReturn?.firstName || customer?.firstName,
-        lastName: shippingAddressInput?.lastName || authUserToReturn?.lastName || customer?.lastName,
-        fullAddress
-      })
-      .catch((err) => console.error('Order purchase notification error:', err))
+    if (isManualMethod) {
+      emailService
+        .sendManualPaymentOrderReceived(order, {
+          accountEmail: authUserToReturn?.email || req.user?.email || customerEmail,
+          shippingEmail: customerEmail,
+          firstName: shippingAddressInput?.firstName || authUserToReturn?.firstName || customer?.firstName,
+          lastName: shippingAddressInput?.lastName || authUserToReturn?.lastName || customer?.lastName,
+          fullAddress,
+          paymentReference: paymentReference?.trim()
+        })
+        .catch((err) => console.error('Manual order notification error:', err))
+    } else {
+      emailService
+        .sendPurchaseNotifications(order, {
+          accountEmail: authUserToReturn?.email || req.user?.email || customerEmail,
+          shippingEmail: customerEmail,
+          firstName: shippingAddressInput?.firstName || authUserToReturn?.firstName || customer?.firstName,
+          lastName: shippingAddressInput?.lastName || authUserToReturn?.lastName || customer?.lastName,
+          fullAddress
+        })
+        .catch((err) => console.error('Order purchase notification error:', err))
+    }
 
     if (tokenToReturn) {
       res.cookie('token', tokenToReturn, {

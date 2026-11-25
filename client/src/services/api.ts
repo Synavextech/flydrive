@@ -13,6 +13,7 @@ import {
   AdminAnalyticsData,
   ProductViewSource,
   PaymentOptionsConfig,
+  ManualPaymentConfig,
   WalletSummary,
   Wallet,
   WalletTransaction,
@@ -335,8 +336,17 @@ export const orderApi = {
       lastName?: string
       phone?: string
     }
-    paymentMethod: 'STRIPE' | 'PAYPAL' | 'WALLET'
+    paymentMethod:
+      | 'STRIPE'
+      | 'PAYPAL'
+      | 'WALLET'
+      | 'BANK_DEPOSIT'
+      | 'CRYPTO'
+      | 'INVOICE'
+      | 'CHEQUE'
+      | 'CUSTOM'
     paymentId?: string
+    paymentReference?: string
     paymentStatus?: string
     paypalOrderId?: string
     useWallet?: boolean
@@ -568,6 +578,21 @@ export const adminApi = {
     return apiRequest(`/admin/orders/${id}/status`, {
       method: 'PUT',
       body: JSON.stringify({ status }),
+    })
+  },
+
+  // Approve manual payment order (admin)
+  approveManualPayment: async (id: string): Promise<ApiResponse<Order>> => {
+    return apiRequest(`/admin/orders/${id}/approve-payment`, {
+      method: 'PUT',
+    })
+  },
+
+  // Reject manual payment order (admin)
+  rejectManualPayment: async (id: string, reason?: string): Promise<ApiResponse<Order>> => {
+    return apiRequest(`/admin/orders/${id}/reject-payment`, {
+      method: 'PUT',
+      body: JSON.stringify({ reason }),
     })
   },
 
@@ -1024,6 +1049,7 @@ type PaymentConfigPayload = {
   paypalClientToken?: string | null
   supportEmail?: string
   paymentAvailability?: PaymentOptionsConfig
+  manualPaymentConfig?: ManualPaymentConfig
 }
 
 let cachedPaymentConfigPromise: Promise<ApiResponse<PaymentConfigPayload>> | null = null

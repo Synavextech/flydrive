@@ -151,7 +151,35 @@ router.get('/config', async (_req, res) => {
       paypalMode,
       paypalClientToken,
       supportEmail: getAdminContactEmail(),
-      paymentAvailability
+      paymentAvailability,
+      manualPaymentConfig: {
+        bankDeposit: {
+          bankName: (process.env.BANK_NAME || 'JPMorgan Chase Bank, N.A.').trim(),
+          accountName: (process.env.BANK_ACCOUNT_NAME || 'Eurotop Aerospace Inc. (DriveFlyElectric)').trim(),
+          accountNumber: (process.env.BANK_ACCOUNT_NUMBER || '9872451928').trim(),
+          routingNumber: (process.env.BANK_ROUTING_NUMBER || '111000614').trim(),
+          swiftBic: (process.env.BANK_SWIFT_BIC || 'CHASUS33').trim(),
+          bankAddress: (process.env.BANK_ADDRESS || '1000 DriveFly Electric Way, Suite 400, Austin, TX 78701').trim()
+        },
+        crypto: {
+          btcWallet: (process.env.CRYPTO_BTC_WALLET || '').trim(),
+          ethWallet: (process.env.CRYPTO_ETH_WALLET || '').trim(),
+          usdtTrc20Wallet: (process.env.CRYPTO_USDT_TRC20_WALLET || '').trim(),
+          usdtErc20Wallet: (process.env.CRYPTO_USDT_ERC20_WALLET || '').trim(),
+          solWallet: (process.env.CRYPTO_SOL_WALLET || '').trim()
+        },
+        cheque: {
+          payee: (process.env.BANK_ACCOUNT_NAME || 'Eurotop Aerospace Inc. (DriveFlyElectric)').trim(),
+          mailingAddress: (process.env.BANK_ADDRESS || '1000 DriveFly Electric Way, Suite 400, Austin, TX 78701').trim(),
+          memoInstruction: 'Include your Order Number (e.g. DFE-...) on the Cheque memo line.'
+        },
+        invoice: {
+          instruction: 'Request an official invoice to receive a dedicated payment link and pay at your convenience.'
+        },
+        custom: {
+          supportPrompt: 'Chat with support for guidance on custom payment options we accommodate (escrow, split wires, financing, local methods).'
+        }
+      }
     }
   })
 })
