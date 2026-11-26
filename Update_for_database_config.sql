@@ -236,8 +236,43 @@ BEGIN
     ADD CONSTRAINT support_messages_sender_role_check
     CHECK (sender_role IN ('CLIENT', 'ADMIN', 'SYSTEM')) NOT VALID;
 
+  -- Ensure support_sessions.id, support_messages.id, and support_messages.session_id are TEXT
+  -- (prevents UUID syntax errors on chat_<uuid> / msg_<uuid> IDs if tables were pre-created as UUID)
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'support_sessions' AND column_name = 'id' AND udt_name = 'uuid'
+  ) OR EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'id' AND udt_name = 'uuid'
+  ) OR EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'support_messages' AND column_name = 'session_id' AND udt_name = 'uuid'
+  ) THEN
+    FOR v_con IN
+      SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_class rel ON rel.oid = c.conrelid
+        JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+       WHERE nsp.nspname = 'public'
+         AND rel.relname = 'support_messages'
+         AND c.contype = 'f'
+    LOOP
+      EXECUTE format('ALTER TABLE public.support_messages DROP CONSTRAINT IF EXISTS %I', v_con.conname);
+    END LOOP;
+
+    ALTER TABLE public.support_messages ALTER COLUMN id TYPE TEXT USING id::text;
+    ALTER TABLE public.support_messages ALTER COLUMN session_id TYPE TEXT USING session_id::text;
+    ALTER TABLE public.support_sessions ALTER COLUMN id TYPE TEXT USING id::text;
+
+    ALTER TABLE public.support_messages
+      ADD CONSTRAINT support_messages_session_id_fkey
+      FOREIGN KEY (session_id) REFERENCES public.support_sessions(id) ON DELETE CASCADE NOT VALID;
+  END IF;
+
   CREATE INDEX IF NOT EXISTS idx_support_messages_session_created
     ON public.support_messages (session_id, created_at ASC);
+  CREATE INDEX IF NOT EXISTS idx_support_messages_sender_user
+    ON public.support_messages (sender_user_id);
 
   -- --------------------------------------------------------------------------
   -- 2B. wallets

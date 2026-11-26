@@ -1383,7 +1383,7 @@ export class DatabaseService {
 
   private isGenericVisitorName(name?: string | null): boolean {
     const clean = String(name || '').trim().toLowerCase()
-    return !clean || clean === 'store visitor' || clean === 'visitor' || clean === 'guest'
+    return !clean || clean === 'store visitor' || clean === 'visitor' || clean === 'guest' || clean === 'customer'
   }
 
   private applyRegisteredUserToSession(
@@ -1415,6 +1415,38 @@ export class DatabaseService {
     } else if (regPhone && !session.visitorPhone) {
       session.visitorPhone = regPhone
     }
+
+    if (regName && Array.isArray(session.messages)) {
+      for (const m of session.messages) {
+        if (m && m.senderRole === 'CLIENT' && this.isGenericVisitorName(m.senderName)) {
+          m.senderName = regName
+        }
+      }
+    }
+  }
+
+  private async getFallbackMessagesForSession(sessionId: string): Promise<any[]> {
+    const cached = this.supportMemoryCache.get(sessionId)
+    if (cached && Array.isArray(cached.messages) && cached.messages.length > 0) {
+      return cached.messages
+    }
+    try {
+      const { data: evRow } = await this.supabase
+        .from('events')
+        .select('description')
+        .eq('id', sessionId)
+        .eq('category', 'LIVECHAT_SESSION')
+        .maybeSingle()
+      if (evRow?.description) {
+        const parsed = JSON.parse(evRow.description)
+        if (Array.isArray(parsed?.messages) && parsed.messages.length > 0) {
+          return parsed.messages
+        }
+      }
+    } catch {
+      // Ignore fallback parse errors
+    }
+    return []
   }
 
   private enrichSupportSession(session: any): any {
@@ -1468,13 +1500,18 @@ export class DatabaseService {
           msgsBySession.set(m.session_id, list)
         }
 
+        const matchedUser = await this.findUserById(userId).catch(() => null)
         const sessionMap = new Map<string, any>()
         for (const row of rows) {
+          let msgs = msgsBySession.get(row.id) || []
+          if (msgs.length === 0) {
+            msgs = await this.getFallbackMessagesForSession(row.id)
+          }
           const built = {
             id: row.id,
             visitorId: row.visitor_id,
             userId: row.user_id || undefined,
-            visitorName: row.visitor_name || 'Store Visitor',
+            visitorName: row.visitor_name || 'Customer',
             visitorEmail: row.visitor_email || '',
             visitorPhone: row.visitor_phone || '',
             topic: row.topic || 'General Inquiry',
@@ -1487,7 +1524,10 @@ export class DatabaseService {
             unreadClientCount: Number(row.unread_client_count || 0),
             createdAt: row.created_at || new Date().toISOString(),
             updatedAt: row.updated_at || new Date().toISOString(),
-            messages: msgsBySession.get(row.id) || []
+            messages: msgs
+          }
+          if (matchedUser) {
+            this.applyRegisteredUserToSession(built, matchedUser)
           }
           sessionMap.set(row.id, built)
           this.supportMemoryCache.set(row.id, built)
@@ -1653,6 +1693,7 @@ export class DatabaseService {
         if (!firstMsgInsert.error) {
           return
         }
+        console.warn('support_messages upsert error (retrying without sender_user_id):', firstMsgInsert.error.message || firstMsgInsert.error)
 
         const legacyMsgRows = messageRowsWithSender.map(({ sender_user_id: _s, ...rest }: any) => rest)
         const { error: msgErr } = await this.supabase
@@ -1662,9 +1703,12 @@ export class DatabaseService {
         if (!msgErr) {
           return
         }
+        console.error('support_messages upsert failed after retry; falling back to events table:', msgErr.message || msgErr)
+      } else {
+        console.error('support_sessions upsert failed; falling back to events table:', sessionErr.message || sessionErr)
       }
-    } catch {
-      // Fallback to public.events below
+    } catch (err) {
+      console.error('Support DB persistence exception; falling back to events table:', err)
     }
 
     // 2. Fallback persistence in public.events (category = 'LIVECHAT_SESSION') so full history persists cleanly
@@ -1706,11 +1750,25 @@ export class DatabaseService {
           .eq('session_id', sessionId)
           .order('created_at', { ascending: true })
 
+        let mappedMsgs = (msgRows || []).map((m: any) => ({
+          id: m.id,
+          sessionId: m.session_id,
+          senderUserId: m.sender_user_id || undefined,
+          senderRole: m.sender_role,
+          senderName: m.sender_name,
+          content: m.content,
+          metadata: m.metadata || {},
+          createdAt: m.created_at
+        }))
+        if (mappedMsgs.length === 0) {
+          mappedMsgs = await this.getFallbackMessagesForSession(sessionId)
+        }
+
         const built = {
           id: row.id,
           visitorId: row.visitor_id,
           userId: row.user_id || undefined,
-          visitorName: row.visitor_name || 'Store Visitor',
+          visitorName: row.visitor_name || 'Customer',
           visitorEmail: row.visitor_email || '',
           visitorPhone: row.visitor_phone || '',
           topic: row.topic || 'General Inquiry',
@@ -1723,18 +1781,9 @@ export class DatabaseService {
           unreadClientCount: Number(row.unread_client_count || 0),
           createdAt: row.created_at || new Date().toISOString(),
           updatedAt: row.updated_at || new Date().toISOString(),
-          messages: (msgRows || []).map((m: any) => ({
-            id: m.id,
-            sessionId: m.session_id,
-            senderUserId: m.sender_user_id || undefined,
-            senderRole: m.sender_role,
-            senderName: m.sender_name,
-            content: m.content,
-            metadata: m.metadata || {},
-            createdAt: m.created_at
-          }))
+          messages: mappedMsgs
         }
-        if (built.userId && (this.isGenericVisitorName(built.visitorName) || !built.visitorEmail)) {
+        if (built.userId && (this.isGenericVisitorName(built.visitorName) || !built.visitorEmail || !built.visitorPhone)) {
           const matchedUser = await this.findUserById(built.userId).catch(() => null)
           if (matchedUser) {
             this.applyRegisteredUserToSession(built, matchedUser)
@@ -1809,24 +1858,31 @@ export class DatabaseService {
         }
 
         for (const row of rows) {
+          let msgs = msgsBySession.get(row.id) || []
+          if (msgs.length === 0) {
+            const cached = this.supportMemoryCache.get(row.id)
+            if (cached && Array.isArray(cached.messages) && cached.messages.length > 0) {
+              msgs = cached.messages
+            }
+          }
           const built = {
             id: row.id,
             visitorId: row.visitor_id,
             userId: row.user_id || undefined,
-            visitorName: row.visitor_name || 'Store Visitor',
+            visitorName: row.visitor_name || 'Customer',
             visitorEmail: row.visitor_email || '',
             visitorPhone: row.visitor_phone || '',
-          topic: row.topic || 'General Inquiry',
-          selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
-          activeOrderId: row.active_order_id || null,
-          status: row.status || 'OPEN',
+            topic: row.topic || 'General Inquiry',
+            selectedProducts: Array.isArray(row.selected_products) ? row.selected_products : [],
+            activeOrderId: row.active_order_id || null,
+            status: row.status || 'OPEN',
             isOnline: Boolean(row.is_online),
             lastSeenAt: row.last_seen_at || row.updated_at || new Date().toISOString(),
             unreadAdminCount: Number(row.unread_admin_count || 0),
             unreadClientCount: Number(row.unread_client_count || 0),
             createdAt: row.created_at || new Date().toISOString(),
             updatedAt: row.updated_at || new Date().toISOString(),
-            messages: msgsBySession.get(row.id) || []
+            messages: msgs
           }
           sessionMap.set(row.id, built)
           this.supportMemoryCache.set(row.id, built)
@@ -1836,7 +1892,7 @@ export class DatabaseService {
       // Fallback
     }
 
-    // 2. Load from public.events fallback table
+    // 2. Load from public.events fallback table (also merges messages if support_messages was empty)
     try {
       const { data: evRows } = await this.supabase
         .from('events')
@@ -1846,14 +1902,19 @@ export class DatabaseService {
         .limit(100)
 
       for (const ev of evRows || []) {
-        if (ev.description && !sessionMap.has(ev.id)) {
-          try {
-            const parsed = JSON.parse(ev.description)
+        if (!ev.description) continue
+        try {
+          const parsed = JSON.parse(ev.description)
+          const existing = sessionMap.get(ev.id)
+          if (!existing) {
             sessionMap.set(ev.id, parsed)
             this.supportMemoryCache.set(ev.id, parsed)
-          } catch {
-            // Skip malformed JSON
+          } else if ((!existing.messages || existing.messages.length === 0) && Array.isArray(parsed.messages) && parsed.messages.length > 0) {
+            existing.messages = parsed.messages
+            this.supportMemoryCache.set(ev.id, existing)
           }
+        } catch {
+          // Skip malformed JSON
         }
       }
     } catch {
@@ -1863,7 +1924,7 @@ export class DatabaseService {
     const hydrated = Array.from(sessionMap.values())
     const userCache = new Map<string, any>()
     for (const sess of hydrated) {
-      if (sess.userId && (this.isGenericVisitorName(sess.visitorName) || !sess.visitorEmail)) {
+      if (sess.userId && (this.isGenericVisitorName(sess.visitorName) || !sess.visitorEmail || !sess.visitorPhone)) {
         let matchedUser = userCache.get(sess.userId)
         if (matchedUser === undefined) {
           matchedUser = await this.findUserById(sess.userId).catch(() => null)
@@ -1972,48 +2033,81 @@ export class DatabaseService {
     return this.enrichSupportSession(session)
   }
 
-  async updateSupportPresence(sessionId: string, isOnline: boolean, visitorMeta?: { visitorName?: string; visitorEmail?: string; currentPath?: string }): Promise<any | null> {
+  private async updateSupportSessionColumns(sessionId: string, dbPatch: Record<string, any>, memoryPatch: Record<string, any>): Promise<any | null> {
     const existing = await this.getSupportSession(sessionId)
     if (!existing) return null
 
-    const nowIso = new Date().toISOString()
-    existing.isOnline = Boolean(isOnline)
-    existing.lastSeenAt = nowIso
-    if (visitorMeta?.visitorName && !this.isGenericVisitorName(visitorMeta.visitorName)) {
-      existing.visitorName = visitorMeta.visitorName
-    }
-    if (visitorMeta?.visitorEmail && !existing.userId) {
-      existing.visitorEmail = visitorMeta.visitorEmail
+    Object.assign(existing, memoryPatch)
+    this.supportMemoryCache.set(sessionId, existing)
+
+    try {
+      const { error } = await this.supabase
+        .from('support_sessions')
+        .update(dbPatch)
+        .eq('id', sessionId)
+      if (!error) {
+        return this.enrichSupportSession(existing)
+      }
+    } catch {
+      // Fallback to events update below
     }
 
-    await this.persistSupportSessionToDb(existing)
+    try {
+      await this.supabase
+        .from('events')
+        .update({
+          description: JSON.stringify(existing),
+          time: existing.lastSeenAt || new Date().toISOString(),
+          status: existing.status === 'RESOLVED' ? 'past' : 'upcoming',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', sessionId)
+        .eq('category', 'LIVECHAT_SESSION')
+    } catch {
+      // Ignore fallback error
+    }
+
     return this.enrichSupportSession(existing)
+  }
+
+  async updateSupportPresence(sessionId: string, isOnline: boolean, visitorMeta?: { visitorName?: string; visitorEmail?: string; currentPath?: string }): Promise<any | null> {
+    const nowIso = new Date().toISOString()
+    const dbPatch: Record<string, any> = {
+      is_online: Boolean(isOnline),
+      last_seen_at: nowIso
+    }
+    const memoryPatch: Record<string, any> = {
+      isOnline: Boolean(isOnline),
+      lastSeenAt: nowIso
+    }
+    if (visitorMeta?.visitorName && !this.isGenericVisitorName(visitorMeta.visitorName)) {
+      dbPatch.visitor_name = visitorMeta.visitorName
+      memoryPatch.visitorName = visitorMeta.visitorName
+    }
+    return this.updateSupportSessionColumns(sessionId, dbPatch, memoryPatch)
   }
 
   async markSupportSessionRead(sessionId: string, readerRole: 'ADMIN' | 'CLIENT'): Promise<any | null> {
-    const existing = await this.getSupportSession(sessionId)
-    if (!existing) return null
-
-    if (readerRole === 'ADMIN') {
-      existing.unreadAdminCount = 0
-    } else {
-      existing.unreadClientCount = 0
-    }
-    await this.persistSupportSessionToDb(existing)
-    return this.enrichSupportSession(existing)
+    const dbPatch = readerRole === 'ADMIN' ? { unread_admin_count: 0 } : { unread_client_count: 0 }
+    const memoryPatch = readerRole === 'ADMIN' ? { unreadAdminCount: 0 } : { unreadClientCount: 0 }
+    return this.updateSupportSessionColumns(sessionId, dbPatch, memoryPatch)
   }
 
   async updateSupportSessionStatus(sessionId: string, status: 'OPEN' | 'RESOLVED'): Promise<any | null> {
-    const existing = await this.getSupportSession(sessionId)
-    if (!existing) return null
-
-    existing.status = status
-    if (status === 'RESOLVED') {
-      existing.unreadAdminCount = 0
+    const nowIso = new Date().toISOString()
+    const dbPatch: Record<string, any> = {
+      status,
+      updated_at: nowIso
     }
-    existing.updatedAt = new Date().toISOString()
-    await this.persistSupportSessionToDb(existing)
-    return this.enrichSupportSession(existing)
+    const memoryPatch: Record<string, any> = {
+      status,
+      updatedAt: nowIso
+    }
+    if (status === 'RESOLVED') {
+      dbPatch.unread_admin_count = 0
+      memoryPatch.unreadAdminCount = 0
+    }
+    return this.updateSupportSessionColumns(sessionId, dbPatch, memoryPatch)
   }
 
   async appendSupportMessage(
